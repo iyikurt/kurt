@@ -1,0 +1,468 @@
+# Turns an application's files into iyi modules, the way Rails' autoloader
+# turns them into constants. The files a person writes have no module
+# header and no imports:
+#
+#   app/models/post.iyi
+#
+#     class Post < ApplicationRecord
+#       property title : String
+#       belongs_to user : User
+#     end
+#
+# and `kurt dev` / `kurt test` compile what this module writes from them
+# into .kurt/build/:
+#
+#   app/models.iyi       every model, with `pub`, a `property` per column of
+#                        its table in db/schema.json, and `derive model` added
+#   app/controllers.iyi  every controller, ApplicationController first, with
+#                        `@post : Post = Post.new` and `@posts : Array(Post) =
+#                        [] of Post` declared for the model variables it uses
+#   app/routes.iyi       config/routes.iyi inside `def routes : Router`
+#   <app>.iyi            the entry: config/application.iyi, mount, run
+#   <name>_test.iyi      one per test/<name>_test.iyi
+#
+# Each module gets the imports its kind needs. Every piece carries a
+# location pragma, so an error is reported at the line of the file the
+# person wrote, not of the generated one, and `render` resolves views from
+# that file too.
+#
+# Why one module for all models: `import` forms a DAG (SPEC.md R-1), and a
+# User has many Posts while a Post belongs to a User. In one module they may
+# name each other freely.
+module autoload
+
+import std/text
+import inflector::{pluralize, underscore}
+import schema::{Table, Column, find}
+import fixtures::{FixtureSet, fixture_id}
+
+pub class Source
+  getter path : String
+  getter text : String
+
+  def initialize(@path : String, @text : String)
+  end
+end
+
+pub def models_imports : Array(String)
+  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*"]
+end
+
+pub def controllers_imports : Array(String)
+  ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
+   "import web/iyi_web/templates::{raw, content_for, yield_content}",
+   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import app/models::*"]
+end
+
+pub def routes_imports : Array(String)
+  ["import web/iyi_web/router::{Router}", "import kurt/controllers::*", "import app/controllers::*"]
+end
+
+pub def entry_imports : Array(String)
+  ["import std/time::{Time}", "import kurt/controllers::{live_reload?, routes_table}",
+   "import web/iyi_web/dsl::*", "import web/iyi_web/session::{SessionHandler}",
+   "import web/iyi_web/csrf::{CSRFHandler}", "import web/iyi_web/override::{OverrideMethodHandler}",
+   "import web/iyi_web/security_headers::{SecurityHeadersHandler}", "import web/iyi_web/request_id::{RequestIdHandler}",
+   "import web/iyi_web/config::{config}",
+   "import kurt/release::{run_database_command}", "import kurt/environment::{session_secret, production?}",
+   "import app/routes::*"]
+end
+
+pub def test_imports : Array(String)
+  ["import std/text", "import std/time::{Time}", "import web/iyi_web/router::{RouteHandler}",
+   "import web/iyi_web/harness::*", "import web/iyi_web/handler::{chain}", "import web/iyi_web/session::{SessionHandler}",
+   "import kurt/model::*", "import kurt/controllers::{sign_in_as, sign_out}", "import app/models::*", "import app/routes::*",
+   "import app/fixtures::*"]
+end
+
+# What follows it on the same line is line *line* of *path*, for errors and
+# for `render`. It is written in front of that line: on a line of its own,
+# iyi counts the newline after it too and every location is one too far.
+pub def pragma(path : String, line : Int32) : String
+  "#<loc:\"" + path + "\"," + line.to_s + ",1>"
+end
+
+# The file's own `import` lines, and its lines with each of them blanked, so
+# every other line keeps its number.
+pub def split_imports(text : String) : Tuple(Array(String), Array(String))
+  imports = [] of String
+  lines = [] of String
+  text.lines.each do |line|
+    if line.starts_with?("import ") || line.starts_with?("pub import ")
+      imports << line.strip
+      lines << ""
+    else
+      lines << line
+    end
+  end
+  {imports, lines}
+end
+
+# `class X`, `struct X`, `enum X` at the top level become `pub`: another
+# module (the routes, a test) has to reach them.
+def publish(line : String) : String
+  ["class ", "struct ", "enum ", "abstract class "].each do |keyword|
+    return "pub " + line if line.starts_with?(keyword)
+  end
+  line
+end
+
+# The name of the class a `class X < ApplicationRecord` line declares, or nil.
+def model_class(line : String) : String?
+  return nil unless line.starts_with?("class ") && line.includes?("<")
+  cut = line.index("<").as(Int32)
+  return nil unless line[cut + 1, line.size - cut - 1].strip == "ApplicationRecord"
+  line[6, cut - 6].strip
+end
+
+# `@[Table("people")]` -> "people".
+def table_annotation(line : String) : String?
+  stripped = line.strip
+  return nil unless stripped.starts_with?("@[Table(\"") && stripped.ends_with?("\")]")
+  stripped[9, stripped.size - 12]
+end
+
+# Each model a file declares, with the table it maps to: the plural of its
+# name, underscored, unless `@[Table(...)]` above it says otherwise.
+pub def model_tables(text : String) : Array(Tuple(String, String))
+  found = [] of Tuple(String, String)
+  annotated = nil
+  text.lines.each do |line|
+    if name = table_annotation(line)
+      annotated = name
+    elsif klass = model_class(line)
+      found << {klass, annotated || pluralize(underscore(klass))}
+      annotated = nil
+    elsif !line.strip.empty? && !line.strip.starts_with?("#")
+      annotated = nil
+    end
+  end
+  found
+end
+
+# The fields a class body declares itself: `property x`, `getter x`.
+def declared_fields(lines : Array(String), from : Int32) : Array(String)
+  names = [] of String
+  index = from + 1
+  while index < lines.size && lines[index].rstrip != "end"
+    stripped = lines[index].strip
+    ["property ", "getter ", "property? ", "getter? "].each do |keyword|
+      if stripped.starts_with?(keyword)
+        rest = stripped[keyword.size, stripped.size - keyword.size]
+        names << rest.split(" ")[0].split(":")[0].strip
+      end
+    end
+    index += 1
+  end
+  names
+end
+
+# A model file: `class Post < ApplicationRecord` is `pub class Post`, with a
+# `property` for each column of its table that the class does not declare
+# itself (id aside: `derive model` writes it), and `derive model` as the
+# class's last line, below the fields and the relations it reads. A class
+# that writes its own `derive` keeps it.
+pub def model_lines(source : Source, tables : Array(Table) = [] of Table, schema_path : String = "db/schema.json") : Array(String)
+  _, lines = split_imports(source.text)
+  out = [] of String
+  in_model = false
+  derived = false
+  resync = false
+  annotated = nil
+  lines.each_with_index do |line, index|
+    prefix = resync ? pragma(source.path, index + 1) : ""
+    resync = false
+    if name = table_annotation(line)
+      annotated = name
+    end
+    if klass = model_class(line)
+      out << prefix + "pub class " + klass
+      in_model = true
+      derived = false
+      table = find(tables, annotated || pluralize(underscore(klass)))
+      annotated = nil
+      if table
+        own = declared_fields(lines, index)
+        first = true
+        table.columns.each do |column|
+          next if column.name == "id" || column.type.empty? || own.includes?(column.name)
+          out << (first ? pragma(schema_path, 1) : "") + "  property " + column.name + " : " + column.type
+          first = false
+          resync = true
+        end
+      end
+      next
+    end
+    if in_model
+      derived = true if line.strip.starts_with?("derive ")
+      if line.rstrip == "end"
+        in_model = false
+        unless derived
+          out << prefix + "  derive model"
+          out << pragma(source.path, index + 1) + line
+          next
+        end
+      end
+    end
+    out << prefix + publish(line)
+  end
+  out
+end
+
+# The models whose table db/schema.json does not have: they get no fields,
+# and the build says why before iyi fails on them.
+pub def missing_tables(sources : Array(Source), tables : Array(Table)) : Array(String)
+  missing = [] of String
+  sources.each do |source|
+    model_tables(source.text).each do |pair|
+      missing << pair[0] + " (table " + pair[1] + ")" if find(tables, pair[1]).nil?
+    end
+  end
+  missing
+end
+
+ANNOTATION = "# Columns of "
+
+# The comment at the top of a model file listing its table's columns, as
+# Rails' annotate gem writes it: the fields are declared from the schema, so
+# this is where a reader sees them. Rewritten by `kurt db:migrate`;
+# nothing compiles it.
+pub def annotate(text : String, tables : Array(Table)) : String
+  lines = text.lines
+  # The old comment goes first.
+  if !lines.empty? && lines[0].starts_with?(ANNOTATION)
+    cut = 0
+    while cut < lines.size && lines[cut].starts_with?("#")
+      cut += 1
+    end
+    lines = lines[cut, lines.size - cut]
+  end
+  body = lines.join("\n") + (text.ends_with?("\n") ? "\n" : "")
+  block = ""
+  model_tables(body).each do |pair|
+    table = find(tables, pair[1])
+    next if table.nil?
+    width = 0
+    table.columns.each { |c| width = c.name.size if c.name.size > width }
+    block += ANNOTATION + pair[1] + " (db/schema.json, kept up to date by `kurt db:migrate`):\n"
+    table.columns.each do |c|
+      block += "#   " + c.name.ljust(width) + "  " + (c.type.empty? ? c.sql + " (not mapped)" : c.type) + "\n"
+    end
+  end
+  block + body
+end
+
+# The instance variables a file uses: `@post` in `@post.title` or
+# `@post = ...`, not `@@counter`.
+def instance_variables(text : String) : Array(String)
+  found = [] of String
+  chars = text.chars
+  index = 0
+  while index < chars.size
+    if chars[index] == '@' && (index == 0 || chars[index - 1] != '@') && index + 1 < chars.size && (chars[index + 1].ascii_lowercase? || chars[index + 1] == '_')
+      stop = index + 1
+      while stop < chars.size && (chars[stop].ascii_alphanumeric? || chars[stop] == '_')
+        stop += 1
+      end
+      name = chars[index + 1, stop - index - 1].join
+      found << name unless found.includes?(name)
+      index = stop
+    else
+      index += 1
+    end
+  end
+  found
+end
+
+# The instance variables a file declares itself: `@post : Post`.
+def declared_ivars(text : String) : Array(String)
+  found = [] of String
+  text.lines.each do |line|
+    stripped = line.strip
+    next unless stripped.starts_with?("@")
+    colon = stripped.index(" :")
+    found << stripped[1, colon - 1] if colon && colon > 1
+  end
+  found
+end
+
+# What a controller's model variables are, by convention: `@post` holds a
+# Post and starts as a blank one, `@posts` holds an Array(Post) and starts
+# empty, so neither is ever nil. A variable the file declares itself, or one
+# that names no model, is left alone.
+pub def conventional_ivars(text : String, models : Array(String)) : Array(String)
+  own = declared_ivars(text)
+  lines = [] of String
+  instance_variables(text).each do |name|
+    next if own.includes?(name)
+    models.each do |model|
+      singular = underscore(model)
+      if name == singular
+        lines << "  @" + name + " : " + model + " = " + model + ".new"
+      elsif name == pluralize(singular)
+        lines << "  @" + name + " : Array(" + model + ") = [] of " + model
+      end
+    end
+  end
+  lines
+end
+
+# A controller: `pub`, and its model variables declared below its class line.
+pub def controller_lines(source : Source, models : Array(String)) : Array(String)
+  code = plain_lines(source)
+  declarations = conventional_ivars(source.text, models)
+  return code if declarations.empty?
+  at = code.index { |line| line.starts_with?("pub class ") }
+  return code if at.nil?
+  result = code[0, at + 1] + declarations
+  return result if at + 1 >= code.size
+  # The line after the declarations is line at + 2 of the file again.
+  result << pragma(source.path, at + 2) + code[at + 1]
+  result + code[at + 2, code.size - at - 2]
+end
+
+# A controller, or any other file: top-level types become `pub`.
+pub def plain_lines(source : Source) : Array(String)
+  _, lines = split_imports(source.text)
+  lines.map { |line| publish(line) }
+end
+
+def header(name : String, imports : Array(String), sources : Array(Source)) : String
+  all = imports.dup
+  sources.each do |source|
+    split_imports(source.text)[0].each { |line| all << line unless all.includes?(line) }
+  end
+  "# Written by kurt from the application's files; edit those, not this.\nmodule " + name + "\n\n" + all.join("\n") + "\n\n"
+end
+
+def pieces(sources : Array(Source), models : Bool, tables : Array(Table) = [] of Table, schema_path : String = "", model_names : Array(String) = [] of String) : String
+  out = ""
+  sources.each do |source|
+    lines = models ? model_lines(source, tables, schema_path) : controller_lines(source, model_names)
+    out += pragma(source.path, 1) + lines.join("\n") + "\n\n"
+  end
+  out
+end
+
+pub def models_module(sources : Array(Source), tables : Array(Table) = [] of Table, schema_path : String = "db/schema.json") : String
+  header("app/models", models_imports, sources) + pieces(sources, true, tables, schema_path)
+end
+
+# ApplicationController first: a class's parent has to be declared before it.
+# *models* are the application's model names, for `conventional_ivars`.
+pub def controllers_module(sources : Array(Source), models : Array(String) = [] of String) : String
+  ordered = sources.select { |s| s.path.ends_with?("/application_controller.iyi") }
+  sources.each { |s| ordered << s unless ordered.includes?(s) }
+  header("app/controllers", controllers_imports, ordered) + pieces(ordered, false, model_names: models)
+end
+
+pub def routes_module(source : Source, generated : String) : String
+  _, lines = split_imports(source.text)
+  body = header("app/routes", routes_imports, [source])
+  body += "pub def routes : Router\n  router = Router.new\n"
+  body += pragma(source.path, 1) + lines.join("\n") + "\n"
+  body += pragma(generated, 1) + "  install_error_pages router\n  router\nend\n"
+  body
+end
+
+# Under `kurt dev`, an event stream that tells each page which start of
+# the server it came from: a page whose server has restarted reloads. The
+# stream writes once and ends after a while, and the page connects again:
+# iyi-web learns that a client went away only from a write that fails, so a
+# stream that kept writing would fail on every page the browser left.
+# `kurt routes` runs the application with KURT_PRINT_ROUTES set: it prints
+# the table and stops before it serves anything.
+PRINT_ROUTES = <<-IYI
+if Program.env("KURT_PRINT_ROUTES")
+  print routes_table(routes)
+  exit 0
+end
+
+IYI
+
+LIVE_ROUTE = <<-IYI
+if live_reload?
+  boot = Time.utc.to_unix_ms.to_s
+  sse "/__kurt/live" do |stream, env|
+    stream.send(boot, event: "boot")
+    sleep(25000)
+  end
+end
+
+IYI
+
+# *text* as an iyi string literal.
+pub def string_literal(text : String) : String
+  "\"" + text.gsub("\\", "\\\\").gsub("\"", "\\\"").gsub("#", "\\#").gsub("\n", "\\n").gsub("\r", "\\r").gsub("\t", "\\t") + "\""
+end
+
+# `./bin/app db:migrate`: the migrations travel inside the binary, and the
+# commands run before config/application.iyi, which needs a production
+# SESSION_SECRET that a migration does not.
+pub def database_commands(migrations : Array(Tuple(String, String))) : String
+  list = migrations.map { |pair| "  {" + string_literal(pair[0]) + ", " + string_literal(pair[1]) + "}," }
+  out = "KURT_MIGRATIONS = [\n" + list.join("\n") + (list.empty? ? "" : "\n") + "] of Tuple(String, String)\n\n"
+  out + "if (command = Program.args[0]?) && command.starts_with?(\"db:\")\n  exit run_database_command(command, KURT_MIGRATIONS)\nend\n\n"
+end
+
+pub def entry_module(app : String, config : Source?, generated : String, migrations : Array(Tuple(String, String)) = [] of Tuple(String, String)) : String
+  sources = config ? [config] : [] of Source
+  body = header(app, entry_imports, sources)
+  body += pragma(generated, 1) + database_commands(migrations)
+  body += "config.env = ::Kurt::Environment.env    # \"[production] blog is ready...\"\nconfig.app_name = " + string_literal(app) + "\n\n"
+  if source = config
+    body += pragma(source.path, 1) + split_imports(source.text)[1].join("\n") + "\n"
+  end
+  body + pragma(generated, 1) + PRINT_ROUTES + LIVE_ROUTE + "mount routes\nrun\n"
+end
+
+pub def test_module(name : String, source : Source) : String
+  header(name, test_imports, [source]) + pragma(source.path, 1) + split_imports(source.text)[1].join("\n") + "\n"
+end
+
+# A test reaches a fixture by its label: `users(:ada)` is the User that
+# test/fixtures/users.yml calls ada, read from the database, so it is what
+# the test's own requests changed it to. *models* pairs each model with its
+# table; a set with no model (a join table) gets no function.
+pub def fixtures_module(sets : Array(FixtureSet), models : Array(Tuple(String, String)), dir : String = "test/fixtures", schema_path : String = "db/schema.json") : String
+  out = "# Written by kurt from test/fixtures; edit those, not this.\nmodule app/fixtures\n\n"
+  out += "import std/file\nimport kurt/model::*\nimport app/models::*\n"
+  out += "import db/db/errors::{DBError}\nimport kurt/datasource::{database, postgres?}\n"
+  out += "import kurt/schema::{Table, parse}\nimport kurt/fixtures::{reload_fixtures}\n\n"
+  unless sets.empty?
+    # Each test file imports this module, so each starts with the fixtures.
+    out += "case failure = reload_fixtures(database, postgres?, parse(File.read(\"" + schema_path + "\")), \"" + dir + "\")\n"
+    out += "in Nil     then nil\nin DBError then raise \"loading test/fixtures: \" + failure.message\n"
+    out += "in String  then raise failure\nend\n\n"
+  end
+  sets.each do |set|
+    model = models.find { |pair| pair[1] == set.table }
+    next if model.nil?
+    name = model[0]
+    out += "# " + set.path + "\n"
+    out += "pub def " + set.table + "(label : Symbol) : " + name + "\n"
+    out += "  id = case label.to_s\n"
+    set.labels.each { |label| out += "       when \"" + label + "\" then " + fixture_id(label).to_s + "_i64\n" }
+    out += "       else raise \"no fixture \" + label.inspect + \" in " + set.path + "\"\n"
+    out += "       end\n"
+    out += "  case found = " + name + ".find(id)\n"
+    out += "  in " + name + " then found\n"
+    out += "  in ::Kurt::Model::NotFound, ::Db::Errors::DBError then raise " + set.table + "_fixture_gone(label, found.message)\n"
+    out += "  end\nend\n\n"
+    out += "def " + set.table + "_fixture_gone(label : Symbol, why : String) : String\n"
+    out += "  \"" + set.table + "(\" + label.inspect + \"): \" + why + \" (a test deleted it?)\"\nend\n\n"
+  end
+  out
+end
+
+# db/seeds.iyi, as a program: its lines run in a function, so `!` hands an
+# error up, and the command says what failed.
+pub def seeds_module(source : Source) : String
+  imports = ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}", "import kurt/model::*", "import app/models::*"]
+  body = header("seeds", imports, [source])
+  body += "def __kurt_seed : Nil | DBError | Invalid | NotFound\n"
+  body += pragma(source.path, 1) + split_imports(source.text)[1].join("\n") + "\n  nil\nend\n\n"
+  body += "case failure = __kurt_seed\nin Nil then puts \"kurt: seeded from db/seeds.iyi\"\n"
+  body += "in DBError, Invalid, NotFound\n  STDERR.puts \"kurt db:seed: \" + failure.message\n  exit 1\nend\n"
+  body
+end

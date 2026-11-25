@@ -1,0 +1,51 @@
+module test/schema_test
+
+import std/text
+import db
+import sqlite
+import db/db/errors::{DBError}
+import schema::*
+
+# type mapping
+assert iyi_type("TEXT", false, false) == "String"
+assert iyi_type("VARCHAR(255)", true, false) == "String?"
+assert iyi_type("INTEGER", false, false) == "Int64"
+assert iyi_type("integer", false, true) == "Int32"
+assert iyi_type("bigint", false, true) == "Int64"
+assert iyi_type("BOOLEAN", false, false) == "Bool"
+assert iyi_type("DATETIME", false, false) == "Time"
+assert iyi_type("timestamp with time zone", false, true) == "Time"
+assert iyi_type("double precision", false, true) == "Float64"
+assert iyi_type("REAL", true, false) == "Float64?"
+assert iyi_type("BLOB", false, false) == ""
+
+def run_all : Nil | DBError
+  url = "sqlite3:%3Amemory%3A?max_pool_size=1"
+  db = Db.open(url)!
+  db.exec("CREATE TABLE schema_migrations (version TEXT PRIMARY KEY)")!
+  db.exec("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL, summary TEXT, published BOOLEAN NOT NULL DEFAULT 0, created_at DATETIME NOT NULL, data BLOB)")!
+  db.exec("CREATE TABLE authors (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")!
+  tables = introspect(db, url)!
+  assert tables.map(&.name) == ["authors", "posts"]
+  posts = find(tables, "posts").as(Table)
+  assert posts.columns.map(&.name) == ["id", "title", "summary", "published", "created_at", "data"]
+  assert posts.columns.map(&.type) == ["Int64", "String", "String?", "Bool", "Time", ""]
+
+  # written and read back, unchanged
+  json = to_json(tables)
+  assert json.includes?(%(    {"name": "summary", "sql": "TEXT", "type": "String?"},))
+  assert json.includes?(%(    {"name": "data", "sql": "BLOB"}))
+  again = parse(json)
+  assert to_json(again) == json
+  assert parse("not json").empty?
+  assert to_json([] of Table) == "{}\n"
+  puts "schema: all assertions passed"
+  nil
+end
+
+case result = run_all
+in Nil then nil
+in DBError
+  STDERR.puts "FAILED: " + result.message
+  exit 1
+end

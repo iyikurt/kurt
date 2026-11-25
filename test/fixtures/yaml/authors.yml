@@ -1,0 +1,9 @@
+# a comment
+ada:
+  name: Ada
+  email: ada@example.com
+  password: secret123
+  admin: true
+bob:
+  name: "Bob: the second"
+  email: bob@example.com

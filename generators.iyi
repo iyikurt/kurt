@@ -1,0 +1,1308 @@
+# What `kurt new` and `kurt generate` write. Each function answers a
+# file's text, so the CLI only decides where it goes and a test can read it.
+#
+# The layout of an application. None of its .iyi files has a module header
+# or imports: `kurt` compiles them into modules (see autoload.iyi).
+#
+#   config/application.iyi            runs at start: middleware, settings
+#   config/routes.iyi                 every route; generators add to it
+#   app/models/<model>.iyi            class Post < ApplicationRecord
+#   app/controllers/<plural>_controller.iyi
+#   app/views/<plural>/<action>.eiy
+#   app/views/layouts/application.eiy
+#   db/migrations/<timestamp>_<name>.sql
+#   test/<name>_test.iyi
+#   public/assets/app.css
+#   iyi.mod
+#   llms.txt                          the conventions, for coding agents
+module generators
+
+import std/text
+import std/time::{Time}
+import std/indexable
+import inflector::{pluralize, singularize, underscore, camelize, humanize}
+
+# One `name:type` argument of `generate scaffold`.
+pub class Field
+  getter name : String
+  getter kind : String
+
+  def initialize(@name : String, @kind : String)
+  end
+
+  # `user:references` is the column `user_id`.
+  def column : String
+    reference? ? @name + "_id" : @name
+  end
+
+  def reference? : Bool
+    @kind == "references"
+  end
+
+  def iyi_type : String
+    case @kind
+    when "string", "text"     then "String"
+    when "int", "references"  then "Int64"
+    when "float"              then "Float64"
+    when "bool"               then "Bool"
+    when "time"               then "Time"
+    else                           "String"
+    end
+  end
+
+  def sql_type(postgres : Bool) : String
+    case @kind
+    when "string"            then postgres ? "VARCHAR(255) NOT NULL DEFAULT ''" : "TEXT NOT NULL DEFAULT ''"
+    when "text"              then "TEXT NOT NULL DEFAULT ''"
+    when "int", "references" then postgres ? "BIGINT NOT NULL DEFAULT 0" : "INTEGER NOT NULL DEFAULT 0"
+    when "float"             then postgres ? "DOUBLE PRECISION NOT NULL DEFAULT 0" : "REAL NOT NULL DEFAULT 0"
+    when "bool"              then postgres ? "BOOLEAN NOT NULL DEFAULT FALSE" : "BOOLEAN NOT NULL DEFAULT 0"
+    when "time"              then postgres ? "TIMESTAMPTZ NOT NULL DEFAULT now()" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    else                          "TEXT NOT NULL DEFAULT ''"
+    end
+  end
+
+  def label : String
+    humanize(column)
+  end
+end
+
+# A type a field may have, in any of the spellings people reach for.
+pub def normalize_kind(kind : String) : String?
+  case kind.downcase
+  when "string", "str"                                  then "string"
+  when "text"                                           then "text"
+  when "int", "integer", "int64", "int32", "bigint"     then "int"
+  when "float", "float64", "decimal", "double", "real" then "float"
+  when "bool", "boolean"                                then "bool"
+  when "time", "datetime", "timestamp"                  then "time"
+  when "references", "reference", "belongs_to", "ref"   then "references"
+  else                                                       nil
+  end
+end
+
+# Parses `title:string body:text user:references`. A field with no type is
+# a string; an unknown type is an error naming it.
+pub def parse_fields(args : Array(String)) : Array(Field) | String
+  fields = [] of Field
+  args.each do |arg|
+    parts = arg.split(":")
+    name = underscore(parts[0])
+    return "a field needs a name: " + arg if name.empty?
+    return "`" + name + "` is a column Kurt writes itself" if ["id", "created_at", "updated_at"].includes?(name)
+    raw = parts.size > 1 ? parts[1] : "string"
+    kind = normalize_kind(raw)
+    return "unknown type `" + raw + "` in " + arg + ": use string, text, int, float, bool, time or references" if kind.nil?
+    fields << Field.new(name, kind)
+  end
+  fields
+end
+
+# Names derived from the model's: Post, post, posts, PostsController.
+pub class Names
+  getter model : String
+  getter singular : String
+  getter plural : String
+
+  def initialize(name : String)
+    @model = camelize(singularize(underscore(name)))
+    @singular = underscore(@model)
+    @plural = pluralize(@singular)
+  end
+
+  def controller : String
+    camelize(@plural) + "Controller"
+  end
+
+  def controller_file : String
+    "app/controllers/" + @plural + "_controller.iyi"
+  end
+
+  def controller_module : String
+    "app/controllers/" + @plural + "_controller"
+  end
+
+  def human : String
+    humanize(@singular)
+  end
+end
+
+pub def timestamp(now : Time) : String
+  now.to_s("%Y%m%d%H%M%S")
+end
+
+# ---------------------------------------------------------------------------
+# Models and migrations
+# ---------------------------------------------------------------------------
+
+# app/models/<model>.iyi: relations and validation. The fields come from
+# the table, through db/schema.json, so the file does not repeat them. A
+# reference to a model that has a file already (*known*) becomes a
+# `belongs_to`; to one that does not yet, a hint.
+pub def model_file(names : Names, fields : Array(Field), known : Array(String)) : String
+  parts = [] of String
+  relations = ""
+  fields.each do |field|
+    next unless field.reference?
+    target = camelize(field.name)
+    if known.includes?(target)
+      relations += "  belongs_to " + field.name + " : " + target + "\n"
+    else
+      relations += "  # belongs_to " + field.name + " : " + target + "    (generate the " + target + " model, then uncomment)\n"
+    end
+  end
+  parts << relations unless relations.empty?
+  # Text fields and links must be filled in; the rest is up to you.
+  required = fields.select { |f| f.kind == "string" || (f.reference? && known.includes?(camelize(f.name))) }
+  unless required.empty?
+    parts << "  validates " + required.map { |f| ":" + f.column }.join(", ") + ", presence: true\n"
+  end
+  "class " + names.model + " < ApplicationRecord\n" + parts.join("\n") + "end\n"
+end
+
+# `has_many posts : Post` in the model a new one references: after its last
+# field or relation line, or first in the class when it has none.
+pub def add_has_many(source : String, names : Names) : String
+  line = "  has_many " + names.plural + " : " + names.model
+  return source if source.includes?(line)
+  lines = source.lines
+  at = -1
+  head = -1
+  lines.each_with_index do |current, index|
+    stripped = current.strip
+    head = index if head < 0 && current.starts_with?("class ")
+    if stripped.starts_with?("property ") || stripped.starts_with?("getter ") || stripped.starts_with?("belongs_to ") || stripped.starts_with?("has_many ") || stripped.starts_with?("has_one ")
+      at = index
+    end
+  end
+  if at < 0
+    return source if head < 0
+    lines.insert(head + 1, line)
+    # Kept apart from what follows, unless the class ends right there.
+    lines.insert(head + 2, "") unless lines[head + 2].rstrip == "end"
+    return lines.join("\n") + "\n"
+  end
+  previous = lines[at].strip
+  # Relations sit apart from the fields, as the generators write them.
+  if previous.starts_with?("property ") || previous.starts_with?("getter ")
+    lines.insert(at + 1, "")
+    at += 1
+  end
+  lines.insert(at + 1, line)
+  lines.join("\n") + "\n"
+end
+
+pub def create_table_migration(names : Names, fields : Array(Field), postgres : Bool) : String
+  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  stamp = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT now()" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+  columns = ["  id " + id]
+  fields.each { |field| columns << "  " + field.column + " " + field.sql_type(postgres) }
+  columns << "  created_at " + stamp
+  columns << "  updated_at " + stamp
+  out = "-- up\nCREATE TABLE " + names.plural + " (\n" + columns.join(",\n") + "\n);\n"
+  fields.each do |field|
+    if field.reference?
+      out += "CREATE INDEX " + names.plural + "_" + field.column + " ON " + names.plural + " (" + field.column + ");\n"
+    end
+  end
+  out + "\n-- down\nDROP TABLE " + names.plural + ";\n"
+end
+
+# db/seeds.iyi for a new application.
+pub def seeds_file : String
+  <<-IYI
+  # The rows a new database starts with: `kurt db:seed`, and `kurt db:reset`
+  # after it migrates. Written with the models, as anywhere else; run it as
+  # often as you like, find_or_create_by finds what an earlier run made.
+  #
+  #   ada = User.find_or_create_by(email: "ada@example.com") do |user|
+  #     user.name = "Ada"
+  #   end!
+  #   Post.find_or_create_by(title: "Welcome", user_id: ada.id)!
+
+  IYI
+end
+
+pub def empty_migration : String
+  "-- up\n\n\n-- down\n\n"
+end
+
+# ---------------------------------------------------------------------------
+# Controllers and views
+# ---------------------------------------------------------------------------
+
+pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String) : String
+  view = names.plural + "/"
+  permitted = fields.map { |field| ":" + field.column }.join(", ")
+  # The records a form's selects offer, loaded for the actions that show it.
+  list_filters = ""
+  list_methods = ""
+  fields.each do |field|
+    shown_by = reference_label(field, labels)
+    next if shown_by.nil?
+    target = camelize(field.name)
+    list = pluralize(underscore(target))
+    list_filters += "  before_action :set_" + list + ", only: [:new, :create, :edit, :update]\n"
+    list_methods += "  # The " + humanize(list).downcase + " the form's select offers.\n"
+    list_methods += "  private def set_" + list + "\n    @" + list + " = " + target + ".order(:" + shown_by + ").all!\n  end\n\n"
+  end
+  # The list shows each reference's name: load them with the rows, so the
+  # page asks once per association, not once per row.
+  shown_refs = fields.select { |field| !reference_label(field, labels).nil? }.map { |field| ":" + field.name }
+  listing = shown_refs.empty? ? names.model + ".order_desc(:id)" : names.model + ".includes(" + shown_refs.join(", ") + ").order_desc(:id)"
+  <<-IYI
+  class #{names.controller} < ApplicationController
+    before_action :set_#{names.singular}, only: [:show, :edit, :update, :destroy]
+  #{list_filters}
+    # GET /#{names.plural}
+    def index
+      @#{names.plural} = #{listing}.paginate(params[:page]?, per: 25).all!
+      render "#{view}index"
+    end
+
+    # GET /#{names.plural}/:id
+    def show
+      render "#{view}show"
+    end
+
+    # GET /#{names.plural}/new
+    def new
+      render "#{view}new"
+    end
+
+    # POST /#{names.plural}
+    def create
+      @#{names.singular} = #{names.model}.new(#{names.singular}_params)
+      if @#{names.singular}.save!
+        redirect_to path_to(@#{names.singular}), notice: "#{names.human} was created."
+      else
+        render "#{view}new", status: 422
+      end
+    end
+
+    # GET /#{names.plural}/:id/edit
+    def edit
+      render "#{view}edit"
+    end
+
+    # PATCH /#{names.plural}/:id
+    def update
+      if @#{names.singular}.update(#{names.singular}_params)!
+        redirect_to path_to(@#{names.singular}), notice: "#{names.human} was updated."
+      else
+        render "#{view}edit", status: 422
+      end
+    end
+
+    # DELETE /#{names.plural}/:id
+    def destroy
+      @#{names.singular}.destroy!
+      redirect_to "/#{names.plural}", notice: "#{names.human} was deleted."
+    end
+
+    # The record the action works on; a missing one is a 404 before the
+    # action runs.
+    private def set_#{names.singular}
+      @#{names.singular} = #{names.model}.find(params[:id])!
+    end
+
+  #{list_methods}  # The fields the form may set: strong parameters, as in Rails.
+    private def #{names.singular}_params : Hash(String, String)
+      params.require(:#{names.singular}).permit(#{permitted})
+    end
+  end
+  IYI
+end
+
+# What a reference shows its record by: *labels* maps a model to its first
+# text column ("User" => "name"), read from db/schema.json; a model with
+# none is shown by its id.
+def reference_label(field : Field, labels : Hash(String, String)) : String?
+  field.reference? ? labels[camelize(field.name)]? : nil
+end
+
+# The referenced record's label, or nothing when the link is empty or the
+# record is gone: `<% if (user = post.user?).is_a?(User) %>...`. A
+# template is compiled as Crystal, where `!` and `.or` do not exist, so the
+# answer is narrowed with `is_a?`.
+def reference_cell(record : String, field : Field, labels : Hash(String, String)) : String?
+  label = reference_label(field, labels)
+  return nil if label.nil?
+  "<% if (" + field.name + " = " + record + "." + field.name + "?).is_a?(" + camelize(field.name) + ") %><%= " + field.name + "." + label + " %><% end %>"
+end
+
+def input_for(names : Names, field : Field, labels : Hash(String, String) = {} of String => String) : String
+  value = "<%= @" + names.singular + "." + field.column + " %>"
+  id = names.singular + "_" + field.column
+  name = names.singular + "[" + field.column + "]"
+  label = "    <label for=\"" + id + "\">" + field.label + "</label>\n"
+  if shown_by = reference_label(field, labels)
+    target = camelize(field.name)
+    return label + "    <select id=\"" + id + "\" name=\"" + name + "\">\n" +
+      "      <option value=\"\">Select a " + humanize(field.name).downcase + "</option>\n" +
+      "      <% @" + pluralize(underscore(target)) + ".each do |option| %>\n" +
+      "      <option value=\"<%= option.id %>\"<%= option.id == @" + names.singular + "." + field.column + " ? \" selected\" : \"\" %>><%= option." + shown_by + " %></option>\n" +
+      "      <% end %>\n    </select>\n"
+  end
+  case field.kind
+  when "text"
+    label + "    <textarea id=\"" + id + "\" name=\"" + name + "\" rows=\"8\">" + value + "</textarea>\n"
+  when "int", "references"
+    label + "    <input id=\"" + id + "\" type=\"number\" name=\"" + name + "\" value=\"" + value + "\">\n"
+  when "float"
+    label + "    <input id=\"" + id + "\" type=\"number\" step=\"any\" name=\"" + name + "\" value=\"" + value + "\">\n"
+  when "bool"
+    "    <label class=\"check\">\n      <input type=\"hidden\" name=\"" + name + "\" value=\"0\">\n      <input id=\"" + id + "\" type=\"checkbox\" name=\"" + name + "\" value=\"1\"<%= @" + names.singular + "." + field.column + " ? \" checked\" : \"\" %>>\n      " + field.label + "\n    </label>\n"
+  when "time"
+    label + "    <input id=\"" + id + "\" type=\"datetime-local\" name=\"" + name + "\" value=\"<%= @" + names.singular + "." + field.column + ".to_s(\"%Y-%m-%dT%H:%M\") %>\">\n"
+  else
+    label + "    <input id=\"" + id + "\" type=\"text\" name=\"" + name + "\" value=\"" + value + "\">\n"
+  end
+end
+
+pub def form_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
+  return daisy_form_view(names, fields, labels) if daisy
+  out = "<% if @" + names.singular + ".errors.any? %>\n<div class=\"errors\" role=\"alert\">\n  <p><%= @" + names.singular + ".errors.size %> problem(s) kept this " + names.human.downcase + " from being saved:</p>\n  <ul>\n  <% @" + names.singular + ".errors.full_messages.each do |message| %>\n    <li><%= message %></li>\n  <% end %>\n  </ul>\n</div>\n<% end %>\n\n"
+  out += "<form method=\"post\" action=\"<%= @" + names.singular + ".persisted? ? path_to(@" + names.singular + ") : \"/" + names.plural + "\" %>\" class=\"form\">\n"
+  out += "  <%= raw(csrf_field) %>\n"
+  out += "  <% if @" + names.singular + ".persisted? %><input type=\"hidden\" name=\"_method\" value=\"patch\"><% end %>\n"
+  fields.each do |field|
+    out += "  <div class=\"field" + "<%= @" + names.singular + ".errors.on(\"" + field.column + "\").empty? ? \"\" : \" field-error\" %>\">\n"
+    out += input_for(names, field, labels)
+    out += "  </div>\n"
+  end
+  out += "  <div class=\"actions\">\n    <button type=\"submit\" class=\"button\">Save " + names.human.downcase + "</button>\n  </div>\n</form>\n"
+  out
+end
+
+pub def index_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
+  return daisy_index_view(names, fields, labels) if daisy
+  shown = fields.reject { |f| f.kind == "text" }
+  shown = fields if shown.empty?
+  out = "<% content_for \"title\" do %>" + humanize(names.plural) + "<% end -%>\n"
+  out += "<div class=\"page-header\">\n  <h1>" + humanize(names.plural) + "</h1>\n  <%= link_to \"New " + names.human.downcase + "\", \"/" + names.plural + "/new\", class: \"button\" %>\n</div>\n\n"
+  out += "<% if @" + names.plural + ".empty? %>\n<p class=\"empty\">No " + humanize(names.plural).downcase + " yet.</p>\n<% else %>\n"
+  out += "<table class=\"table\">\n  <thead>\n    <tr>\n"
+  shown.each { |f| out += "      <th>" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</th>\n" }
+  out += "      <th></th>\n    </tr>\n  </thead>\n  <tbody>\n"
+  out += "  <% @" + names.plural + ".each do |" + names.singular + "| %>\n    <tr>\n"
+  shown.each_with_index do |f, i|
+    cell = reference_cell(names.singular, f, labels) || "<%= " + names.singular + "." + f.column + " %>"
+    cell = "<a href=\"<%= path_to(" + names.singular + ") %>\">" + cell + "</a>" if i == 0
+    out += "      <td>" + cell + "</td>\n"
+  end
+  out += "      <td class=\"row-actions\">\n        <%= link_to \"Edit\", path_to(" + names.singular + ") + \"/edit\" %>\n"
+  out += "        <%= button_to \"Delete\", path_to(" + names.singular + "), method: :delete, class: \"link danger\", confirm: \"Delete this " + names.human.downcase + "?\" %>\n"
+  out += "      </td>\n"
+  out += "    </tr>\n  <% end %>\n  </tbody>\n</table>\n<% end %>\n"
+  out
+end
+
+pub def show_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
+  return daisy_show_view(names, fields, labels) if daisy
+  out = "<% content_for \"title\" do %>" + names.human + " <%= @" + names.singular + ".id %><% end -%>\n"
+  out += "<div class=\"page-header\">\n  <h1>" + names.human + " <%= @" + names.singular + ".id %></h1>\n</div>\n\n<dl class=\"details\">\n"
+  fields.each do |f|
+    shown = reference_cell("@" + names.singular, f, labels)
+    shown ||= f.kind == "text" ? "<div class=\"prose\"><%= @" + names.singular + "." + f.column + " %></div>" : "<%= @" + names.singular + "." + f.column + " %>"
+    out += "  <dt>" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</dt>\n  <dd>" + shown + "</dd>\n"
+  end
+  out += "</dl>\n\n<div class=\"actions\">\n  <%= link_to \"Edit\", path_to(@" + names.singular + ") + \"/edit\", class: \"button\" %>\n  <%= link_to \"Back to " + humanize(names.plural).downcase + "\", \"/" + names.plural + "\" %>\n  <%= button_to \"Delete this " + names.human.downcase + "\", path_to(@" + names.singular + "), method: :delete, class: \"link danger\", confirm: \"Delete this " + names.human.downcase + "?\" %>\n</div>\n"
+  out
+end
+
+pub def new_view(names : Names, daisy : Bool = false) : String
+  return daisy_page_view(names, "New " + names.human.downcase, false) if daisy
+  "<% content_for \"title\" do %>New " + names.human.downcase + "<% end -%>\n<h1>New " + names.human.downcase + "</h1>\n\n<%= render \"_form.eiy\" %>\n\n<%= link_to \"Back to " + humanize(names.plural).downcase + "\", \"/" + names.plural + "\" %>\n"
+end
+
+pub def edit_view(names : Names, daisy : Bool = false) : String
+  return daisy_page_view(names, "Editing " + names.human.downcase, true) if daisy
+  "<% content_for \"title\" do %>Editing " + names.human.downcase + "<% end -%>\n<h1>Editing " + names.human.downcase + "</h1>\n\n<%= render \"_form.eiy\" %>\n\n<%= link_to \"Show\", path_to(@" + names.singular + ") %> ·\n<%= link_to \"Back to " + humanize(names.plural).downcase + "\", \"/" + names.plural + "\" %>\n"
+end
+
+# A controller with the named actions, each rendering a view of its name.
+pub def plain_controller(name : String, actions : Array(String)) : String
+  plural = underscore(name)
+  out = "class " + camelize(plural) + "Controller < ApplicationController\n"
+  actions.each_with_index do |action, i|
+    out += "\n" if i > 0
+    out += "  # GET /" + plural + (action == "index" ? "" : "/" + action) + "\n"
+    out += "  def " + action + "\n    render \"" + plural + "/" + action + "\"\n  end\n"
+  end
+  out + "end\n"
+end
+
+pub def plain_view(name : String, action : String, daisy : Bool = false) : String
+  plural = underscore(name)
+  if daisy
+    return "<% content_for \"title\" do %>" + camelize(plural) + "#" + action + "<% end -%>\n<h1 class=\"text-3xl font-bold\">" + camelize(plural) + "#" + action + "</h1>\n<p class=\"mt-2 text-base-content/70\">Find me in app/views/" + plural + "/" + action + ".eiy</p>\n"
+  end
+  "<% content_for \"title\" do %>" + camelize(plural) + "#" + action + "<% end -%>\n<h1>" + camelize(plural) + "#" + action + "</h1>\n<p>Find me in app/views/" + plural + "/" + action + ".eiy</p>\n"
+end
+
+# ---------------------------------------------------------------------------
+# Tailwind CSS and daisyUI (the default; `kurt new NAME --css none` skips it)
+# ---------------------------------------------------------------------------
+
+# app/assets/tailwind/app.css: what `kurt dev` and `kurt build` compile into
+# public/assets/app.css with the Tailwind CLI. The classes are read from the
+# views; daisyUI's two files sit next to this one.
+pub def tailwind_css : String
+  <<-CSS
+  /* The application's styles: Tailwind CSS with daisyUI (https://daisyui.com).
+     `kurt dev` and `kurt build` compile this file into public/assets/app.css,
+     with the classes the views in app/views use. */
+  @import "tailwindcss" source(none);
+  @source "../../views/**/*.eiy";
+
+  /* Two themes: light, and dracula as the dark one. Dracula is used when the
+     system is in dark mode; data-theme="light" or "dracula" on <html> picks one. */
+  @plugin "./daisyui.mjs" {
+    themes: light --default, dracula --prefersdark;
+  }
+
+  /* A theme of your own, with daisyui-theme.mjs:
+  @plugin "./daisyui-theme.mjs" {
+    name: "brand";
+    default: true;
+    --color-primary: oklch(55% 0.2 25);
+  }
+  */
+
+  CSS
+end
+
+# " input-error" when the field did not validate, else "".
+def error_class(names : Names, field : Field, kind : String) : String
+  "<%= @" + names.singular + ".errors.on(\"" + field.column + "\").empty? ? \"\" : \" " + kind + "-error\" %>"
+end
+
+def daisy_input_for(names : Names, field : Field, labels : Hash(String, String)) : String
+  record = "@" + names.singular
+  value = "<%= " + record + "." + field.column + " %>"
+  id = names.singular + "_" + field.column
+  name = names.singular + "[" + field.column + "]"
+  # A label tied to its input, styled as daisyUI's legend: screen readers
+  # name the field by it.
+  legend = "      <label class=\"fieldset-legend\" for=\"" + id + "\">" + field.label + "</label>\n"
+  if shown_by = reference_label(field, labels)
+    target = camelize(field.name)
+    return "      <label class=\"fieldset-legend\" for=\"" + id + "\">" + humanize(field.name) + "</label>\n" +
+      "      <select id=\"" + id + "\" name=\"" + name + "\" class=\"select w-full" + error_class(names, field, "select") + "\">\n" +
+      "        <option value=\"\">Select a " + humanize(field.name).downcase + "</option>\n" +
+      "        <% @" + pluralize(underscore(target)) + ".each do |option| %>\n" +
+      "        <option value=\"<%= option.id %>\"<%= option.id == " + record + "." + field.column + " ? \" selected\" : \"\" %>><%= option." + shown_by + " %></option>\n" +
+      "        <% end %>\n      </select>\n"
+  end
+  case field.kind
+  when "text"
+    legend + "      <textarea id=\"" + id + "\" name=\"" + name + "\" rows=\"8\" class=\"textarea w-full" + error_class(names, field, "textarea") + "\">" + value + "</textarea>\n"
+  when "int", "references"
+    legend + "      <input id=\"" + id + "\" type=\"number\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
+  when "float"
+    legend + "      <input id=\"" + id + "\" type=\"number\" step=\"any\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
+  when "bool"
+    "      <label class=\"label\">\n        <input type=\"hidden\" name=\"" + name + "\" value=\"0\">\n        <input id=\"" + id + "\" type=\"checkbox\" name=\"" + name + "\" value=\"1\" class=\"checkbox\"<%= " + record + "." + field.column + " ? \" checked\" : \"\" %>>\n        " + field.label + "\n      </label>\n"
+  when "time"
+    legend + "      <input id=\"" + id + "\" type=\"datetime-local\" name=\"" + name + "\" value=\"<%= " + record + "." + field.column + ".to_s(\"%Y-%m-%dT%H:%M\") %>\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
+  else
+    legend + "      <input id=\"" + id + "\" type=\"text\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
+  end
+end
+
+def daisy_form_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
+  record = "@" + names.singular
+  out = "<% if " + record + ".errors.any? %>\n<div role=\"alert\" class=\"alert alert-error mb-6\">\n  <div>\n    <p class=\"font-semibold\"><%= " + record + ".errors.size %> problem(s) kept this " + names.human.downcase + " from being saved:</p>\n    <ul class=\"list-disc ml-5\">\n    <% " + record + ".errors.full_messages.each do |message| %>\n      <li><%= message %></li>\n    <% end %>\n    </ul>\n  </div>\n</div>\n<% end %>\n\n"
+  out += "<form method=\"post\" action=\"<%= " + record + ".persisted? ? path_to(" + record + ") : \"/" + names.plural + "\" %>\" class=\"card bg-base-100 shadow-sm\">\n"
+  out += "  <div class=\"card-body\">\n"
+  out += "    <%= raw(csrf_field) %>\n"
+  out += "    <% if " + record + ".persisted? %><input type=\"hidden\" name=\"_method\" value=\"patch\"><% end %>\n"
+  fields.each do |field|
+    out += "    <fieldset class=\"fieldset\">\n" + daisy_input_for(names, field, labels) + "    </fieldset>\n"
+  end
+  out += "    <div class=\"card-actions justify-end mt-4\">\n      <button type=\"submit\" class=\"btn btn-primary\">Save " + names.human.downcase + "</button>\n    </div>\n  </div>\n</form>\n"
+  out
+end
+
+def daisy_index_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
+  shown = fields.reject { |f| f.kind == "text" }
+  shown = fields if shown.empty?
+  title = humanize(names.plural)
+  out = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
+  out += "<div class=\"flex items-center justify-between gap-4 mb-6\">\n  <h1 class=\"text-3xl font-bold\">" + title + "</h1>\n  <%= link_to \"New " + names.human.downcase + "\", \"/" + names.plural + "/new\", class: \"btn btn-primary\" %>\n</div>\n\n"
+  out += "<% if @" + names.plural + ".empty? %>\n<div class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body items-center text-base-content/60\">No " + title.downcase + " yet.</div>\n</div>\n<% else %>\n"
+  out += "<div class=\"overflow-x-auto rounded-box bg-base-100 shadow-sm\">\n<table class=\"table\">\n  <thead>\n    <tr>\n"
+  shown.each { |f| out += "      <th>" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</th>\n" }
+  out += "      <th></th>\n    </tr>\n  </thead>\n  <tbody>\n"
+  out += "  <% @" + names.plural + ".each do |" + names.singular + "| %>\n    <tr class=\"hover:bg-base-200\">\n"
+  shown.each_with_index do |f, i|
+    cell = reference_cell(names.singular, f, labels) || "<%= " + names.singular + "." + f.column + " %>"
+    cell = "<a class=\"link link-hover font-medium\" href=\"<%= path_to(" + names.singular + ") %>\">" + cell + "</a>" if i == 0
+    out += "      <td>" + cell + "</td>\n"
+  end
+  out += "      <td class=\"text-right whitespace-nowrap\">\n        <%= link_to \"Edit\", path_to(" + names.singular + ") + \"/edit\", class: \"btn btn-ghost btn-xs\" %>\n"
+  out += "        <%= button_to \"Delete\", path_to(" + names.singular + "), method: :delete, class: \"btn btn-ghost btn-xs text-error\", confirm: \"Delete this " + names.human.downcase + "?\" %>\n"
+  out += "      </td>\n"
+  out += "    </tr>\n  <% end %>\n  </tbody>\n</table>\n</div>\n<% end %>\n"
+  out
+end
+
+def daisy_show_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
+  record = "@" + names.singular
+  out = "<% content_for \"title\" do %>" + names.human + " <%= " + record + ".id %><% end -%>\n"
+  out += "<h1 class=\"text-3xl font-bold mb-6\">" + names.human + " <%= " + record + ".id %></h1>\n\n"
+  out += "<div class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body\">\n    <dl class=\"grid gap-4\">\n"
+  fields.each do |f|
+    shown = reference_cell(record, f, labels)
+    shown ||= f.kind == "text" ? "<div class=\"whitespace-pre-wrap\"><%= " + record + "." + f.column + " %></div>" : "<%= " + record + "." + f.column + " %>"
+    out += "      <div>\n        <dt class=\"text-sm font-semibold text-base-content/60\">" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</dt>\n        <dd>" + shown + "</dd>\n      </div>\n"
+  end
+  out += "    </dl>\n    <div class=\"card-actions justify-end mt-4\">\n      <%= button_to \"Delete\", path_to(" + record + "), method: :delete, class: \"btn btn-ghost text-error\", confirm: \"Delete this " + names.human.downcase + "?\" %>\n      <%= link_to \"Back to " + humanize(names.plural).downcase + "\", \"/" + names.plural + "\", class: \"btn btn-ghost\" %>\n      <%= link_to \"Edit\", path_to(" + record + ") + \"/edit\", class: \"btn btn-primary\" %>\n    </div>\n  </div>\n</div>\n"
+  out
+end
+
+# new.eiy and edit.eiy: a title and the form.
+def daisy_page_view(names : Names, title : String, editing : Bool) : String
+  out = "<% content_for \"title\" do %>" + title + "<% end -%>\n<h1 class=\"text-3xl font-bold mb-6\">" + title + "</h1>\n\n<%= render \"_form.eiy\" %>\n\n<div class=\"mt-4 flex gap-4\">\n"
+  out += "  <%= link_to \"Show\", path_to(@" + names.singular + "), class: \"link\" %>\n" if editing
+  out + "  <%= link_to \"Back to " + humanize(names.plural).downcase + "\", \"/" + names.plural + "\", class: \"link\" %>\n</div>\n"
+end
+
+def daisy_home_view(app : String) : String
+  <<-EIY
+  <% content_for "title" do %>#{camelize(app)}<% end -%>
+  <div class="hero rounded-box bg-base-100 py-16 shadow-sm">
+    <div class="hero-content text-center">
+      <div class="max-w-xl">
+        <img src="/icon.svg" alt="Kurt" width="96" height="109" class="mx-auto">
+        <h1 class="mt-6 text-4xl font-bold">#{camelize(app)} is running</h1>
+        <p class="py-4 text-base-content/70">A Kurt application on iyi, styled with Tailwind CSS and daisyUI. Next:</p>
+        <div class="mockup-code text-left text-sm">
+          <pre data-prefix="$"><code>kurt generate scaffold Post title:string body:text published:bool</code></pre>
+          <pre data-prefix="$"><code>kurt db:migrate</code></pre>
+        </div>
+        <p class="pt-4 text-sm">then open <a class="link link-primary" href="/posts">/posts</a>. This page is <code>app/views/home/index.eiy</code>.</p>
+      </div>
+    </div>
+  </div>
+
+  EIY
+end
+
+def daisy_layout_view(app : String) : String
+  <<-EIY
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title><%= yield_content "title" %> · #{camelize(app)}</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/app.css">
+    <script>
+      // The theme chosen with the navbar button, before the page is drawn.
+      // Without a choice, the system decides (app/assets/tailwind/app.css).
+      try {
+        var theme = localStorage.getItem("theme");
+        if (theme) document.documentElement.setAttribute("data-theme", theme);
+      } catch (e) {}
+    </script>
+  </head>
+  <body class="min-h-screen bg-base-200">
+    <header class="navbar bg-base-100 px-4 shadow-sm">
+      <div class="flex-1"><a class="btn btn-ghost text-xl" href="/">#{camelize(app)}</a></div>
+      <ul class="menu menu-horizontal gap-1"><!-- kurt:nav --></ul>
+      <button type="button" class="btn btn-ghost btn-circle" data-theme-toggle aria-label="Switch to the dark theme" title="Switch theme">
+        <svg data-theme-icon="light" class="size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>
+        <svg data-theme-icon="dark" class="hidden size-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>
+      </button>
+    </header>
+    <main class="mx-auto max-w-4xl p-6">
+      <% if notice = flash?("notice") %><div role="alert" class="alert alert-success mb-6"><span><%= notice %></span></div><% end %>
+      <% if alert = flash?("alert") %><div role="alert" class="alert alert-error mb-6"><span><%= alert %></span></div><% end %>
+      <%= content %>
+    </main>
+    <script>
+      // The navbar button: light and dracula, the two themes in app.css.
+      (function () {
+        var root = document.documentElement;
+        var button = document.querySelector("[data-theme-toggle]");
+        var current = function () {
+          return root.getAttribute("data-theme") ||
+            (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dracula" : "light");
+        };
+        var show = function () {
+          var dark = current() === "dracula";
+          button.querySelector('[data-theme-icon="light"]').classList.toggle("hidden", dark);
+          button.querySelector('[data-theme-icon="dark"]').classList.toggle("hidden", !dark);
+          button.setAttribute("aria-label", dark ? "Switch to the light theme" : "Switch to the dark theme");
+        };
+        button.addEventListener("click", function () {
+          var next = current() === "dracula" ? "light" : "dracula";
+          root.setAttribute("data-theme", next);
+          try { localStorage.setItem("theme", next); } catch (e) {}
+          show();
+        });
+        show();
+      })();
+    </script>
+    <%= raw(live_reload_tag) %>
+  </body>
+  </html>
+
+  EIY
+end
+
+# ---------------------------------------------------------------------------
+# Authentication: `kurt generate authentication`, after Rails 8's generator.
+# Users with an email address and a bcrypt password, sign-in and sign-out
+# through the cookie session, sign-up, and sign-in required everywhere
+# unless a controller says `allow_unauthenticated_access`.
+# ---------------------------------------------------------------------------
+
+pub AUTH_PASSWORD = "password123"
+
+pub def auth_label(column : String) : String
+  humanize(column)
+end
+
+# A new User: the address it signs in with, its password's digest.
+pub def auth_user_model(login : String) : String
+  <<-IYI
+  class User < ApplicationRecord
+  #{auth_user_lines(login)}end
+
+  IYI
+end
+
+# What a User gets for signing in; also put into a User that exists.
+pub def auth_user_lines(login : String) : String
+  <<-IYI
+    has_secure_password
+
+    validates :#{login}, presence: true, format: /\\A[^@\\s]+@[^@\\s]+\\z/, uniqueness: true
+    validates :password, length: {minimum: 8}
+
+    before_validation :normalize_#{login}
+
+    # Addresses are kept trimmed and lowercase, so "Ada@Example.com " signs in.
+    def normalize_#{login}
+      @#{login} = #{login}.strip.downcase
+    end
+
+  IYI
+end
+
+pub def auth_users_migration(login : String, postgres : Bool) : String
+  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  time = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+  <<-SQL
+  -- up
+  CREATE TABLE users (
+    id #{id},
+    #{login} TEXT NOT NULL DEFAULT '',
+    password_digest TEXT NOT NULL DEFAULT '',
+    created_at #{time},
+    updated_at #{time}
+  );
+  CREATE UNIQUE INDEX users_#{login} ON users (#{login});
+
+  -- down
+  DROP TABLE users;
+
+  SQL
+end
+
+# For a users table that exists: the digest, and the address when it has none.
+pub def auth_columns_migration(login : String, add_login : Bool) : String
+  up = [] of String
+  down = [] of String
+  if add_login
+    up << "ALTER TABLE users ADD COLUMN " + login + " TEXT NOT NULL DEFAULT '';"
+    down << "ALTER TABLE users DROP COLUMN " + login + ";"
+  end
+  up << "ALTER TABLE users ADD COLUMN password_digest TEXT NOT NULL DEFAULT '';"
+  up << "CREATE UNIQUE INDEX users_" + login + " ON users (" + login + ");"
+  down.unshift("DROP INDEX users_" + login + ";")
+  down << "ALTER TABLE users DROP COLUMN password_digest;"
+  "-- up\n" + up.join("\n") + "\n\n-- down\n" + down.join("\n") + "\n"
+end
+
+# Put into ApplicationController: the rule, and who is signed in.
+pub def auth_application_lines : String
+  <<-IYI
+    before_action :require_authentication
+
+    @current_user : User? = nil
+    @current_user_loaded : Bool = false
+
+    # The signed-in user, or nil; views ask it too:
+    # `<% if user = current_user? %>`.
+    def current_user? : User?
+      unless @current_user_loaded
+        @current_user_loaded = true
+        if id = session_user_id
+          found = User.find?(id)
+          @current_user = found.is_a?(User) ? found : nil
+        end
+      end
+      @current_user
+    end
+
+    # Every action needs a signed-in user unless its controller says
+    # `allow_unauthenticated_access`. A page sends the visitor to /login,
+    # and back to it after signing in.
+    def require_authentication
+      return nil if current_user?
+      if (store = session?) && env.request.method == "GET"
+        store["return_to"] = env.request.path
+      end
+      Unauthorized.new
+    end
+
+  IYI
+end
+
+pub def sessions_controller(login : String) : String
+  <<-IYI
+  class SessionsController < ApplicationController
+    allow_unauthenticated_access only: [:new, :create]
+
+    # GET /login
+    def new
+      render "sessions/new"
+    end
+
+    # POST /login
+    def create
+      if user = User.authenticate_by("#{login}", params[:#{login}].strip.downcase, params[:password])!
+        back = session["return_to"]? || "/"
+        start_session_for(user)
+        redirect_to back, notice: "Signed in."
+      else
+        redirect_to "/login", alert: "Try another email address or password."
+      end
+    end
+
+    # DELETE /logout
+    def destroy
+      terminate_session
+      redirect_to "/login", notice: "Signed out."
+    end
+  end
+
+  IYI
+end
+
+pub def registrations_controller(fields : Array(String)) : String
+  permitted = (fields + ["password", "password_confirmation"]).map { |f| ":" + f }.join(", ")
+  <<-IYI
+  class RegistrationsController < ApplicationController
+    allow_unauthenticated_access
+
+    # GET /signup
+    def new
+      render "registrations/new"
+    end
+
+    # POST /signup
+    def create
+      @user = User.new(registration_params)
+      if @user.save!
+        start_session_for(@user)
+        redirect_to "/", notice: "Welcome!"
+      else
+        render "registrations/new", status: 422
+      end
+    end
+
+    private def registration_params : Hash(String, String)
+      params.require(:user).permit(#{permitted})
+    end
+  end
+
+  IYI
+end
+
+# One labelled input of a sign-in or sign-up form.
+pub def auth_input(id : String, name : String, label : String, type : String, value : String, extra : String, daisy : Bool) : String
+  if daisy
+    "    <fieldset class=\"fieldset\">\n      <label class=\"fieldset-legend\" for=\"" + id + "\">" + label + "</label>\n      <input id=\"" + id + "\" type=\"" + type + "\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full\"" + extra + ">\n    </fieldset>\n"
+  else
+    "  <div class=\"field\">\n    <label for=\"" + id + "\">" + label + "</label>\n    <input id=\"" + id + "\" type=\"" + type + "\" name=\"" + name + "\" value=\"" + value + "\"" + extra + ">\n  </div>\n"
+  end
+end
+
+def auth_form(title : String, action : String, inputs : String, button : String, after : String, errors : String, daisy : Bool) : String
+  head = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
+  if daisy
+    head + "<div class=\"mx-auto max-w-sm\">\n  <h1 class=\"text-3xl font-bold mb-6\">" + title + "</h1>\n" + errors +
+      "  <form method=\"post\" action=\"" + action + "\" class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body\">\n    <%= raw(csrf_field) %>\n" + inputs +
+      "    <button type=\"submit\" class=\"btn btn-primary mt-4\">" + button + "</button>\n  </div>\n  </form>\n  <p class=\"mt-4 text-sm\">" + after + "</p>\n</div>\n"
+  else
+    head + "<h1>" + title + "</h1>\n" + errors + "<form method=\"post\" action=\"" + action + "\" class=\"form\">\n  <%= raw(csrf_field) %>\n" + inputs +
+      "  <div class=\"actions\"><button type=\"submit\" class=\"button\">" + button + "</button></div>\n</form>\n<p>" + after + "</p>\n"
+  end
+end
+
+pub def sessions_view(login : String, daisy : Bool) : String
+  link = daisy ? "class=\"link link-primary\" " : ""
+  inputs = auth_input(login, login, auth_label(login), "email", "", " required autofocus autocomplete=\"username\"", daisy) +
+           auth_input("password", "password", "Password", "password", "", " required maxlength=\"72\" autocomplete=\"current-password\"", daisy)
+  auth_form("Sign in", "/login", inputs, "Sign in", "No account yet? <a " + link + "href=\"/signup\">Sign up</a>", "", daisy)
+end
+
+pub def registrations_view(login : String, fields : Array(String), daisy : Bool) : String
+  link = daisy ? "class=\"link link-primary\" " : ""
+  inputs = ""
+  fields.each do |field|
+    type = field == login ? "email" : "text"
+    extra = field == login ? " required autocomplete=\"username\"" : ""
+    inputs += auth_input("user_" + field, "user[" + field + "]", auth_label(field), type, "<%= @user." + field + " %>", extra, daisy)
+  end
+  inputs += auth_input("user_password", "user[password]", "Password", "password", "", " required minlength=\"8\" maxlength=\"72\" autocomplete=\"new-password\"", daisy)
+  inputs += auth_input("user_password_confirmation", "user[password_confirmation]", "Password confirmation", "password", "", " required autocomplete=\"new-password\"", daisy)
+  box = daisy ? "  <div role=\"alert\" class=\"alert alert-error mb-6\">\n    <ul class=\"list-disc ml-5\">\n" : "<div class=\"errors\" role=\"alert\">\n  <ul>\n"
+  close = daisy ? "    </ul>\n  </div>\n" : "  </ul>\n</div>\n"
+  errors = "<% if @user.errors.any? %>\n" + box + "    <% @user.errors.full_messages.each do |message| %><li><%= message %></li><% end %>\n" + close + "<% end %>\n"
+  auth_form("Sign up", "/signup", inputs, "Create account", "Already have one? <a " + link + "href=\"/login\">Sign in</a>", errors, daisy)
+end
+
+# The layout's links: who is signed in and a sign-out button, or the way in.
+pub def auth_nav(daisy : Bool) : String
+  if daisy
+    "<% if current_user? %><li><%= button_to \"Sign out\", \"/logout\", method: :delete %></li><% else %><li><a href=\"/login\">Sign in</a></li><li><a href=\"/signup\">Sign up</a></li><% end %>"
+  else
+    "<% if current_user? %><%= button_to \"Sign out\", \"/logout\", method: :delete, class: \"link\" %><% else %><a href=\"/login\">Sign in</a><a href=\"/signup\">Sign up</a><% end %>"
+  end
+end
+
+pub def auth_routes : Array(String)
+  ["get \"/login\", SessionsController, :new",
+   "post \"/login\", SessionsController, :create",
+   "delete \"/logout\", SessionsController, :destroy",
+   "get \"/signup\", RegistrationsController, :new",
+   "post \"/signup\", RegistrationsController, :create"]
+end
+
+# A user for a test to be signed in as: every text column filled in, the
+# address one of its own (*tag*), so test files do not collide.
+pub def auth_tester(login : String, fields : Array(String), tag : String) : String
+  pairs = [] of String
+  (fields.includes?(login) ? fields : [login] + fields).each do |field|
+    value = field == login || field.includes?("email") ? "tester-" + tag + "@example.com" : "Tester"
+    pairs << "\"" + field + "\" => \"" + value + "\""
+  end
+  pairs << "\"password\" => \"" + AUTH_PASSWORD + "\""
+  pairs << "\"password_confirmation\" => \"" + AUTH_PASSWORD + "\""
+  "User.create({" + pairs.join(", ") + "}).as(User)"
+end
+
+# The line a test gets to be signed in for its requests.
+pub def auth_sign_in_line(login : String, fields : Array(String), tag : String) : String
+  "sign_in_as(" + auth_tester(login, fields, tag) + ")\n"
+end
+
+pub def sessions_test(login : String, fields : Array(String)) : String
+  email = "signin@example.com"
+  form = login + "=signin%40example.com"
+  <<-IYI
+  # Signing up, in and out through the session cookie, as a browser does.
+  # `kurt test` runs this against a freshly migrated test database.
+  app = chain([SessionHandler.new("kurt test session secret, at least 32 bytes"), RouteHandler.new(routes)])
+  #{auth_tester(login, fields, "signin").sub("tester-signin@example.com", email)}
+
+  # the cookie a response set, to send with the next request
+  def cookie_of(res) : String
+    found = ""
+    res.headers.each do |name, value|
+      found = value.split(";")[0] if name.downcase == "set-cookie"
+    end
+    found
+  end
+
+  def with_cookie(request, cookie : String)
+    request.headers["Cookie"] = cookie
+    request
+  end
+
+  assert dispatch(app, "GET", "/login").response.status_code == 200
+  assert dispatch(app, "GET", "/signup").response.status_code == 200
+
+  # a wrong password goes back to the form
+  res = dispatch(app, form_request("POST", "/login", "#{form}&password=wrong-password")).response
+  assert res.status_code == 303
+  assert res.headers["Location"]? == "/login"
+
+  # the right one signs in and leaves a session cookie
+  res = dispatch(app, form_request("POST", "/login", "#{form}&password=#{AUTH_PASSWORD}")).response
+  assert res.status_code == 303
+  assert res.headers["Location"]? == "/"
+  cookie = cookie_of(res)
+  assert !cookie.empty?
+
+  # signing out needs the cookie; without it, the way is to /login
+  assert dispatch(app, "DELETE", "/logout").response.status_code == 302
+  res = dispatch(app, with_cookie(http_request("DELETE", "/logout"), cookie)).response
+  assert res.status_code == 303
+  assert res.headers["Location"]? == "/login"
+
+  # signing up makes a user and signs them in
+  User.#{login}("new-user@example.com").delete_all.as(Int64)
+  res = dispatch(app, form_request("POST", "/signup", "user%5B#{login}%5D=New-User%40example.com&user%5Bpassword%5D=#{AUTH_PASSWORD}&user%5Bpassword_confirmation%5D=#{AUTH_PASSWORD}#{fields.reject { |f| f == login }.map { |f| "&user%5B" + f + "%5D=New" }.join}")).response
+  assert res.status_code == 303
+  assert !cookie_of(res).empty?
+  assert User.#{login}("new-user@example.com").count.as(Int64) == 1   # kept lowercase
+
+  # a password too short is refused, and the form comes back
+  res = dispatch(app, form_request("POST", "/signup", "user%5B#{login}%5D=short%40example.com&user%5Bpassword%5D=short&user%5Bpassword_confirmation%5D=short")).response
+  assert res.status_code == 422
+
+  IYI
+end
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+# Adds *line* to config/routes.iyi, unless it is there already.
+pub def append_route(source : String, line : String) : String
+  return source if source.lines.any? { |current| current.strip == line }
+  source.rstrip + "\n" + line + "\n"
+end
+
+pub def routes_file : String
+  <<-IYI
+  # Every route of the application.
+  #
+  #   resources "posts", PostsController       the REST routes of a resource
+  #   get "/about", PagesController, :about    one route (post, put, patch, delete too)
+  #   resources "posts", PostsController do    nested: /posts/:post_id/comments
+  #     resources "comments", CommentsController
+  #   end
+  #   namespace "admin" do ... end             routes under /admin
+  #
+  # `kurt routes` lists them all.
+
+  root HomeController, :index
+  IYI
+end
+
+# ---------------------------------------------------------------------------
+# A new application
+# ---------------------------------------------------------------------------
+
+# Kurt's module path: a git repository and its version tags, as iyi
+# packages are.
+pub PACKAGE = "github.com/iyikurt/kurt"
+
+# An application's iyi.mod: Kurt at *version* (the kurt command's own), its
+# files importing it as `kurt/...`. *framework*, a Kurt checkout, replaces
+# the release (KURT_PATH, for working on Kurt itself).
+pub def mod_file(app : String, framework : String?, version : String = "0.1.0") : String
+  out = "# Dependencies. `iyi get -u` moves them to their latest releases.\nmodule " + app + "\n\n"
+  out += "require " + PACKAGE + " v" + version + " as kurt\n"
+  out += "require github.com/sdogruyol/iyi-web v0.7.0 as web\n"
+  out += "require github.com/iyilang/db v0.6.0 as db\n"
+  out += "require github.com/iyilang/sqlite v0.6.0 as sqlite\n"
+  if path = framework
+    out += "\n# Kurt from a checkout on this machine (KURT_PATH).\nreplace " + PACKAGE + " => " + path + "\n"
+  end
+  out
+end
+
+# config/application.iyi: what runs before the routes are mounted.
+pub def application_config(secret : String) : String
+  <<-IYI
+  # Runs once when the application starts, before its routes are mounted.
+
+  # Sessions are an encrypted cookie. This secret was generated for
+  # development and test by `kurt new`; production refuses to start without
+  # its own SESSION_SECRET (32 bytes or more: `openssl rand -hex 32`).
+  SECRET = session_secret("#{secret}")
+
+  use SecurityHeadersHandler.new(strict_transport_security: production? ? "max-age=31536000" : nil), 0   # nosniff, frames; HSTS over HTTPS
+  use RequestIdHandler.new        # X-Request-Id, in the log line too
+  use OverrideMethodHandler.new   # _method=patch/delete from HTML forms
+  use SessionHandler.new(SECRET, secure: production?)   # an HTTPS-only cookie in production
+  use CSRFHandler.new             # forms carry <%= raw(csrf_field) %>
+  IYI
+end
+
+pub def application_controller : String
+  <<-IYI
+  # The parent of every controller: filters and helpers the whole
+  # application shares.
+  #
+  #   before_action :require_login, except: [:index, :show]
+  #
+  #   def require_login
+  #     Unauthorized.new unless session["user_id"]?
+  #   end
+  class ApplicationController < Controller
+  end
+  IYI
+end
+
+pub def home_controller : String
+  <<-IYI
+  class HomeController < ApplicationController
+    # GET /
+    def index
+      render "home/index"
+    end
+  end
+  IYI
+end
+
+pub def home_view(app : String, daisy : Bool = false) : String
+  return daisy_home_view(app) if daisy
+  <<-EIY
+  <% content_for "title" do %>#{camelize(app)}<% end -%>
+  <section class="hero">
+    <img src="/icon.svg" alt="Kurt" width="96" height="109">
+    <h1>#{camelize(app)} is running</h1>
+    <p>A Kurt application on iyi. Next:</p>
+    <pre><code>kurt generate scaffold Post title:string body:text published:bool
+  kurt db:migrate</code></pre>
+    <p>then open <a href="/posts">/posts</a>. This page is <code>app/views/home/index.eiy</code>.</p>
+  </section>
+
+  EIY
+end
+
+pub def layout_view(app : String, daisy : Bool = false) : String
+  return daisy_layout_view(app) if daisy
+  <<-EIY
+  <!DOCTYPE html>
+  <html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title><%= yield_content "title" %> · #{camelize(app)}</title>
+    <link rel="icon" href="/icon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="/assets/app.css">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">#{camelize(app)}</a>
+      <nav><!-- kurt:nav --></nav>
+    </header>
+    <main class="container">
+      <% if notice = flash?("notice") %><p class="flash notice"><%= notice %></p><% end %>
+      <% if alert = flash?("alert") %><p class="flash alert"><%= alert %></p><% end %>
+      <%= content %>
+    </main>
+    <%= raw(live_reload_tag) %>
+  </body>
+  </html>
+
+  EIY
+end
+
+pub def nav_link(names : Names, daisy : Bool = false) : String
+  return "<li><a href=\"/" + names.plural + "\">" + humanize(names.plural) + "</a></li>" if daisy
+  "<a href=\"/" + names.plural + "\">" + humanize(names.plural) + "</a>"
+end
+
+pub def stylesheet : String
+  <<-CSS
+  /* The application's styles. Plain CSS, no build step: edit freely. */
+  :root {
+    --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --bg: #ffffff; --soft: #f6f8fa;
+    --accent: #0969da; --danger: #cf222e; --ok: #1a7f37; --radius: 6px;
+    font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg);
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; line-height: 1.5; }
+  a { color: var(--accent); }
+  .topbar { display: flex; gap: 1.5rem; align-items: center; padding: .75rem 1.5rem; border-bottom: 1px solid var(--line); }
+  .topbar nav { display: flex; gap: 1rem; }
+  .brand { font-weight: 700; color: var(--fg); text-decoration: none; }
+  .container { max-width: 56rem; margin: 2rem auto; padding: 0 1.5rem; }
+  .page-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+  .button { display: inline-block; padding: .45rem .9rem; border: 1px solid var(--accent); border-radius: var(--radius);
+            background: var(--accent); color: #fff; text-decoration: none; font: inherit; cursor: pointer; }
+  .link { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); cursor: pointer; }
+  .danger { color: var(--danger); }
+  .inline { display: inline; }
+  .table { width: 100%; border-collapse: collapse; }
+  .table th, .table td { text-align: left; padding: .5rem; border-bottom: 1px solid var(--line); }
+  .row-actions { white-space: nowrap; display: flex; gap: .75rem; justify-content: flex-end; }
+  .form .field { display: flex; flex-direction: column; gap: .25rem; margin-bottom: 1rem; }
+  .form input[type=text], .form input[type=number], .form input[type=datetime-local], .form textarea, .form select {
+    font: inherit; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--radius); }
+  .form .check { flex-direction: row; align-items: center; gap: .5rem; display: flex; }
+  .field-error input, .field-error textarea, .field-error select { border-color: var(--danger); }
+  .errors { border: 1px solid var(--danger); background: #ffebe9; border-radius: var(--radius); padding: .5rem 1rem; margin-bottom: 1rem; }
+  .flash { padding: .5rem 1rem; border-radius: var(--radius); }
+  .flash.notice { background: #dafbe1; color: var(--ok); }
+  .flash.alert { background: #ffebe9; color: var(--danger); }
+  .details dt { font-weight: 600; margin-top: .75rem; }
+  .details dd { margin: 0; }
+  .prose { white-space: pre-wrap; }
+  .empty { color: var(--muted); }
+  .hero pre { background: var(--soft); padding: 1rem; border-radius: var(--radius); overflow-x: auto; }
+
+  CSS
+end
+
+# With Tailwind, public/assets/app.css is built from app/assets/tailwind/app.css
+# (`kurt dev` and `kurt build` build it), so it stays out of git.
+pub def gitignore(daisy : Bool = false) : String
+  "/.kurt/\n/db/*.sqlite3\n/db/*.sqlite3-*\n/bin/\n/lib/\n.env\n" + (daisy ? "/public/assets/app.css\n" : "")
+end
+
+# A test of a scaffold, through the routes, without a socket. `kurt test`
+# runs it against a freshly migrated test database.
+# *sign_in*: the line that signs a test in, when the application has
+# `kurt generate authentication`.
+pub def scaffold_test(app : String, names : Names, fields : Array(Field), sign_in : String = "") : String
+  body = [] of String
+  fields.each do |field|
+    value = case field.kind
+            when "int", "references" then "1"
+            when "float"             then "1.5"
+            when "bool"              then "1"
+            when "time"              then "2026-01-01T10%3A00"
+            else
+              # A field named for an address gets one, so a format rule passes.
+              field.column.includes?("email") ? "example%40example.com" : "Example"
+            end
+    body << names.singular + "%5B" + field.column + "%5D=" + value
+  end
+  blank = fields.find { |f| f.kind == "string" }
+  invalid = blank ? "\n# a blank " + blank.column + " is refused, and the form comes back\nres = dispatch(app, form_request(\"POST\", \"/" + names.plural + "\", \"" + names.singular + "%5B" + blank.column + "%5D=\")).response\nassert res.status_code == 422\nassert " + names.model + ".count.as(Int64) == 0\n" : ""
+  <<-IYI
+  # `kurt test` runs this against db/test.sqlite3, freshly migrated, through
+  # the routes and without a socket.
+  #{names.model}.delete_all.as(Int64)
+  app = RouteHandler.new(routes)
+  #{sign_in}
+  res = dispatch(app, "GET", "/#{names.plural}").response
+  assert res.status_code == 200
+  #{invalid}
+  # a valid form creates one and redirects to it
+  res = dispatch(app, form_request("POST", "/#{names.plural}", "#{body.join("&")}")).response
+  assert res.status_code == 303
+  #{names.singular} = #{names.model}.last?.as(#{names.model})
+  assert res.headers["Location"]? == "/#{names.plural}/" + #{names.singular}.id.to_s
+  assert dispatch(app, "GET", "/#{names.plural}/" + #{names.singular}.id.to_s).response.status_code == 200
+
+  # a missing one is 404
+  assert dispatch(app, "GET", "/#{names.plural}/999999").response.status_code == 404
+
+  # deleted through the form-friendly route
+  res = dispatch(app, form_request("POST", "/#{names.plural}/" + #{names.singular}.id.to_s + "/delete", "")).response
+  assert res.status_code == 303
+  assert #{names.model}.count.as(Int64) == 0
+
+  IYI
+end
+
+pub def llms_txt(app : String) : String
+  <<-TXT
+  # #{app}
+
+  > A Kurt application: a Rails-like layer on iyi (https://iyi.dev), over
+  > iyi-web (HTTP, routing, templates, sessions, CSRF) and db (SQL, pools).
+
+  ## Layout
+
+  No .iyi file here has a module header or imports. `kurt dev` and `kurt test`
+  compile them into modules under .kurt/build/ (generated: never edit it), adding the
+  imports each kind needs; errors still point at these files.
+
+  - `config/application.iyi`: runs at start. Middleware: method override, session cookie, CSRF.
+  - `config/routes.iyi`: `root HomeController, :index`, `resources "posts", PostsController`
+    (the REST routes for the actions the controller defines), `get "/about", PagesController, :about`.
+    A block nests resources (`/posts/:post_id/comments`); `namespace "admin" do ... end` prefixes paths.
+    `kurt routes` prints every route.
+  - `app/models/<model>.iyi`: `class Post < ApplicationRecord`, one per file.
+  - `app/controllers/<plural>_controller.iyi`: `class PostsController < ApplicationController`.
+  - `app/views/<plural>/<action>.eiy`: templates. `<%= expr %>` escapes; `raw(x)` does not.
+  - `db/migrations/<timestamp>_<name>.sql`: `-- up` and `-- down` sections of plain SQL.
+  - `test/<name>_test.iyi`: tests through the routes (`dispatch(RouteHandler.new(routes), ...)`).
+  - A file that needs another module adds its own `import` line at the top.
+
+  ## Commands
+
+  - `kurt dev [-p PORT]`: run the server (http://localhost:3000). It watches app/, config/ and
+    db/schema.json: a change is rebuilt and the server restarted, and open pages reload themselves.
+    A change that does not build prints iyi's errors and leaves the last good server running.
+  - `kurt generate scaffold Post title:string body:text user:references published:bool`
+  - `kurt generate model Comment body:text post:references`
+  - `kurt generate controller Pages about contact`
+  - `kurt generate migration add_slug_to_posts`
+  - `kurt db:migrate`, `kurt db:rollback [STEPS]`, `kurt db:status`, `kurt db:reset` (then seeds)
+  - `kurt db:seed`: run db/seeds.iyi (models, `find_or_create_by`, `!` works there).
+  - `kurt test`: migrate a fresh test database and run every test/*_test.iyi. Each test file
+    starts with test/fixtures/<table>.yml loaded (`ada:` then `column: value` lines; `user: ada`
+    sets user_id, `password:` sets password_digest) and reads a row as `users(:ada)`.
+    `sign_in_as(users(:ada))` signs the next requests in. `!` does not work at a test's top
+    level: use `.as(User)`.
+  - `kurt build`: a release binary in bin/#{app}, migrations inside. On the server:
+    `KURT_ENV=production DATABASE_URL=... SESSION_SECRET=... ./bin/#{app} db:migrate`, then
+    `./bin/#{app} -p 8080`. Production refuses to start without a SESSION_SECRET of 32+ bytes;
+    GET /up is the health check.
+
+  Field types: string, text, int, float, bool, time, references.
+
+  ## Models
+
+  A model's fields come from its table: `kurt db:migrate` writes db/schema.json, and the build
+  declares a `property` per column (nilable when the column allows NULL). The comment at the top
+  of each model file lists them. A `property` the model writes itself wins over the schema's.
+
+  ```iyi
+  class Post < ApplicationRecord
+    belongs_to user : User
+    has_many comments : Comment
+
+    def validate(errors : Errors) : Nil
+      errors.add("title", "can't be blank") if title.strip.empty?
+    end
+  end
+  ```
+
+  - `Post.all`, `Post.find(id)` (NotFound when missing), `Post.find?(id)` (nil), `Post.first`, `Post.first?`, `Post.count`
+  - `Post.where(published: true).order_desc(:id).paginate(page, per: 20).all`
+  - one typed finder per field: `Post.title("Hello").first?`
+  - `Post.includes(:user, :comments).all` loads associations with the rows (no N+1);
+    `post.user` and `post.comments` then ask nothing more
+  - `Post.create(title: "Hi")`, `post.save`, `post.destroy`, `post.increment(:comments_count)`
+  - every call answers a value or an error (`Post | NotFound | DBError`, `Post | Invalid | DBError`);
+    `!` hands the error up.
+
+  ## Controllers
+
+  - `render "posts/index"` renders app/views/posts/index.eiy in layouts/application.eiy
+    (`layout: "admin"`, `layout: false`). A template renders a partial with `render "_form.eiy"`.
+  - An action calls models with `!`. The framework answers NotFound with 404, Invalid with 422,
+    Unauthorized with a redirect to /login (401 for JSON), Forbidden with 403, DBError with 503.
+  - Strong parameters, as in Rails: forms send `post[title]`, and
+    `params.require(:post).permit(:title, :body)` is the only way to the Hash a model takes
+    (`Post.new(h)`, `post.update(h)`, `Post.create(h)`); values are converted to the field types,
+    and one that does not convert ("abc" for a number) is a validation error.
+  - Saving, as in Rails: `if post.save! ... else render "posts/edit", status: 422 end`. `save`
+    answers false when validation fails and keeps the reasons in `post.errors`; its `!` hands a
+    DBError up. `post.update(title: "New")` sets fields and saves. `Post.create(...)!` answers the
+    record, or hands Invalid up (422).
+  - `params[:id]` ("" when missing), `params[:q]?` (nil when missing); `Post.find(params[:id])`
+    and `paginate(params[:page]?)` take the text as it is (not a number: 404 / page 1).
+  - `redirect_to path, notice: "..."`, `flash("alert", "...")`, `path_to(record)`, `json(data)`,
+    `wants_json?`, `session`.
+  - `before_action :require_login, except: [:index, :show]`; a filter stops the action by
+    answering Unauthorized, Forbidden, NotFound or DBError (a Halt); any other answer runs it.
+  - Scaffolds load the record in a filter, as Rails does:
+    `before_action :set_post, only: [:show, :edit, :update, :destroy]` with
+    `private def set_post; @post = Post.find(params[:id])!; end`.
+  - `@post` and `@posts` need no declaration: in a controller, a variable named after a model
+    holds that model (starting as a blank one) and its plural an Array of it (starting empty), so
+    neither is ever nil. Any other instance variable is declared with its type:
+    `@featured : Array(Post) = [] of Post`. Views read them as they are.
+  - Views see the action's locals and the controller's methods; forms print `<%= raw(csrf_field) %>`.
+
+  TXT
+end

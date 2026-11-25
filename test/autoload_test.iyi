@@ -1,0 +1,121 @@
+module test/autoload_test
+
+import std/text
+import autoload::*
+import schema::{Table, Column}
+import std/yaml::{Any}
+import fixtures::{FixtureSet, Fixture, fixture_id}
+
+# imports are lifted out, and their lines left blank so numbering holds
+imports, lines = split_imports("import std/json::{JSON}\nclass A\nend\n")
+assert imports == ["import std/json::{JSON}"]
+assert lines == ["", "class A", "end"]
+
+# a model: pub, and `derive model` as the last line, the `end` keeping its
+# line number through an inline pragma
+model = Source.new("/app/models/post.iyi", "class Post < ApplicationRecord\n  property title : String\nend\n")
+assert model_lines(model) == ["pub class Post", "  property title : String", "  derive model", %(#<loc:"/app/models/post.iyi",3,1>end)]
+
+# a model that derives on its own keeps its derive and gets no second one
+own = Source.new("/m.iyi", "class Tag < ApplicationRecord\n  property name : String\n  derive model\nend\n")
+assert model_lines(own).count { |l| l.includes?("derive model") } == 1
+
+# plain classes and structs are published; nested ones are not touched
+plain = Source.new("/c.iyi", "class PostsController < ApplicationController\n  class Inner\n  end\nend\nstruct Form\nend\n")
+assert plain_lines(plain) == ["pub class PostsController < ApplicationController", "  class Inner", "  end", "end", "pub struct Form", "end"]
+
+# modules: header with the kind's imports and the file's own, then the code
+models = models_module([model, Source.new("/app/models/tag.iyi", "import std/json::{JSON}\nclass Tag < ApplicationRecord\nend\n")])
+assert models.includes?("module app/models\n")
+assert models.includes?("import kurt/model::*\n")
+assert models.includes?("import std/json::{JSON}\n")
+assert models.includes?(%(#<loc:"/app/models/post.iyi",1,1>pub class Post))
+
+# ApplicationController first, whatever the file order
+app = Source.new("/app/controllers/application_controller.iyi", "class ApplicationController < Controller\nend\n")
+posts = Source.new("/app/controllers/posts_controller.iyi", "class PostsController < ApplicationController\nend\n")
+controllers = controllers_module([posts, app])
+assert controllers.index("ApplicationController < Controller").as(Int32) < controllers.index("PostsController <").as(Int32)
+
+# routes become the body of `routes`
+routes = routes_module(Source.new("/config/routes.iyi", "root HomeController, :index\n"), "/build/app/routes.iyi")
+assert routes.includes?("pub def routes : Router\n  router = Router.new\n" + %(#<loc:"/config/routes.iyi",1,1>root HomeController, :index))
+assert routes.includes?("install_error_pages router\n  router\nend\n")
+
+# fields from the schema: after the class line, id and the class's own
+# fields left out, unmapped columns skipped; the next line resyncs
+tables = [Table.new("posts", [Column.new("id", "INTEGER", "Int64"), Column.new("title", "TEXT", "String"),
+                              Column.new("published", "BOOLEAN", "Bool"), Column.new("data", "BLOB", ""),
+                              Column.new("summary", "TEXT", "String?")]),
+          Table.new("people", [Column.new("name", "TEXT", "String")])]
+post = Source.new("/app/models/post.iyi", "class Post < ApplicationRecord\n  property published : Bool = true\nend\n")
+assert model_lines(post, tables, "/db/schema.json") == [
+  "pub class Post",
+  %(#<loc:"/db/schema.json",1,1>  property title : String),
+  "  property summary : String?",
+  %(#<loc:"/app/models/post.iyi",2,1>  property published : Bool = true),
+  "  derive model",
+  %(#<loc:"/app/models/post.iyi",3,1>end),
+]
+
+# @[Table] picks the table
+person = Source.new("/app/models/person.iyi", "@[Table(\"people\")]\nclass Person < ApplicationRecord\nend\n")
+assert model_lines(person, tables, "/s.json")[2] == %(#<loc:"/s.json",1,1>  property name : String)
+assert model_tables("@[Table(\"people\")]\nclass Person < ApplicationRecord\nend\nclass Tag < ApplicationRecord\nend\n") == [{"Person", "people"}, {"Tag", "tags"}]
+
+# a model with no table is reported
+assert missing_tables([post, Source.new("/t.iyi", "class Tag < ApplicationRecord\nend\n")], tables) == ["Tag (table tags)"]
+
+# the column comment: written on top, replaced on the next run, never doubled
+annotated = annotate("class Post < ApplicationRecord\nend\n", tables)
+assert annotated.starts_with?("# Columns of posts (db/schema.json")
+assert annotated.includes?("#   summary    String?\n")
+assert annotated.includes?("#   data       BLOB (not mapped)\n")
+assert annotated.ends_with?("\nclass Post < ApplicationRecord\nend\n")
+assert annotate(annotated, tables) == annotated
+assert annotate(annotated, [] of Table) == "class Post < ApplicationRecord\nend\n"
+
+# a controller's model variables are declared by convention, after its
+# class line; its own declarations and variables naming no model are left
+controller = Source.new("/app/controllers/posts_controller.iyi",
+  "class PostsController < ApplicationController\n  @featured : Array(Post) = [] of Post\n\n  def index\n    @posts = Post.all!\n    @post = @posts.first? || Post.new\n    @featured = @posts\n    @title = \"x\"\n  end\nend\n")
+assert conventional_ivars(controller.text, ["Post", "User"]) == ["  @posts : Array(Post) = [] of Post", "  @post : Post = Post.new"]
+assert controller_lines(controller, ["Post"])[0, 4] == [
+  "pub class PostsController < ApplicationController",
+  "  @posts : Array(Post) = [] of Post",
+  "  @post : Post = Post.new",
+  %(#<loc:"/app/controllers/posts_controller.iyi",2,1>  @featured : Array(Post) = [] of Post),
+]
+assert controller_lines(Source.new("/c.iyi", "class HomeController < ApplicationController\nend\n"), ["Post"]) == ["pub class HomeController < ApplicationController", "end"]
+assert conventional_ivars("x = @@count + @people.size", ["Person"]) == ["  @people : Array(Person) = [] of Person"]
+
+# fixtures: one function per set with a model, reloaded by each test file
+users_set = FixtureSet.new("users", "test/fixtures/users.yml", [Fixture.new("ada", [] of Tuple(String, Any))])
+tags_set = FixtureSet.new("tags", "test/fixtures/tags.yml", [] of Fixture)
+fx = fixtures_module([users_set, tags_set], [{"User", "users"}], "/app/test/fixtures", "/app/db/schema.json")
+assert fx.includes?("module app/fixtures\n")
+assert fx.includes?("pub def users(label : Symbol) : User\n")
+assert fx.includes?("when \"ada\" then " + fixture_id("ada").to_s + "_i64\n")
+assert fx.includes?("reload_fixtures(database, postgres?, parse(File.read(\"/app/db/schema.json\")), \"/app/test/fixtures\")")
+assert !fx.includes?("def tags(")                        # no Tag model
+assert !fixtures_module([] of FixtureSet, [{"User", "users"}]).includes?("reload_fixtures(database")   # nothing to load
+assert test_imports.includes?("import app/fixtures::*")
+
+# db/seeds.iyi runs in a function, so `!` works and a failure is reported
+seeds = seeds_module(Source.new("/app/db/seeds.iyi", "import std/json\nUser.create(name: \"Ada\")!\n"))
+assert seeds.includes?("module seeds\n")
+assert seeds.includes?("import std/json\n")
+assert seeds.includes?("def __kurt_seed : Nil | DBError | Invalid | NotFound\n")
+assert seeds.includes?("User.create(name: \"Ada\")!\n")
+assert seeds.includes?("STDERR.puts \"kurt db:seed: \" + failure.message")
+
+# a release binary: migrations inside, db: commands before the config
+assert string_literal("a \"q\" \#{x}\nb\\") == "\"a \\\"q\\\" \\\#{x}\\nb\\\\\""
+entry = entry_module("blog", Source.new("/app/config/application.iyi", "SECRET = session_secret(\"x\")\n"), "/app/.kurt/build/blog.iyi",
+                     [{"db/migrations/1_a.sql", "-- up\nCREATE TABLE a (x INT);\n"}])
+assert entry.includes?("KURT_MIGRATIONS = [\n  {\"db/migrations/1_a.sql\", \"-- up\\nCREATE TABLE a (x INT);\\n\"},\n] of Tuple(String, String)")
+assert entry.index("run_database_command").as(Int32) < entry.index("session_secret(").as(Int32)
+assert entry.includes?("config.app_name = \"blog\"")
+assert entry_imports.includes?("import web/iyi_web/security_headers::{SecurityHeadersHandler}")
+
+puts "autoload: all assertions passed"

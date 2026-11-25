@@ -1,0 +1,121 @@
+# View helpers, as in Rails, for the templates in app/views:
+#
+#   <%= link_to "Posts", "/posts", class: "btn" %>
+#   <%= button_to "Delete", path_to(post), method: :delete, confirm: "Delete this post?" %>
+#   <%= truncate(post.body, length: 80) %>
+#   <%= pluralize(post.comments.count!, "comment") %>        # "1 comment", "3 comments"
+#   <%= time_ago_in_words(post.created_at) %> ago            # "about 2 hours ago"
+#   <%= number_with_delimiter(12345) %>                       # "12,345"
+#   <%= simple_format(post.body) %>                           # paragraphs and line breaks
+#   <div id="<%= dom_id(post) %>">                            # "post_7"
+#
+# `link_to`, `button_to` and `current_page?` need the request, so they are
+# the controller's (controllers.iyi); the rest are here. What prints markup
+# answers SafeHTML, which `<%= %>` prints as it is; the text that went into
+# it was escaped on the way.
+module helpers
+
+import std/text
+import std/html::{HTML}
+import std/time::{Time}
+import web/iyi_web/templates::{SafeHTML}
+import inflector
+
+# *text* cut to *length* characters, *omission* included: "A long titl...".
+pub def truncate(text : String, length : Int32 = 30, omission : String = "...") : String
+  return text if text.size <= length
+  keep = length - omission.size
+  keep = 0 if keep < 0
+  text[0, keep] + omission
+end
+
+# "1 comment", "3 comments"; *plural* when the word's is irregular past
+# what the inflector knows.
+pub def pluralize(count : Int32 | Int64, singular : String, plural : String? = nil) : String
+  word = count == 1 ? singular : (plural || ::Kurt::Inflector.pluralize(singular))
+  count.to_s + " " + word
+end
+
+# 1234567 as "1,234,567".
+pub def number_with_delimiter(number : Int32 | Int64, delimiter : String = ",") : String
+  digits = number.abs.to_s
+  groups = [] of String
+  while digits.size > 3
+    groups.unshift(digits[digits.size - 3, 3])
+    digits = digits[0, digits.size - 3]
+  end
+  groups.unshift(digits)
+  (number < 0 ? "-" : "") + groups.join(delimiter)
+end
+
+# How long ago *from* was, in Rails' words: "less than a minute",
+# "5 minutes", "about 2 hours", "3 days", "about 1 month", "over 1 year".
+pub def time_ago_in_words(from : Time, now : Time = Time.utc) : String
+  distance_of_time_in_words(from, now)
+end
+
+pub def distance_of_time_in_words(from : Time, to : Time) : String
+  seconds = (to - from).total_seconds.abs
+  minutes = (seconds / 60).round.to_i64
+  return "less than a minute" if minutes < 1
+  return "1 minute" if minutes == 1
+  return minutes.to_s + " minutes" if minutes < 45
+  return "about 1 hour" if minutes < 90
+  return "about " + (minutes / 60.0).round.to_i64.to_s + " hours" if minutes < 1440
+  return "1 day" if minutes < 2520
+  return (minutes / 1440.0).round.to_i64.to_s + " days" if minutes < 43200
+  return "about 1 month" if minutes < 86400
+  return (minutes / 43200.0).round.to_i64.to_s + " months" if minutes < 525600
+  years = minutes // 525600
+  rest = minutes % 525600
+  return "about " + pluralize(years, "year") if rest < 131400
+  return "over " + pluralize(years, "year") if rest < 394200
+  "almost " + pluralize(years + 1, "year")
+end
+
+# Text as paragraphs: a blank line starts a new <p>, a single line break is
+# a <br>. The text is escaped first, so it is safe to print.
+pub def simple_format(text : String) : SafeHTML
+  clean = HTML.escape(text.gsub("\r\n", "\n")).strip
+  return SafeHTML.new("") if clean.empty?
+  paragraphs = [] of String
+  current = [] of String
+  clean.split("\n").each do |line|
+    if line.strip.empty?
+      paragraphs << current.join("<br>\n") unless current.empty?
+      current = [] of String
+    else
+      current << line
+    end
+  end
+  paragraphs << current.join("<br>\n") unless current.empty?
+  SafeHTML.new(paragraphs.map { |p| "<p>" + p + "</p>" }.join("\n"))
+end
+
+# An HTML id for a record: "post_7", or "new_post" before it is saved;
+# *prefix* in front: dom_id(post, "edit") is "edit_post_7".
+pub def dom_id(record : T, prefix : String? = nil) : String forall T
+  name = ::Kurt::Inflector.underscore(T.model_name)
+  base = record.id == 0 ? "new_" + name : name + "_" + record.id.to_s
+  prefix ? prefix + "_" + base : base
+end
+
+# ` key="value"` for each pair, `data_confirm` as `data-confirm`; a true
+# value is the bare attribute; nil leaves it out, and so does false unless
+# it is a data- attribute.
+pub def attributes_html(**attrs) : String
+  out = ""
+  attrs.each do |key, value|
+    name = key.to_s.gsub("_", "-")
+    if value == true
+      out += " " + name
+    elsif value == false
+      # data-turbo="false" means something; a plain attribute set to false
+      # (disabled: false) is left out, as in Rails.
+      out += " " + name + "=\"false\"" if name.starts_with?("data-")
+    elsif !value.nil?
+      out += " " + name + "=\"" + HTML.escape(value.to_s) + "\""
+    end
+  end
+  out
+end

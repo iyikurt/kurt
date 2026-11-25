@@ -1,0 +1,176 @@
+module test/generators_test
+
+import std/text
+import inflector::*
+import generators::*
+
+# inflector
+assert pluralize("post") == "posts"
+assert pluralize("category") == "categories"
+assert pluralize("day") == "days"
+assert pluralize("box") == "boxes"
+assert pluralize("person") == "people"
+assert singularize("categories") == "category"
+assert singularize("people") == "person"
+assert singularize("boxes") == "box"
+assert singularize("posts") == "post"
+assert underscore("BlogPost") == "blog_post"
+assert camelize("blog_post") == "BlogPost"
+assert humanize("user_id") == "User"
+assert humanize("comments_count") == "Comments count"
+
+# names
+names = Names.new("BlogPost")
+assert names.model == "BlogPost"
+assert names.singular == "blog_post"
+assert names.plural == "blog_posts"
+assert names.controller == "BlogPostsController"
+assert names.controller_file == "app/controllers/blog_posts_controller.iyi"
+assert Names.new("posts").model == "Post"
+
+# fields
+case fields = parse_fields(["title:string", "body:text", "user:references", "published:boolean", "views:integer", "slug"])
+in Array(Field)
+  assert fields.map(&.column) == ["title", "body", "user_id", "published", "views", "slug"]
+  assert fields.map(&.iyi_type) == ["String", "String", "Int64", "Bool", "Int64", "String"]
+  assert fields[2].reference?
+in String
+  assert false
+end
+assert parse_fields(["x:blob"]).is_a?(String)
+assert parse_fields(["id:int"]).is_a?(String)
+
+# model file: a reference to a known model is a belongs_to, an unknown one a hint
+post = Names.new("Post")
+user_ref = [Field.new("title", "string"), Field.new("user", "references")]
+known = model_file(post, user_ref, ["User"])
+assert known.starts_with?("class Post < ApplicationRecord\n")
+assert known.includes?("  belongs_to user : User\n")
+assert known.includes?("  validates :title, :user_id, presence: true\n")
+assert !known.includes?("def validate")
+assert model_file(post, user_ref, [] of String).includes?("  validates :title, presence: true\n")
+assert !known.includes?("derive")
+assert !known.includes?("property")
+assert model_file(Names.new("Tag"), [Field.new("count", "int")], [] of String) == "class Tag < ApplicationRecord\nend\n"
+unknown = model_file(post, user_ref, [] of String)
+assert unknown.includes?("  # belongs_to user : User")
+
+# has_many goes after the referenced model's fields, set apart from them
+user = "class User < ApplicationRecord\n  property name : String\n\n  def validate(errors : Errors) : Nil\n  end\nend\n"
+updated = add_has_many(user, post)
+assert updated == "class User < ApplicationRecord\n  property name : String\n\n  has_many posts : Post\n\n  def validate(errors : Errors) : Nil\n  end\nend\n"
+assert add_has_many(updated, post) == updated
+
+# a model with no field lines: first in the class
+assert add_has_many("class User < ApplicationRecord\nend\n", post) == "class User < ApplicationRecord\n  has_many posts : Post\nend\n"
+assert add_has_many("class User < ApplicationRecord\n  def x : Nil\n  end\nend\n", post) == "class User < ApplicationRecord\n  has_many posts : Post\n\n  def x : Nil\n  end\nend\n"
+assert add_has_many(add_has_many(updated, Names.new("Comment")), post).split("has_many").size == 3
+
+# migrations per dialect
+sqlite = create_table_migration(post, user_ref, false)
+assert sqlite.includes?("id INTEGER PRIMARY KEY")
+assert sqlite.includes?("created_at DATETIME NOT NULL")
+assert create_table_migration(post, [Field.new("published", "bool")], false).includes?("published BOOLEAN NOT NULL")
+assert sqlite.includes?("CREATE INDEX posts_user_id ON posts (user_id);")
+assert sqlite.includes?("-- down\nDROP TABLE posts;")
+assert create_table_migration(post, user_ref, true).includes?("id BIGSERIAL PRIMARY KEY")
+
+# routes: appended once
+routes = append_route(append_route(routes_file, "resources \"posts\", PostsController"), "resources \"posts\", PostsController")
+assert routes.lines.count { |l| l == "resources \"posts\", PostsController" } == 1
+assert routes.ends_with?("root HomeController, :index\nresources \"posts\", PostsController\n")
+
+# controllers have no header
+assert scaffold_controller(post, user_ref).starts_with?("class PostsController < ApplicationController\n")
+controller = scaffold_controller(post, user_ref)
+assert controller.includes?("render \"posts/index\"")
+assert controller.includes?("  before_action :set_post, only: [:show, :edit, :update, :destroy]\n")
+assert controller.includes?("    @post = Post.new(post_params)\n    if @post.save!\n      redirect_to path_to(@post), notice: \"Post was created.\"\n    else\n      render \"posts/new\", status: 422\n    end\n")
+assert controller.includes?("    if @post.update(post_params)!\n")
+assert controller.includes?("  private def set_post\n    @post = Post.find(params[:id])!\n  end\n")
+assert controller.split("Post.find").size == 2       # only in the filter
+assert !controller.includes?("@post :")              # declared by convention
+assert controller.includes?(".paginate(params[:page]?, per: 25)")
+assert !controller.includes?("_param(")
+assert controller.includes?("  private def post_params : Hash(String, String)\n    params.require(:post).permit(:title, :user_id)\n  end\n")
+assert !controller.includes?("assign")
+assert !controller.includes?("Invalid")
+assert !controller.includes?("Halt")
+assert !controller.includes?("Errors.new")
+assert form_view(post, user_ref).includes?("<% if @post.errors.any? %>")
+assert form_view(post, user_ref).includes?("name=\"post[title]\"")
+
+# a reference to a model with a label is a select, and shown by its label
+labels = {"User" => "name"}
+form = form_view(post, user_ref, labels)
+assert form.includes?("<select id=\"post_user_id\" name=\"post[user_id]\">")
+assert form.includes?("<% @users.each do |option| %>")
+with_list = scaffold_controller(post, user_ref, labels)
+assert with_list.includes?("  before_action :set_users, only: [:new, :create, :edit, :update]\n")
+assert with_list.includes?("  private def set_users\n    @users = User.order(:name).all!\n  end\n")
+assert with_list.includes?("@posts = Post.includes(:user).order_desc(:id).paginate(")   # names load with the rows
+assert controller.includes?("@posts = Post.order_desc(:id).paginate(")                    # no label: nothing to load
+assert form.includes?("<%= option.id == @post.user_id ? \" selected\" : \"\" %>")
+assert !form_view(post, user_ref).includes?("<select")     # no label: a number field
+assert show_view(post, user_ref, labels).includes?("<dt>User</dt>\n  <dd><% if (user = @post.user?).is_a?(User) %><%= user.name %><% end %></dd>")
+assert index_view(post, user_ref, labels).includes?("<% if (user = post.user?).is_a?(User) %><%= user.name %><% end %>")
+
+# the Kurt logo: favicon and welcome page
+assert layout_view("blog").includes?("<link rel=\"icon\" href=\"/icon.svg\"")
+assert home_view("blog").includes?("<img src=\"/icon.svg\" alt=\"Kurt\"")
+
+
+# Tailwind and daisyUI (the default for `kurt new`)
+assert tailwind_css.includes?("@import \"tailwindcss\" source(none);")
+assert tailwind_css.includes?("@source \"../../views/**/*.eiy\";")
+assert tailwind_css.includes?("@plugin \"./daisyui.mjs\"")
+assert tailwind_css.includes?("themes: light --default, dracula --prefersdark;")
+assert layout_view("blog", true).includes?("<ul class=\"menu menu-horizontal gap-1\"><!-- kurt:nav --></ul>")
+assert layout_view("blog", true).includes?("alert alert-success")
+assert layout_view("blog", true).includes?("data-theme-toggle")
+assert layout_view("blog", true).includes?("localStorage.getItem(\"theme\")")
+assert !layout_view("blog").includes?("data-theme-toggle")
+assert home_view("blog", true).includes?("mockup-code")
+assert nav_link(post, true) == "<li><a href=\"/posts\">Posts</a></li>"
+assert nav_link(post) == "<a href=\"/posts\">Posts</a>"
+daisy_form = form_view(post, user_ref, labels, true)
+assert daisy_form.includes?("class=\"card bg-base-100 shadow-sm\"")
+assert daisy_form.includes?("class=\"input w-full<%= @post.errors.on(\"title\").empty? ? \"\" : \" input-error\" %>\"")
+assert daisy_form.includes?("class=\"select w-full")
+assert daisy_form.includes?("btn btn-primary")
+assert index_view(post, user_ref, labels, true).includes?("<table class=\"table\">")
+assert show_view(post, user_ref, labels, true).includes?("card-actions")
+assert new_view(post, true).includes?("<h1 class=\"text-3xl font-bold mb-6\">New post</h1>")
+assert edit_view(post, true).includes?("<%= link_to \"Show\", path_to(@post), class: \"link\" %>")
+# deletes are button_to forms, links link_to
+plain_index = index_view(post, user_ref, labels)
+assert plain_index.includes?("<%= button_to \"Delete\", path_to(post), method: :delete, class: \"link danger\", confirm: \"Delete this post?\" %>")
+assert plain_index.includes?("<%= link_to \"New post\", \"/posts/new\", class: \"button\" %>")
+assert !plain_index.includes?("_method")
+assert show_view(post, user_ref, labels).includes?("<%= button_to \"Delete this post\"")
+assert auth_nav(true).includes?("<%= button_to \"Sign out\", \"/logout\", method: :delete %>")
+assert gitignore(true).includes?("/public/assets/app.css")
+assert !gitignore.includes?("app.css")
+assert !form_view(post, user_ref, labels).includes?("btn")          # --css none: plain classes
+
+assert scaffold_test("blog", Names.new("User"), [Field.new("email", "string")]).includes?("user%5Bemail%5D=example%40example.com")
+
+puts "generators: all assertions passed"
+
+# db/seeds.iyi for a new application
+assert seeds_file.includes?("find_or_create_by(email: \"ada@example.com\")")
+
+# a new application's config: its own secret in production, hardened defaults
+config = application_config("abc")
+assert config.includes?("SECRET = session_secret(\"abc\")")
+assert config.includes?("use SecurityHeadersHandler.new(strict_transport_security: production? ? \"max-age=31536000\" : nil), 0")
+assert config.includes?("use SessionHandler.new(SECRET, secure: production?)")
+assert config.includes?("use RequestIdHandler.new")
+
+# iyi.mod: Kurt as the package it is published as, imported as `kurt/...`
+released = mod_file("blog", nil, "0.2.0")
+assert released.includes?("module blog\n")
+assert released.includes?("require github.com/iyikurt/kurt v0.2.0 as kurt\n")
+assert !released.includes?("replace")
+local = mod_file("blog", "/src/kurt")
+assert local.includes?("replace github.com/iyikurt/kurt => /src/kurt\n")

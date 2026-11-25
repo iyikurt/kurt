@@ -1,0 +1,29 @@
+# The application's database: one pool, opened from `database_url`
+# (DATABASE_URL, or `sqlite3:./db/<env>.sqlite3`).
+#
+# A `Database` is `Share`, so routes on every core may use it. Importing
+# this module registers the SQLite and PostgreSQL drivers: a postgres:// URL
+# in DATABASE_URL is all an application on PostgreSQL needs.
+module datasource
+
+import db
+import sqlite
+import pg
+import db/db/core::{Database}
+import environment::{database_url, postgres_url?, numbered_placeholders}
+
+DATABASE = Db.open(database_url).or_panic
+POSTGRES = postgres_url?(database_url)
+
+pub def database : Database
+  DATABASE
+end
+
+pub def postgres? : Bool
+  POSTGRES
+end
+
+# The statement in the dialect's placeholders.
+pub def placeholders(sql : String) : String
+  POSTGRES ? numbered_placeholders(sql) : sql
+end

@@ -1,0 +1,145 @@
+# The database's tables and columns, as `db/schema.json`: what
+# `kurt db:migrate` reads back from the database after migrating, and what
+# the autoloader declares a model's fields from. Rails' db/schema.rb, for
+# the same reason: a column is written once, in its migration, and a build
+# needs no database to know it.
+#
+#   {
+#     "posts": [
+#       {"name": "id", "sql": "INTEGER", "type": "Int64"},
+#       {"name": "title", "sql": "TEXT", "type": "String"},
+#       {"name": "summary", "sql": "TEXT", "type": "String?"}
+#     ]
+#   }
+#
+# `type` is the iyi type the field is declared with: nilable when the column
+# may hold NULL. A column whose type has no iyi counterpart here (a BLOB) has
+# no `type`, and the model declares it by hand if it needs it.
+module schema
+
+import std/text
+import std/json::{JSON, Any}
+import db/db/core::{Database}
+import db/db/errors::{DBError}
+import environment::{postgres_url?}
+
+pub class Column
+  getter name : String
+  getter sql : String
+  getter type : String
+
+  def initialize(@name : String, @sql : String, @type : String)
+  end
+end
+
+pub class Table
+  getter name : String
+  getter columns : Array(Column)
+
+  def initialize(@name : String, @columns : Array(Column))
+  end
+end
+
+# The iyi type of a column of SQL type *sql*, or "" for none. SQLite keeps a
+# column's declared type name, which is how BOOLEAN and DATETIME columns are
+# told from INTEGER and TEXT ones there.
+pub def iyi_type(sql : String, nullable : Bool, postgres : Bool) : String
+  t = sql.upcase
+  base = if t.includes?("BOOL")
+           "Bool"
+         elsif t.includes?("DATE") || t.includes?("TIME")
+           "Time"
+         elsif t.includes?("INT")
+           # PostgreSQL's integer is 4 bytes, and its driver reads it as such.
+           postgres && (t == "INTEGER" || t == "INT4" || t == "INT") ? "Int32" : "Int64"
+         elsif t.includes?("REAL") || t.includes?("FLOA") || t.includes?("DOUB")
+           "Float64"
+         elsif t.empty? || t.includes?("CHAR") || t.includes?("TEXT") || t.includes?("CLOB") || t.includes?("UUID") || t.includes?("JSON")
+           "String"
+         else
+           ""
+         end
+  return "" if base.empty?
+  nullable ? base + "?" : base
+end
+
+def sqlite_tables(db : Database) : Array(Table) | DBError
+  names = db.query_all("SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'schema_migrations' ORDER BY name", as: String)!
+  names.map do |table|
+    rows = db.query_all("SELECT name, type, \"notnull\", pk FROM pragma_table_info(?) ORDER BY cid", table, as: Tuple(String, String, Int64, Int64))!
+    columns = rows.map do |row|
+      nullable = row[2] == 0 && row[3] == 0
+      Column.new(row[0], row[1], iyi_type(row[1], nullable, false))
+    end
+    Table.new(table, columns)
+  end
+end
+
+def postgres_tables(db : Database) : Array(Table) | DBError
+  rows = db.query_all("SELECT table_name::text, column_name::text, data_type::text, is_nullable::text FROM information_schema.columns WHERE table_schema = current_schema() AND table_name <> 'schema_migrations' ORDER BY table_name, ordinal_position", as: Tuple(String, String, String, String))!
+  tables = [] of Table
+  rows.each do |row|
+    if tables.empty? || tables.last.name != row[0]
+      tables << Table.new(row[0], [] of Column)
+    end
+    nullable = row[3] == "YES" && row[1] != "id"
+    tables.last.columns << Column.new(row[1], row[2], iyi_type(row[2], nullable, true))
+  end
+  tables
+end
+
+# What the database at *url* holds now, schema_migrations aside.
+pub def introspect(db : Database, url : String) : Array(Table) | DBError
+  postgres_url?(url) ? postgres_tables(db) : sqlite_tables(db)
+end
+
+def quote(text : String) : String
+  "\"" + text.gsub("\\", "\\\\").gsub("\"", "\\\"") + "\""
+end
+
+# Tables by name, columns in their order, one column a line: a migration
+# shows up in a diff as the lines it changed.
+pub def to_json(tables : Array(Table)) : String
+  return "{}\n" if tables.empty?
+  blocks = tables.map do |table|
+    columns = table.columns.map do |c|
+      typed = c.type.empty? ? "" : ", \"type\": " + quote(c.type)
+      "    {\"name\": " + quote(c.name) + ", \"sql\": " + quote(c.sql) + typed + "}"
+    end
+    "  " + quote(table.name) + ": [\n" + columns.join(",\n") + "\n  ]"
+  end
+  "{\n" + blocks.join(",\n") + "\n}\n"
+end
+
+def text_field(fields : Hash(String, Any), key : String) : String
+  if value = fields[key]?
+    value.as_s? || ""
+  else
+    ""
+  end
+end
+
+# The tables in a schema.json; none for a file that is not one.
+pub def parse(text : String) : Array(Table)
+  tables = [] of Table
+  document = JSON.parse?(text)
+  return tables if document.nil?
+  hash = document.as_h?
+  return tables if hash.nil?
+  hash.each do |name, value|
+    columns = [] of Column
+    (value.as_a? || [] of Any).each do |entry|
+      fields = entry.as_h?
+      next if fields.nil?
+      column = text_field(fields, "name")
+      next if column.empty?
+      columns << Column.new(column, text_field(fields, "sql"), text_field(fields, "type"))
+    end
+    tables << Table.new(name, columns)
+  end
+  tables
+end
+
+pub def find(tables : Array(Table), name : String) : Table?
+  tables.find { |table| table.name == name }
+end

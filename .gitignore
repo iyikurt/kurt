@@ -1,0 +1,8 @@
+/bin/
+/lib/
+.kurt/
+*.dwarf
+*.sqlite3
+*.sqlite3-*
+.DS_Store
+.claude/settings.local.json

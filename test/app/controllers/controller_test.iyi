@@ -1,0 +1,232 @@
+module test/app/controllers/controller_test
+
+import std/text
+import db/db/errors::{DBError}
+import web/iyi_web/router::{Router, RouteHandler}
+import web/iyi_web/harness::*
+import datasource::{database}
+import model::*
+import controllers::*
+import helpers::*
+
+class Post
+  property title : String
+
+  derive model
+
+  def validate(errors : Errors) : Nil
+    errors.add("title", "can't be blank") if title.strip.empty?
+  end
+end
+
+class ApplicationController < Controller
+  def require_login
+    Unauthorized.new unless params[:token] == "secret"
+  end
+end
+
+class PostsController < ApplicationController
+  before_action :require_login, except: [:index, :show, :hello, :helpers]
+  before_action :set_post, only: [:show, :destroy]
+
+  @post : Post = Post.new
+  @posts : Array(Post) = [] of Post
+
+  def index
+    @posts = Post.order(:id).all!
+    render "posts/index"
+  end
+
+  def show
+    render "posts/show"
+  end
+
+  def create
+    @post = Post.new(post_params)
+    if @post.save!
+      redirect_to path_to(@post), notice: "Post was created."
+    else
+      render "posts/new", status: 422
+    end
+  end
+
+  def destroy
+    @post.destroy!
+    redirect_to "/posts"
+  end
+
+  def hello
+    "hello " + params[:name]
+  end
+
+  def helpers
+    @posts = Post.order(:id).all!
+    render "posts/helpers", layout: false
+  end
+
+  private def set_post
+    @post = Post.find(params[:id])!
+  end
+
+  private def post_params : Hash(String, String)
+    params.require(:post).permit(:title)
+  end
+end
+
+# A parent's filter left out: everywhere, and for one action only.
+class OpenController < ApplicationController
+  before_action :require_login
+  skip_before_action :require_login, only: [:open]
+
+  def open
+    "open"
+  end
+
+  def closed
+    "closed"
+  end
+end
+
+class PublicController < ApplicationController
+  before_action :require_authentication
+  allow_unauthenticated_access
+
+  def require_authentication
+    Unauthorized.new
+  end
+
+  def index
+    "public"
+  end
+end
+
+# Nested under posts, and one under a namespace.
+class NotesController < ApplicationController
+  def index
+    "notes of " + params[:article_id]
+  end
+
+  def show
+    "note " + params[:id] + " of " + params[:article_id]
+  end
+end
+
+class StatsController < ApplicationController
+  def index
+    "stats"
+  end
+end
+
+def routes : Router
+  router = Router.new
+  resources "posts", PostsController
+  get "/hello/:name", PostsController, :hello
+  get "/helpers", PostsController, :helpers
+  get "/open", OpenController, :open
+  get "/closed", OpenController, :closed
+  get "/public", PublicController, :index
+  resources "articles", PostsController, only: [:index] do
+    resources "notes", NotesController
+  end
+  namespace "admin" do
+    get "/stats", StatsController, :index
+  end
+  install_error_pages router
+  router
+end
+
+def setup : Nil | DBError
+  database.exec("DROP TABLE IF EXISTS posts")!
+  database.exec("CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL)")!
+  nil
+end
+
+case failed = setup
+in DBError
+  STDERR.puts failed.message
+  exit 1
+in Nil
+end
+
+app = RouteHandler.new(routes)
+
+# index on an empty table
+res = dispatch(app, "GET", "/posts").response
+assert res.status_code == 200
+assert res.body == "<html><body><ul></ul>\n</body></html>\n"
+
+# the filter stops create without the token: Unauthorized -> /login
+res = dispatch(app, form_request("POST", "/posts", "post%5Btitle%5D=Hello")).response
+assert res.status_code == 302
+assert res.headers["Location"]? == "/login"
+assert Post.count.as(Int64) == 0
+
+# invalid: 422 and the form again, with the message
+res = dispatch(app, form_request("POST", "/posts", "post%5Btitle%5D=+&token=secret")).response
+assert res.status_code == 422
+assert res.body.includes?("title can&#39;t be blank")
+
+# valid: created, and redirected to it
+res = dispatch(app, form_request("POST", "/posts", "post%5Btitle%5D=Hello+%3Cb%3E&post%5Bid%5D=77&token=secret")).response
+assert res.status_code == 303
+assert res.headers["Location"]? == "/posts/1"
+
+# show escapes what it prints
+res = dispatch(app, "GET", "/posts/1").response
+assert res.status_code == 200
+assert res.body.includes?("<h1>Hello &lt;b&gt;</h1>")
+
+# a record that is not there: NotFound -> 404, from `!` alone
+res = dispatch(app, "GET", "/posts/42").response
+assert res.status_code == 404
+res = dispatch(app, "GET", "/posts/abc").response
+assert res.status_code == 404
+
+# a JSON client gets 401 instead of a redirect
+res = dispatch(app, http_request("POST", "/posts", body: "{}", content_type: "application/json")).response
+assert res.status_code == 401
+
+# no edit/update/new actions: not registered
+assert dispatch(app, "GET", "/posts/1/edit").response.status_code == 404
+
+# a single route from the `get` macro, not behind the filter
+assert dispatch(app, "GET", "/hello/ali").response.body == "hello ali"
+
+# destroy, through the form-friendly route
+res = dispatch(app, form_request("POST", "/posts/1/delete", "token=secret")).response
+assert res.status_code == 303
+assert Post.count.as(Int64) == 0
+
+# skip_before_action and allow_unauthenticated_access
+assert dispatch(app, "GET", "/open").response.body == "open"
+assert dispatch(app, "GET", "/closed").response.status_code == 302
+assert dispatch(app, "GET", "/public").response.body == "public"
+
+# view helpers: link_to, button_to, partials with locals and collections
+Post.create(title: "First").as(Post)
+Post.create(title: "<Second>").as(Post)
+body = dispatch(app, "GET", "/helpers").response.body
+assert body.includes?(%(<a href="/posts" class="btn" data-turbo="false">All &lt;posts&gt;</a>))
+assert body.includes?(%(<form method="post" action="/posts/1" class="inline" style="display: inline" onsubmit="return confirm('Delete Bob\\&#39;s post?')"><input type="hidden" name="_method" value="delete"><button type="submit" class="danger">Delete</button></form>))
+first = Post.order(:id).first.as(Post)
+assert body.includes?(%(<li id="post_) + first.id.to_s + %(">First</li>))
+assert body.includes?("&lt;Second&gt;</li>")
+assert body.includes?("<p>a note &amp; more</p>")
+assert body.includes?("true")
+Post.delete_all.as(Int64)
+
+# nested resources and a namespace
+assert dispatch(app, "GET", "/articles/5/notes").response.body == "notes of 5"
+assert dispatch(app, "GET", "/articles/5/notes/9").response.body == "note 9 of 5"
+assert dispatch(app, "GET", "/admin/stats").response.body == "stats"
+assert dispatch(app, "GET", "/stats").response.status_code == 404
+# every route names its action, for `kurt routes`
+summaries = routes.route_docs.map { |pair| pair[1].method + " " + pair[0] + " " + (pair[1].summary || "") }
+assert summaries.includes?("GET /articles/:post_id/notes NotesController#index") == false
+assert summaries.includes?("GET /articles/:article_id/notes NotesController#index")
+assert summaries.includes?("GET /admin/stats StatsController#index")
+table = routes_table(routes)
+assert table.lines.first.strip.starts_with?("Verb")
+assert table.includes?("/articles/:article_id/notes/:id")
+
+puts "controller: all assertions passed"

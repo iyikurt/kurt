@@ -1,0 +1,673 @@
+# Controllers: a class per resource, an instance per request, an action per
+# route. Built on iyi-web: the routing macros register ordinary iyi-web
+# routes, and the errors an action hands up with `!` become responses in one
+# place, `install_error_pages` (NotFound -> 404, Invalid -> 422,
+# Unauthorized -> the login page, Forbidden -> 403, DBError -> 503).
+#
+#   class PostsController < ApplicationController
+#     before_action :require_login, except: [:index, :show]
+#
+#     def index
+#       posts = Post.order_desc(:id).all!
+#       render "posts/index"                       # app/views/posts/index.eiy
+#     end
+#
+#     def show
+#       post = Post.find(params[:id])!              # NotFound -> 404
+#       render "posts/show"
+#     end
+#   end
+#
+# config/routes.iyi:
+#
+#   root HomeController, :index
+#   resources "posts", PostsController
+#   get "/about", PagesController, :about
+module controllers
+
+import std/text
+import db/db/errors::{DBError}
+import web/iyi_web/context::{Context}
+import web/iyi_web/params::{Params}
+import web/iyi_web/router::{Router}
+import web/iyi_web/status::{HttpError}
+import web/iyi_web/session::{Session, session}
+import web/iyi_web/csrf::{csrf_tag, csrf_token}
+import web/iyi_web/log::{StdoutLogger}
+import model::{NotFound, Invalid}
+import datasource::{database}
+import environment::{production?, env}
+import strong_parameters::{Parameters}
+import std/html::{HTML}
+import web/iyi_web/templates::{SafeHTML}
+import helpers::{attributes_html}
+
+pub import web/iyi_web/context
+pub import web/iyi_web/templates
+pub import model
+pub import strong_parameters
+pub import helpers
+
+# The visitor must sign in first. A page sends them to the login page; a
+# JSON request gets 401.
+pub class Unauthorized
+  getter message : String
+
+  def initialize(@message : String = "sign in first")
+  end
+end
+
+impl Error for Unauthorized
+  def message : String
+    @message
+  end
+end
+
+impl HttpError for Unauthorized
+  def status : Int32
+    401
+  end
+end
+
+# Signed in, but not allowed to.
+pub class Forbidden
+  getter message : String
+
+  def initialize(@message : String = "not allowed")
+  end
+end
+
+impl Error for Forbidden
+  def message : String
+    @message
+  end
+end
+
+impl HttpError for Forbidden
+  def status : Int32
+    403
+  end
+end
+
+# What a filter answers to stop the action: nil lets it run. A DBError is
+# one too, so a filter may hand up what `Post.find(...)!` hands it.
+pub alias Halt = Unauthorized | Forbidden | NotFound | DBError
+
+pub class Controller
+  getter env : Context
+  getter action : String
+  @params : Parameters? = nil
+
+  def initialize(@env : Context, @action : String = "")
+  end
+
+  # Runs before every action; answer a Halt to stop it. `before_action`
+  # writes this from its arguments, and a controller may write it by hand,
+  # calling `super` first.
+  def before_action(action : String) : Halt?
+    nil
+  end
+
+  # The query string, the form body and the path's parameters, in one
+  # place, a path parameter first, then the body, as Rails' `params`:
+  #
+  #   Post.find(params[:id])                   # "" when missing
+  #   params[:q]?                              # nil when missing
+  #   params.require(:post).permit(:title)     # strong parameters
+  def params : Parameters
+    if built = @params
+      return built
+    end
+    values = {} of String => String
+    @env.params.query.each { |key, value| values[key] = value }
+    @env.params.body.each { |key, value| values[key] = value }
+    @env.params.url.each { |key, value| values[key] = value }
+    built = Parameters.new(values)
+    @params = built
+    built
+  end
+
+  # Ends the action with a redirect: 303 after a form, so the browser
+  # follows it with a GET. `notice:` and `alert:` leave a flash message for
+  # the next page: `redirect_to path_to(post), notice: "Post was created."`.
+  def redirect_to(path : String, status : Int32 = 303, notice : String? = nil, alert : String? = nil) : Nil
+    if message = notice
+      flash("notice", message)
+    end
+    if message = alert
+      flash("alert", message)
+    end
+    @env.redirect(path, status)
+    nil
+  end
+
+  def status(code : Int32) : Nil
+    @env.response.status_code = code
+    nil
+  end
+
+  # The request asked for JSON: an Accept header naming it, a JSON body, or
+  # a path ending in `.json`.
+  def wants_json? : Bool
+    accept = @env.request.headers["Accept"]? || ""
+    type = @env.request.headers["Content-Type"]? || ""
+    accept.includes?("application/json") || type.includes?("application/json") || @env.request.path.ends_with?(".json")
+  end
+
+  # Writes *data* as JSON.
+  def json(data : T) : Nil forall T
+    @env.json(data)
+    nil
+  end
+
+  # The request's session. Panics when no SessionHandler ran; the
+  # application's entry file installs one.
+  def session : Session
+    ::IyiWeb::Session.session(@env)
+  end
+
+  # The session, or nil when no SessionHandler ran (a test that dispatches
+  # to the routes alone).
+  def session? : Session?
+    @env.get?("iyi_web.session", Session)
+  end
+
+  # A message for the next page: `flash("notice", "Post created")`. Kept
+  # in the session; without one it is dropped.
+  def flash(kind : String, message : String) : Nil
+    if store = session?
+      store["flash_" + kind] = message
+    end
+    nil
+  end
+
+  # The message left for this page, read once.
+  def flash?(kind : String) : String?
+    store = session?
+    return nil if store.nil?
+    key = "flash_" + kind
+    message = store[key]?
+    store.delete(key) if message
+    message
+  end
+
+  # The hidden form field CSRFHandler checks. Print it with `raw(...)`.
+  # Empty when no CSRFHandler (and so no session) is installed.
+  def csrf_field : String
+    session?.nil? ? "" : csrf_tag(@env)
+  end
+
+  def csrf_token : String
+    session?.nil? ? "" : ::IyiWeb::Csrf.csrf_token(@env)
+  end
+
+  # The script that reloads the page when `kurt dev` restarts the server
+  # after a change; empty anywhere else. The layout prints it with `raw`.
+  def live_reload_tag : String
+    ::Kurt::Controllers.live_reload_tag
+  end
+
+  # No filter is skipped until `skip_before_action` says so.
+  def __kurt_skip?(filter : String, action : String) : Bool
+    false
+  end
+
+  # The signed-in user's id, kept in the session by `start_session_for`;
+  # nil when nobody is signed in. In a test, the one `sign_in_as` named.
+  def session_user_id : Int64?
+    if forced = ::Kurt::Controllers.test_user_id
+      return forced
+    end
+    store = session?
+    return nil if store.nil?
+    raw = store["user_id"]?
+    raw ? raw.to_i64? : nil
+  end
+
+  # Signs *user* in: a new session id first, so an id someone planted
+  # before the login is worth nothing after it.
+  def start_session_for(user : T) : Nil forall T
+    store = session
+    store.regenerate
+    store["user_id"] = user.id.to_s
+    nil
+  end
+
+  # Signs out: the session is emptied and its cookie deleted.
+  def terminate_session : Nil
+    if store = session?
+      store.clear
+    end
+    nil
+  end
+
+  # A link: `<%= link_to "Edit", path_to(post) + "/edit", class: "btn" %>`.
+  # The text is escaped; a SafeHTML one (an icon, `raw(...)`) is not. Other
+  # attributes follow: `target: "_blank"`, `data_turbo: false`.
+  def link_to(text : String | SafeHTML, path : String, class klass : String? = nil, **attrs) : SafeHTML
+    inner = text.is_a?(SafeHTML) ? text.to_s : HTML.escape(text)
+    SafeHTML.new("<a href=\"" + HTML.escape(path) + "\"" + attributes_html(class: klass) + attributes_html(**attrs) + ">" + inner + "</a>")
+  end
+
+  # A button in a form of its own, for what a link must not do:
+  # `<%= button_to "Delete", path_to(post), method: :delete, confirm: "Delete this post?" %>`.
+  # The form carries the CSRF field and, for a method a form cannot send,
+  # `_method` (OverrideMethodHandler reads it).
+  def button_to(text : String | SafeHTML, path : String, method : Symbol | String = :post, class klass : String? = nil, confirm : String? = nil, form_class : String = "inline") : SafeHTML
+    verb = method.to_s.downcase
+    inner = text.is_a?(SafeHTML) ? text.to_s : HTML.escape(text)
+    ask = ""
+    if question = confirm
+      ask = " onsubmit=\"return confirm('" + HTML.escape(question.gsub("\\", "\\\\").gsub("'", "\\'")) + "')\""
+    end
+    hidden = verb == "post" || verb == "get" ? "" : "<input type=\"hidden\" name=\"_method\" value=\"" + HTML.escape(verb) + "\">"
+    form_method = verb == "get" ? "get" : "post"
+    # Inline by default without depending on a stylesheet: Tailwind builds
+    # only the classes the views name, and this one is named here.
+    look = form_class == "inline" ? " style=\"display: inline\"" : ""
+    SafeHTML.new("<form method=\"" + form_method + "\" action=\"" + HTML.escape(path) + "\" class=\"" + HTML.escape(form_class) + "\"" + look + ask + ">" +
+                 (form_method == "post" ? csrf_field : "") + hidden + "<button type=\"submit\"" + attributes_html(class: klass) + ">" + inner + "</button></form>")
+  end
+
+  # Whether the request is for *path*: a navbar marks its page with it.
+  def current_page?(path : String) : Bool
+    @env.request.path == path
+  end
+
+  # `/posts/7/comments/3`, for a resource nested in another.
+  def path_to(parent : P, record : T) : String forall P, T
+    path_to(parent) + path_to(record)
+  end
+
+  # `/posts/7` for a Post with id 7.
+  def path_to(record : T) : String forall T
+    "/" + T.table_name + "/" + record.id.to_s
+  end
+end
+
+# Builds a controller for one request and runs its filters, then the action
+# the block calls. What `resources` and `route` expand to.
+pub def dispatch(controller : C, & : C -> R) : R | Halt forall C, R
+  if failure = controller.before_action(controller.action)
+    failure
+  else
+    yield controller
+  end
+end
+
+# A filter: `before_action :require_login, except: [:index, :show]` runs
+# `require_login` before every action, or only the ones `only:` names, or
+# all but the ones `except:` names. Filters run in the order they are
+# written, a parent class's first. A filter stops the action by answering a
+# Halt (what `Post.find(...)!` hands up when the record is missing); any
+# other answer, an assigned record or nil, lets it run, so a filter needs no
+# return type:
+#
+#   private def set_post
+#     @post = Post.find(params[:id])!
+#   end
+pub macro before_action(name, only = nil, except = nil)
+  def before_action(action : String) : ::Kurt::Controllers::Halt?
+    {% if @type.methods.any? { |m| m.name == "before_action" } %}
+      earlier = previous_def
+    {% else %}
+      earlier = super
+    {% end %}
+    return earlier if earlier
+    {% if only %}
+      return nil unless {{ only.map(&.id.stringify) }}.includes?(action)
+    {% end %}
+    {% if except %}
+      return nil if {{ except.map(&.id.stringify) }}.includes?(action)
+    {% end %}
+    return nil if __kurt_skip?({{ name.id.stringify }}, action)
+    answer = {{ name.id }}
+    answer.is_a?(::Kurt::Controllers::Halt) ? answer : nil
+  end
+end
+
+# Leaves out a filter a parent class set, for every action or only some:
+# `skip_before_action :require_authentication, only: [:new, :create]`.
+pub macro skip_before_action(name, only = nil, except = nil)
+  def __kurt_skip?(filter : String, action : String) : Bool
+    {% if @type.methods.any? { |m| m.name == "__kurt_skip?" } %}
+      return true if previous_def
+    {% else %}
+      return true if super
+    {% end %}
+    return false unless filter == {{ name.id.stringify }}
+    {% if only %}
+      {{ only.map(&.id.stringify) }}.includes?(action)
+    {% elsif except %}
+      !{{ except.map(&.id.stringify) }}.includes?(action)
+    {% else %}
+      true
+    {% end %}
+  end
+end
+
+# Pages anyone may see once `kurt generate authentication` has made sign-in
+# the rule: `allow_unauthenticated_access only: [:index, :show]`, or every
+# action of the controller without arguments.
+pub macro allow_unauthenticated_access(only = nil, except = nil)
+  ::Kurt::Controllers.skip_before_action(:require_authentication, {{ only }}, {{ except }})
+end
+
+# Who `sign_in_as` signed in for the test process; 0 for nobody.
+TEST_USER = Atomic(Int64).new(0_i64)
+
+# In a test, makes every request after it signed in as *user*, without a
+# login form or a cookie. Refused anywhere but KURT_ENV=test, which
+# `kurt test` sets: a server never runs this.
+pub def sign_in_as(user : T) : Nil forall T
+  sign_in_as(user.id)
+end
+
+pub def sign_in_as(id : Int64) : Nil
+  raise "sign_in_as is for tests, and KURT_ENV is " + env unless env == "test"
+  TEST_USER.set(id)
+  nil
+end
+
+# Undoes `sign_in_as`.
+pub def sign_out : Nil
+  TEST_USER.set(0_i64)
+  nil
+end
+
+pub def test_user_id : Int64?
+  return nil unless env == "test"
+  id = TEST_USER.get
+  id == 0 ? nil : id
+end
+
+# Renders `app/views/<name>.eiy` inside `app/views/layouts/application.eiy`,
+# from an action in `app/controllers/`: `render "posts/index"`.
+# `layout: "admin"` picks `layouts/admin.eiy`, `layout: false` none, and
+# `status: 422` sets the response's status: `render "posts/edit", status: 422`.
+# A name ending in `.eiy` is a path relative to the calling file, which is
+# how a template renders a partial: `<%= render "_form.eiy" %>`.
+#
+# A partial takes locals and collections, as in Rails:
+#
+#   <%= render "_form.eiy", post: @post %>             # `post` in the partial
+#   <%= render "_post.eiy", collection: @posts %>      # once per post, as `post`
+pub macro render(name, layout = "application", status = nil, collection = nil, **locals)
+  {% if name.is_a?(StringLiteral) && name.ends_with?(".eiy") %}
+    {% if collection %}
+      {% item = name.split("/").last.gsub(/^_/, "").gsub(/\.eiy$/, "") %}
+      begin
+        __kurt_parts = [] of String
+        {{ collection }}.each do |{{ item.id }}|
+          {% for key, value in locals %}
+            {{ key.id }} = {{ value }}
+          {% end %}
+          __kurt_parts << ::IyiWeb::Templates.render({{ name }}).to_s
+        end
+        ::IyiWeb::Templates::SafeHTML.new(__kurt_parts.join)
+      end
+    {% elsif locals.empty? %}
+      ::IyiWeb::Templates.render({{ name }})
+    {% else %}
+      begin
+        {% for key, value in locals %}
+          {{ key.id }} = {{ value }}
+        {% end %}
+        ::IyiWeb::Templates.render({{ name }})
+      end
+    {% end %}
+  {% else %}
+    begin
+      {% if status %}
+        self.status({{ status }})
+      {% end %}
+      {% if layout == false %}
+        ::IyiWeb::Templates.render({{ "../views/" + name + ".eiy" }})
+      {% else %}
+        ::IyiWeb::Templates.render({{ "../views/" + name + ".eiy" }}, {{ "../views/layouts/" + layout + ".eiy" }})
+      {% end %}
+    end
+  {% end %}
+end
+
+# The routing macros below are written inside a function that has a local
+# `router` (config/routes.iyi is compiled into one), and add to it.
+
+# The seven routes of a resource, each to the action of the same name:
+#
+#   GET    /posts           index
+#   GET    /posts/new       new
+#   POST   /posts           create
+#   GET    /posts/:id       show
+#   GET    /posts/:id/edit  edit
+#   PATCH  /posts/:id       update   (also PUT, and POST with _method)
+#   DELETE /posts/:id       destroy  (also POST /posts/:id/delete)
+#
+# `only: [:index, :show]` or `except: [:destroy]` registers fewer. An
+# action the controller does not define is not registered either, so a
+# controller with only `index` and `show` needs no `only:`.
+#
+# A block nests resources under one of these, as in Rails:
+#
+#   resources "posts", PostsController do
+#     resources "comments", CommentsController     # /posts/:post_id/comments
+#   end
+#
+# The nested controller reads `params[:post_id]`; `param: :author_id` names
+# it otherwise.
+pub macro resources(name, controller, only = nil, except = nil, param = nil, &block)
+  {% all = ["index", "new", "create", "show", "edit", "update", "destroy"] %}
+  {% chosen = only ? only.map(&.id.stringify) : all %}
+  {% if except %}
+    {% chosen = chosen.reject { |a| except.map(&.id.stringify).includes?(a) } %}
+  {% end %}
+  {% klass = controller.resolve %}
+  {% chosen = chosen.select { |a| klass.has_method?(a) } %}
+  {% base = "/" + name.id.stringify %}
+  {% if chosen.includes?("index") %}
+    ::Kurt::Controllers.action router, :get, {{ base }}, {{ controller }}, :index
+  {% end %}
+  {% if chosen.includes?("new") %}
+    ::Kurt::Controllers.action router, :get, {{ base + "/new" }}, {{ controller }}, :new
+  {% end %}
+  {% if chosen.includes?("create") %}
+    ::Kurt::Controllers.action router, :post, {{ base }}, {{ controller }}, :create
+  {% end %}
+  {% if chosen.includes?("show") %}
+    ::Kurt::Controllers.action router, :get, {{ base + "/:id" }}, {{ controller }}, :show
+  {% end %}
+  {% if chosen.includes?("edit") %}
+    ::Kurt::Controllers.action router, :get, {{ base + "/:id/edit" }}, {{ controller }}, :edit
+  {% end %}
+  {% if chosen.includes?("update") %}
+    {% for verb in ["patch", "put", "post"] %}
+      ::Kurt::Controllers.action router, {{ verb.id.symbolize }}, {{ base + "/:id" }}, {{ controller }}, :update
+    {% end %}
+  {% end %}
+  {% if chosen.includes?("destroy") %}
+    ::Kurt::Controllers.action router, :delete, {{ base + "/:id" }}, {{ controller }}, :destroy
+    ::Kurt::Controllers.action router, :post, {{ base + "/:id/delete" }}, {{ controller }}, :destroy
+  {% end %}
+  {% if block %}
+    {% plural = name.id.stringify %}
+    {% one = plural.ends_with?("ies") ? plural[0...-3] + "y" : (plural.ends_with?("ses") || plural.ends_with?("xes") || plural.ends_with?("ches") || plural.ends_with?("shes") ? plural[0...-2] : (plural.ends_with?("s") ? plural[0...-1] : plural)) %}
+    {% key = param ? param.id.stringify : one + "_id" %}
+    router.namespace({{ base + "/:" + key }}) do |router|
+      {{ block.body }}
+    end
+  {% end %}
+end
+
+# Routes under a path: `namespace "admin" do resources "users", AdminUsersController end`
+# is /admin/users. The controllers are named as any other.
+pub macro namespace(name, &block)
+  router.namespace({{ "/" + name.id.stringify }}) do |router|
+    {{ block.body }}
+  end
+end
+
+# `root HomeController, :index` is `GET /`.
+pub macro root(controller, action)
+  ::Kurt::Controllers.action router, :get, "/", {{ controller }}, {{ action }}
+end
+
+# One route to one action: `get "/about", PagesController, :about`.
+pub macro get(path, controller, action)
+  ::Kurt::Controllers.action router, :get, {{ path }}, {{ controller }}, {{ action }}
+end
+
+pub macro post(path, controller, action)
+  ::Kurt::Controllers.action router, :post, {{ path }}, {{ controller }}, {{ action }}
+end
+
+pub macro put(path, controller, action)
+  ::Kurt::Controllers.action router, :put, {{ path }}, {{ controller }}, {{ action }}
+end
+
+pub macro patch(path, controller, action)
+  ::Kurt::Controllers.action router, :patch, {{ path }}, {{ controller }}, {{ action }}
+end
+
+pub macro delete(path, controller, action)
+  ::Kurt::Controllers.action router, :delete, {{ path }}, {{ controller }}, {{ action }}
+end
+
+# What every routing macro expands to: a route on *router* that builds the
+# controller for the request, runs its filters, then the action.
+#
+# The route's summary names its action, which `kurt routes` prints (and the
+# OpenAPI document shows, when an application asks for one).
+pub macro action(router, verb, path, controller, name)
+  {{ router }}.{{ verb.id }} {{ path }}, summary: {{ controller.stringify + "#" + name.id.stringify }} do |env|
+    ::Kurt::Controllers.dispatch({{ controller }}.new(env, {{ name.id.stringify }})) { |c| c.{{ name.id }} }
+  end
+end
+
+# What `kurt routes` prints: each route's verb, full path and action.
+pub def routes_table(router : Router) : String
+  rows = router.route_docs.map { |pair| {pair[1].method, pair[0], pair[1].summary || ""} }
+  return "No routes: config/routes.iyi adds them.\n" if rows.empty?
+  verb_width = (rows.map { |r| r[0].size } + ["Verb".size]).max
+  path_width = (rows.map { |r| r[1].size } + ["Path".size]).max
+  line = ->(verb : String, path : String, target : String) { "  " + verb.ljust(verb_width) + "  " + path.ljust(path_width) + "  " + target }
+  out = [line.call("Verb", "Path", "Controller#Action")]
+  rows.each { |r| out << line.call(r[0], r[1], r[2]) }
+  out.join("\n") + "\n"
+end
+
+LOG = StdoutLogger.new
+
+LIVE_RELOAD = !(Program.env("KURT_LIVE_RELOAD") || "").empty?
+
+LIVE_RELOAD_SCRIPT = <<-HTML
+<script>
+(function () {
+  var boot = null;
+  function listen() {
+    var events = new EventSource("/__kurt/live");
+    events.addEventListener("boot", function (event) {
+      if (boot !== null && boot !== event.data) { location.reload(); }
+      boot = event.data;
+    });
+    events.onerror = function () { events.close(); setTimeout(listen, 300); };
+  }
+  listen();
+})();
+</script>
+HTML
+
+# The page script `kurt dev` reloads pages with; "" unless it started this
+# server (KURT_LIVE_RELOAD).
+pub def live_reload_tag : String
+  LIVE_RELOAD ? LIVE_RELOAD_SCRIPT : ""
+end
+
+pub def live_reload? : Bool
+  LIVE_RELOAD
+end
+
+def escape(text : String) : String
+  text.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub("\"", "&quot;")
+end
+
+def json_request?(env : Context) : Bool
+  accept = env.request.headers["Accept"]? || ""
+  type = env.request.headers["Content-Type"]? || ""
+  accept.includes?("application/json") || type.includes?("application/json")
+end
+
+def page(title : String, body : String) : String
+  "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>" + escape(title) +
+    "</title></head><body style=\"font-family: system-ui, sans-serif; max-width: 40rem; margin: 4rem auto; padding: 0 1rem\">" +
+    body + "</body></html>"
+end
+
+# The default answers for the errors actions hand up. Register the
+# application's own pages for a type before calling this: pages are tried
+# in the order they were registered.
+pub def install_error_pages(router : Router, login_path : String = "/login") : Nil
+  install_health_check(router)
+  router.error NotFound do |env, err|
+    env.response.status_code = 404
+    if json_request?(env)
+      env.response.content_type = "application/json"
+      %({"error":"not found"})
+    else
+      page("Not found", "<h1>Not found</h1><p>" + escape(err.message) + "</p>")
+    end
+  end
+
+  router.error Invalid do |env, err|
+    env.response.status_code = 422
+    if json_request?(env)
+      env.response.content_type = "application/json"
+      items = err.errors.full_messages.map { |m| "\"" + m.gsub("\\", "\\\\").gsub("\"", "\\\"") + "\"" }
+      %({"errors":[) + items.join(",") + "]}"
+    else
+      list = err.errors.full_messages.map { |m| "<li>" + escape(m) + "</li>" }.join
+      page("Invalid", "<h1>" + escape(err.model) + " could not be saved</h1><ul>" + list + "</ul>")
+    end
+  end
+
+  router.error Unauthorized do |env, err|
+    if json_request?(env)
+      env.response.status_code = 401
+      env.response.content_type = "application/json"
+      %({"error":"unauthorized"})
+    else
+      env.redirect(login_path, 302)
+      ""
+    end
+  end
+
+  router.error Forbidden do |env, err|
+    env.response.status_code = 403
+    page("Forbidden", "<h1>Forbidden</h1><p>" + escape(err.message) + "</p>")
+  end
+
+  router.error DBError do |env, err|
+    LOG.write("database error: " + (err.message.empty? ? err.class.to_s : err.message))
+    env.response.status_code = 503
+    if json_request?(env)
+      env.response.content_type = "application/json"
+      %({"error":"database unavailable"})
+    else
+      page("Unavailable", "<h1>Service unavailable</h1><p>Please try again shortly.</p>")
+    end
+  end
+  nil
+end
+
+# GET /up, for load balancers and deploy tools, as in Rails 8: 200 "OK"
+# when the application is up and its database answers, 503 when not.
+pub def install_health_check(router : Router, path : String = "/up") : Nil
+  router.get path, summary: "health check" do |env|
+    env.response.content_type = "text/plain"
+    if database.scalar("SELECT 1").is_a?(DBError)
+      env.response.status_code = 503
+      "database unavailable\n"
+    else
+      "OK\n"
+    end
+  end
+end

@@ -1,0 +1,52 @@
+# What a release binary does besides serving: `./bin/blog db:migrate` on a
+# server that has the binary and no source. `kurt build` puts the
+# application's migrations inside it, so the binary migrates the database
+# it is pointed at (DATABASE_URL) to the schema it was built for.
+module release
+
+import std/text
+import db/db/errors::{DBError}
+import datasource::{database}
+import environment::{database_url}
+import migrator::{migrate, status, from_files, Migration, MigrationError}
+
+USAGE = <<-TEXT
+Commands:
+  db:migrate   run the migrations this binary carries that have not run
+  db:status    which of them have run
+TEXT
+
+# Runs *command* with the migrations *files* (path, text); answers the exit
+# status.
+pub def run_database_command(command : String, files : Array(Tuple(String, String))) : Int32
+  migrations = case found = from_files(files)
+               in Array(Migration) then found
+               in MigrationError
+                 STDERR.puts "error: " + found.message
+                 return 1
+               end
+  case command
+  when "db:migrate"
+    case ran = migrate(database, database_url, migrations)
+    in Array(Migration)
+      puts "nothing to migrate" if ran.empty?
+      ran.each { |m| puts "  migrate  " + m.label }
+      0
+    in MigrationError, DBError
+      STDERR.puts "error: " + ran.message
+      1
+    end
+  when "db:status"
+    case rows = status(database, migrations)
+    in Array(Tuple(Migration, Bool))
+      rows.each { |row| puts (row[1] ? "  up    " : "  down  ") + row[0].label }
+      0
+    in MigrationError, DBError
+      STDERR.puts "error: " + rows.message
+      1
+    end
+  else
+    STDERR.puts "unknown command " + command + "\n" + USAGE
+    1
+  end
+end

@@ -1,0 +1,1518 @@
+# The model layer: a table mapped to a class by one `derive model`, a query
+# builder over the `db` package, relations as macros, validation.
+#
+#   @[Table("posts")]                # optional: the default is the plural of
+#   class Post                       # the class name, underscored
+#     property title : String
+#     property body : String
+#     property user_id : Int64
+#
+#     belongs_to user : User         # relations go ABOVE the derive: a
+#     has_many comments : Comment    # derive reads the declarations above it
+#
+#     validates :title, presence: true   # Rails' validations and callbacks,
+#     before_save :set_slug              # also above the derive
+#
+#     derive model
+#
+#     def validate(errors : Errors) : Nil   # rules of your own
+#       errors.add("title", "can't be blank") if title.empty?
+#     end
+#   end
+#
+#   Post.all!                                    # Array(Post) | DBError
+#   Post.find(1)!                                # Post | NotFound | DBError
+#   Post.where(published: true).order_desc(:id).limit(10).all!
+#   Post.title("Hello").first?!                  # one typed finder per field
+#   post = Post.create(title: "Hi", body: "...", user_id: 1)!   # | Invalid
+#   post.user!.name
+#   post.comments.order(:id).all!
+#
+# Why macros and not annotations for relations: a derive is handed the type's
+# name and its fields with their types, nothing else (SPEC.md II.4), so it
+# cannot see `@[BelongsTo(User)]`. A macro called in the class body reads only
+# its own arguments, which R-5 allows. That was Phase 0's gate.
+module model
+
+import std/text
+import db/db/core::{Database}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue}
+import std/time::{Time}
+import std/regex::{Regex}
+import std/password::{Bcrypt}
+import environment::{env}
+import datasource::{database, placeholders, postgres?}
+
+pub import db/db/serializable
+pub import db/db/value
+pub import inflector
+
+# ---------------------------------------------------------------------------
+# Errors a model answers. None of them knows about HTTP: the controller layer
+# turns them into responses, in one place (controllers.install_error_pages).
+# ---------------------------------------------------------------------------
+
+# A query ran and found no row: `find`, `first`, a `belongs_to` link.
+pub class NotFound
+  getter message : String
+  getter model : String
+
+  def initialize(@model : String, @message : String = "")
+    @message = @model + " not found" if @message.empty?
+  end
+end
+
+impl Error for NotFound
+  def message : String
+    @message
+  end
+end
+
+# The messages validation collected, field by field.
+pub class Errors
+  @messages : Hash(String, Array(String))
+
+  def initialize
+    @messages = {} of String => Array(String)
+  end
+
+  def add(field : String, message : String) : Nil
+    list = @messages[field]? || [] of String
+    list << message
+    @messages[field] = list
+    nil
+  end
+
+  def empty? : Bool
+    @messages.empty?
+  end
+
+  def any? : Bool
+    !@messages.empty?
+  end
+
+  def size : Int32
+    count = 0
+    @messages.each_value { |list| count += list.size }
+    count
+  end
+
+  # Messages for one field, empty when it has none.
+  def on(field : String) : Array(String)
+    @messages[field]? || [] of String
+  end
+
+  def fields : Array(String)
+    @messages.keys
+  end
+
+  # "title can't be blank", one per message.
+  def full_messages : Array(String)
+    out = [] of String
+    @messages.each do |field, list|
+      list.each { |message| out << field + " " + message }
+    end
+    out
+  end
+
+  def to_h : Hash(String, Array(String))
+    @messages
+  end
+end
+
+# A record that did not pass validation, and why. `save` answers it instead
+# of writing anything.
+pub class Invalid
+  getter model : String
+  getter errors : Errors
+
+  def initialize(@model : String, @errors : Errors)
+  end
+end
+
+impl Error for Invalid
+  def message : String
+    @model + " is invalid: " + @errors.full_messages.join(", ")
+  end
+end
+
+# Overrides the table a model maps to: `@[Table("people")]`.
+pub annotation Table
+end
+
+# ---------------------------------------------------------------------------
+# Transactions. The transaction is handed on explicitly, `on: tx`, and not
+# kept somewhere ambient: a server runs many requests at once, and a query
+# that found "the current transaction" by itself could land in another
+# request's.
+#
+#   Post.transaction do |tx|
+#     post.save(on: tx)!
+#     Comment.where(post_id: post.id).on(tx).delete_all!
+#   end
+#
+# The block's error rolls everything back and is answered; so does leaving
+# the block early (`!`). Otherwise it commits and answers the block's value.
+# ---------------------------------------------------------------------------
+
+pub class Transaction
+  getter inner : ::Db::Core::Transaction
+
+  def initialize(@inner : ::Db::Core::Transaction)
+  end
+
+  def connection : ::Db::Core::Connection
+    @inner.connection
+  end
+end
+
+# A transaction of its own, or one nested in *on* (a savepoint).
+pub def transaction(on : Transaction? = nil, & : Transaction -> T) : T | Nil | DBError forall T
+  if outer = on
+    outer.inner.transaction { |tx| yield Transaction.new(tx) }
+  else
+    database.transaction { |tx| yield Transaction.new(tx) }
+  end
+end
+
+# A query against T's table, built up and run by `all`, `first`, `count`...
+# Nothing runs until one of those is called, so a scope can be passed around
+# and narrowed: `Post.feed.where(user_id: 5).limit(3).all`.
+pub class Query(T)
+  @wheres : Array(String)
+  @args : Array(DBValue)
+  @orders : Array(String)
+  @limit : Int32?
+  @offset : Int32?
+  @on : Transaction?
+  @includes : Array(String)
+  @preloaded : Array(T)?
+
+  def initialize
+    @wheres = [] of String
+    @args = [] of DBValue
+    @orders = [] of String
+    @limit = nil
+    @offset = nil
+    @on = nil
+    @includes = [] of String
+    @preloaded = nil
+  end
+
+  # Loads associations with the rows, one query each, so a list does not
+  # ask once per row (N+1): `Post.includes(:user, :comments).all!`, then
+  # `post.user?` and `post.comments.all!` ask nothing more.
+  def includes(*names : Symbol) : Query(T)
+    names.each { |name| @includes << name.to_s }
+    self
+  end
+
+  # Rows `includes` loaded for a has_many: `all`, `count` and `first` answer
+  # them; narrowing the query (`where`, `order`, `limit`...) asks again.
+  def __kurt_preload_rows(rows : Array(T)) : Query(T)
+    @preloaded = rows
+    self
+  end
+
+  # `column IN (...)`; no values matches nothing.
+  def where_in(column : String, values : Array(DBValue)) : Query(T)
+    @preloaded = nil
+    if values.empty?
+      @wheres << "1 = 0"
+    else
+      @wheres << column + " IN (" + values.map { |_| "?" }.join(", ") + ")"
+      values.each { |value| @args << value }
+    end
+    self
+  end
+
+  def where_in(column : Symbol, values : Array(DBValue)) : Query(T)
+    where_in(column.to_s, values)
+  end
+
+  # Runs the query in *tx*: `Comment.where(post_id: 1).on(tx).all`. Nil is
+  # no transaction, so a transaction that may or may not be there passes on.
+  def on(tx : Transaction?) : Query(T)
+    @on = tx
+    self
+  end
+
+  # `column = value`; a nil value is `column IS NULL`.
+  def where(column : String, value : DBValue) : Query(T)
+    @preloaded = nil
+    if value.nil?
+      @wheres << column + " IS NULL"
+    else
+      @wheres << column + " = ?"
+      @args << value
+    end
+    self
+  end
+
+  def where(column : Symbol, value : DBValue) : Query(T)
+    where(column.to_s, value)
+  end
+
+  # `where(published: true, user_id: 5)`: each pair is `column = value`.
+  def where(**conditions : **C) : Query(T) forall C
+    conditions.each do |column, value|
+      where(column.to_s, value.as(DBValue))
+    end
+    self
+  end
+
+  # A fragment of SQL with `?` placeholders: `where_sql("views > ?", [10])`.
+  def where_sql(fragment : String, args : Array(DBValue) = [] of DBValue) : Query(T)
+    @preloaded = nil
+    @wheres << "(" + fragment + ")"
+    args.each { |arg| @args << arg }
+    self
+  end
+
+  def where_not(column : String, value : DBValue) : Query(T)
+    @preloaded = nil
+    if value.nil?
+      @wheres << column + " IS NOT NULL"
+    else
+      @wheres << column + " <> ?"
+      @args << value
+    end
+    self
+  end
+
+  def order(column : String) : Query(T)
+    @preloaded = nil
+    @orders << column + " ASC"
+    self
+  end
+
+  def order(column : Symbol) : Query(T)
+    order(column.to_s)
+  end
+
+  def order_desc(column : String) : Query(T)
+    @preloaded = nil
+    @orders << column + " DESC"
+    self
+  end
+
+  def order_desc(column : Symbol) : Query(T)
+    order_desc(column.to_s)
+  end
+
+  def limit(n : Int32) : Query(T)
+    @preloaded = nil
+    @limit = n
+    self
+  end
+
+  def offset(n : Int32) : Query(T)
+    @preloaded = nil
+    @offset = n
+    self
+  end
+
+  # Page 1 is the first; a page below 1 is page 1.
+  # A page number as a request sends it: `paginate(params[:page])`. Missing
+  # or not a number is page 1.
+  def paginate(page : String?, per : Int32 = 25) : Query(T)
+    paginate((page || "").strip.to_i? || 1, per)
+  end
+
+  def paginate(page : Int32, per : Int32 = 25) : Query(T)
+    page = 1 if page < 1
+    limit(per).offset((page - 1) * per)
+  end
+
+  # The WHERE clause, and the arguments it binds.
+  def where_clause : String
+    @wheres.empty? ? "" : " WHERE " + @wheres.join(" AND ")
+  end
+
+  def to_sql : String
+    sql = "SELECT * FROM " + T.table_name + where_clause
+    sql += " ORDER BY " + @orders.join(", ") unless @orders.empty?
+    if n = @limit
+      sql += " LIMIT " + n.to_s
+    end
+    if n = @offset
+      sql += " LIMIT -1" if @limit.nil? && !postgres?
+      sql += " OFFSET " + n.to_s
+    end
+    sql
+  end
+
+  def args : Array(DBValue)
+    @args
+  end
+
+  # Every row the query matches.
+  def all : Array(T) | DBError
+    if loaded = @preloaded
+      return loaded.dup
+    end
+    rows = if tx = @on
+             tx.connection.query_all(placeholders(to_sql), args: @args, as: T)!
+           else
+             database.query_all(placeholders(to_sql), args: @args, as: T)!
+           end
+    @includes.each do |name|
+      if failure = T.__kurt_preload(rows, name, @on)
+        return failure
+      end
+    end
+    rows
+  end
+
+  # The first row, or NotFound when there is none.
+  def first : T | NotFound | DBError
+    if loaded = @preloaded
+      return loaded.empty? ? NotFound.new(T.model_name) : loaded[0]
+    end
+    rows = limit(1).all!
+    rows.empty? ? NotFound.new(T.model_name) : rows[0]
+  end
+
+  # The first row, or nil when there is none.
+  def first? : T | Nil | DBError
+    if loaded = @preloaded
+      return loaded.empty? ? nil : loaded[0]
+    end
+    rows = limit(1).all!
+    rows.empty? ? nil : rows[0]
+  end
+
+  # An id as a request sends it: `find(params[:id])`. Text that is not a
+  # number finds nothing, without asking the database.
+  def find(id : String) : T | NotFound | DBError
+    number = id.strip.to_i64?
+    number ? find(number) : NotFound.new(T.model_name)
+  end
+
+  def find(id : Int64) : T | NotFound | DBError
+    where("id", id).first
+  end
+
+  def count : Int64 | DBError
+    if loaded = @preloaded
+      return loaded.size.to_i64
+    end
+    sql = placeholders("SELECT COUNT(*) FROM " + T.table_name + where_clause)
+    value = if tx = @on
+              tx.connection.scalar(sql, args: @args)!
+            else
+              database.scalar(sql, args: @args)!
+            end
+    case value
+    when Int64 then value
+    when Int32 then value.to_i64
+    else            0_i64
+    end
+  end
+
+  def exists? : Bool | DBError
+    count! > 0
+  end
+
+  # Deletes every row the query matches, without loading them; answers how
+  # many went.
+  def delete_all : Int64 | DBError
+    sql = placeholders("DELETE FROM " + T.table_name + where_clause)
+    if tx = @on
+      tx.connection.exec(sql, args: @args)!.rows_affected
+    else
+      database.exec(sql, args: @args)!.rows_affected
+    end
+  end
+end
+
+# A form value that is not of its field's type: "abc" for a number.
+pub class CastError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+# A form's text as a field's type, for `assign`.
+pub def cast(raw : String, type : String.class) : String | CastError
+  raw
+end
+
+pub def cast(raw : String, type : Int64.class) : Int64 | CastError
+  text = raw.strip
+  return CastError.new("can't be blank") if text.empty?
+  text.to_i64? || CastError.new("is not a number")
+end
+
+pub def cast(raw : String, type : Int32.class) : Int32 | CastError
+  text = raw.strip
+  return CastError.new("can't be blank") if text.empty?
+  text.to_i? || CastError.new("is not a number")
+end
+
+pub def cast(raw : String, type : Float64.class) : Float64 | CastError
+  text = raw.strip
+  return CastError.new("can't be blank") if text.empty?
+  text.to_f? || CastError.new("is not a number")
+end
+
+# A checkbox sends "1" (with a hidden "0" before it), and nothing at all
+# when it has no hidden field and is not ticked.
+pub def cast(raw : String, type : Bool.class) : Bool | CastError
+  case raw.strip.downcase
+  when "1", "true", "on", "yes"     then true
+  when "0", "false", "off", "no", "" then false
+  else                                    CastError.new("is not true or false")
+  end
+end
+
+# What a datetime-local or date input sends, and the database's own text.
+pub def cast(raw : String, type : Time.class) : Time | CastError
+  text = raw.strip
+  return CastError.new("can't be blank") if text.empty?
+  ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"].each do |pattern|
+    parsed = Time.parse_utc(text, pattern)
+    return parsed if parsed.is_a?(Time)
+  end
+  CastError.new("is not a date")
+end
+
+# A value given to `new` as the field's type: an Int32 widens to Int64.
+pub def coerce(value : Int32, type : Int64.class) : Int64
+  value.to_i64
+end
+
+pub def coerce(value : Int64, type : Int64.class) : Int64
+  value
+end
+
+# A field's value when `new` was not given one.
+pub def zero_value(type : String.class) : String
+  ""
+end
+
+pub def zero_value(type : Int64.class) : Int64
+  0_i64
+end
+
+pub def zero_value(type : Int32.class) : Int32
+  0
+end
+
+pub def zero_value(type : Float64.class) : Float64
+  0.0
+end
+
+pub def zero_value(type : Bool.class) : Bool
+  false
+end
+
+pub def zero_value(type : Time.class) : Time
+  Time.utc
+end
+
+# What the methods `derive model` writes call. They run in the model's own
+# module, which imports this one and nothing else of Kurt's, so every
+# database call goes through here.
+
+pub def now : Time
+  Time.utc
+end
+
+# INSERT ... RETURNING id: the new row's id.
+pub def insert_row(table : String, names : Array(String), values : Array(DBValue), on : Transaction? = nil) : Int64 | DBError
+  marks = names.map { |_| "?" }
+  sql = placeholders("INSERT INTO " + table + " (" + names.join(", ") + ") VALUES (" + marks.join(", ") + ") RETURNING id")
+  if tx = on
+    tx.connection.query_one(sql, args: values, as: Int64)
+  else
+    database.query_one(sql, args: values, as: Int64)
+  end
+end
+
+pub def update_row(table : String, names : Array(String), values : Array(DBValue), id : Int64, on : Transaction? = nil) : Int64 | DBError
+  sets = names.map { |name| name + " = ?" }
+  args = values.dup
+  args << id
+  write_rows("UPDATE " + table + " SET " + sets.join(", ") + " WHERE id = ?", args, on)
+end
+
+pub def delete_row(table : String, id : Int64, on : Transaction? = nil) : Int64 | DBError
+  args = [] of DBValue
+  args << id
+  write_rows("DELETE FROM " + table + " WHERE id = ?", args, on)
+end
+
+pub def increment_column(table : String, column : String, by : Int64, id : Int64, on : Transaction? = nil) : Int64 | DBError
+  args = [] of DBValue
+  args << by
+  args << id
+  write_rows("UPDATE " + table + " SET " + column + " = " + column + " + ? WHERE id = ?", args, on)
+end
+
+# An UPDATE or DELETE, in *on* when there is one; how many rows it touched.
+def write_rows(sql : String, args : Array(DBValue), on : Transaction?) : Int64 | DBError
+  if tx = on
+    tx.connection.exec(placeholders(sql), args: args)!.rows_affected
+  else
+    database.exec(placeholders(sql), args: args)!.rows_affected
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Validations and callbacks, as in Rails, written in the class body:
+#
+#   class User < ApplicationRecord
+#     validates :name, presence: true, length: {maximum: 60}
+#     validates :email, presence: true, format: /\A[^@\s]+@[^@\s]+\z/, uniqueness: true
+#     validates :role, inclusion: {in: ["admin", "member"]}
+#
+#     before_validation :normalize_email
+#     after_create :send_welcome
+#
+#     def normalize_email
+#       @email = email.strip.downcase
+#     end
+#   end
+#
+# Each `validates` and each callback line adds to the ones before it, in
+# order. A `def validate(errors : Errors)` still runs, after them, for rules
+# of your own. A callback that answers a DBError stops the save or destroy
+# and hands the error up; any other answer is ignored.
+# ---------------------------------------------------------------------------
+
+# Blank: an empty or all-space string, nil, or a link column (`*_id`) that is
+# still 0. A number, a time or false is there.
+pub def blank?(field : String, value : String) : Bool
+  value.strip.empty?
+end
+
+pub def blank?(field : String, value : Nil) : Bool
+  true
+end
+
+pub def blank?(field : String, value : Int64 | Int32) : Bool
+  field.ends_with?("_id") && value == 0
+end
+
+pub def blank?(field : String, value : Float64 | Bool | Time) : Bool
+  false
+end
+
+pub def check_presence(errors : Errors, field : String, value : V, message : String?) : Nil forall V
+  errors.add(field, message || "can't be blank") if blank?(field, value)
+end
+
+# Length of a string field; nil passes (a nilable column that is empty).
+pub def check_length(errors : Errors, field : String, value : String?, minimum : Int32?, maximum : Int32?, exactly : Int32?, message : String?) : Nil
+  return if value.nil?
+  size = value.size
+  if min = minimum
+    errors.add(field, message || "is too short (minimum is " + min.to_s + " characters)") if size < min
+  end
+  if max = maximum
+    errors.add(field, message || "is too long (maximum is " + max.to_s + " characters)") if size > max
+  end
+  if want = exactly
+    errors.add(field, message || "is the wrong length (should be " + want.to_s + " characters)") if size != want
+  end
+end
+
+pub def check_format(errors : Errors, field : String, value : String?, pattern : Regex, message : String?) : Nil
+  return if value.nil?
+  errors.add(field, message || "is invalid") unless value =~ pattern
+end
+
+pub def check_inclusion(errors : Errors, field : String, value : V, allowed : Array(A), message : String?) : Nil forall V, A
+  errors.add(field, message || "is not included in the list") unless allowed.includes?(value)
+end
+
+# No other row has this value: a query to the database, so it can fail.
+# Pair it with a unique index, which the database enforces under load.
+pub def check_uniqueness(errors : Errors, field : String, others : Query(T), message : String?) : Nil | DBError forall T
+  taken = others.exists?!
+  errors.add(field, message || "has already been taken") if taken
+  nil
+end
+
+# `validates :title, :body, presence: true` and the rest: presence, length
+# ({minimum:, maximum:, is:, in: 3..20}), format (a regex), inclusion
+# ({in: [...]}) and uniqueness (true). `message:` replaces every message of
+# the line.
+pub macro validates(*fields, presence = nil, length = nil, format = nil, inclusion = nil, uniqueness = nil, message = nil)
+  def __kurt_validations(errors : ::Kurt::Model::Errors) : ::Db::Errors::DBError?
+    {% if @type.methods.any? { |m| m.name == "__kurt_validations" } %}
+      if failure = previous_def
+        return failure
+      end
+    {% end %}
+    {% for field in fields %}
+      {% name = field.id.stringify %}
+      {% if presence %}
+        ::Kurt::Model.check_presence(errors, {{ name }}, {{ field.id }}, {{ message }})
+      {% end %}
+      {% if length %}
+        {% if length[:in] %}
+          ::Kurt::Model.check_length(errors, {{ name }}, {{ field.id }}, {{ length[:in].begin }}, {{ length[:in].end }}, nil, {{ message }})
+        {% else %}
+          ::Kurt::Model.check_length(errors, {{ name }}, {{ field.id }}, {{ length[:minimum] }}, {{ length[:maximum] }}, {{ length[:is] }}, {{ message }})
+        {% end %}
+      {% end %}
+      {% if format %}
+        ::Kurt::Model.check_format(errors, {{ name }}, {{ field.id }}, {{ format.is_a?(NamedTupleLiteral) ? format[:with] : format }}, {{ message }})
+      {% end %}
+      {% if inclusion %}
+        ::Kurt::Model.check_inclusion(errors, {{ name }}, {{ field.id }}, {{ inclusion.is_a?(NamedTupleLiteral) ? inclusion[:in] : inclusion }}, {{ message }})
+      {% end %}
+      {% if uniqueness %}
+        if failure = ::Kurt::Model.check_uniqueness(errors, {{ name }}, self.class.query.on(@__kurt_on).where({{ name }}, {{ field.id }}).where_not("id", @id), {{ message }})
+          return failure
+        end
+      {% end %}
+    {% end %}
+    nil
+  end
+end
+
+# One callback chain: each line calls its methods after the earlier lines'.
+pub macro __kurt_callbacks(hook, names)
+  def __kurt_{{ hook.id }} : ::Db::Errors::DBError?
+    {% if @type.methods.any? { |m| m.name == "__kurt_" + hook.id.stringify } %}
+      if failure = previous_def
+        return failure
+      end
+    {% end %}
+    {% for name in names %}
+      result = {{ name.id }}
+      return result if result.is_a?(::Db::Errors::DBError)
+    {% end %}
+    nil
+  end
+end
+
+pub macro before_validation(*names)
+  ::Kurt::Model.__kurt_callbacks(:before_validation, {{ names }})
+end
+
+pub macro before_save(*names)
+  ::Kurt::Model.__kurt_callbacks(:before_save, {{ names }})
+end
+
+pub macro after_save(*names)
+  ::Kurt::Model.__kurt_callbacks(:after_save, {{ names }})
+end
+
+pub macro before_create(*names)
+  ::Kurt::Model.__kurt_callbacks(:before_create, {{ names }})
+end
+
+pub macro after_create(*names)
+  ::Kurt::Model.__kurt_callbacks(:after_create, {{ names }})
+end
+
+pub macro before_update(*names)
+  ::Kurt::Model.__kurt_callbacks(:before_update, {{ names }})
+end
+
+pub macro after_update(*names)
+  ::Kurt::Model.__kurt_callbacks(:after_update, {{ names }})
+end
+
+pub macro before_destroy(*names)
+  ::Kurt::Model.__kurt_callbacks(:before_destroy, {{ names }})
+end
+
+pub macro after_destroy(*names)
+  ::Kurt::Model.__kurt_callbacks(:after_destroy, {{ names }})
+end
+
+# ---------------------------------------------------------------------------
+# Passwords: `has_secure_password`, as in Rails, over a `password_digest`
+# column. bcrypt, from std/password.
+#
+#   class User < ApplicationRecord
+#     has_secure_password
+#   end
+#
+#   user = User.create(email_address: "ada@example.com", password: "s3cret-pass", password_confirmation: "s3cret-pass")!
+#   user.authenticate("s3cret-pass")                                   # true
+#   User.authenticate_by("email_address", "ada@example.com", "s3cret-pass")!   # the user, or nil
+# ---------------------------------------------------------------------------
+
+# bcrypt's cost: the lowest in tests, where every user hashes a password.
+pub def bcrypt_cost : Int32
+  env == "test" ? 4 : 11
+end
+
+pub def digest_password(plain : String) : String
+  Bcrypt.hash(plain, bcrypt_cost)
+end
+
+pub def verify_password(attempt : String, digest : String) : Bool
+  return false if digest.empty?
+  Bcrypt.verify(attempt, digest)
+end
+
+# What `authenticate_by` checks a password against when no record has the
+# value, so that a miss takes as long as a wrong password.
+DUMMY_DIGEST = "$2b$11$xIbZPOBwibM7ga01aso2t.tTpKxzprSE7YWt7sJ/ZxxJyVCPjfeUe"   # Bcrypt.hash("kurt: no such user", 11)
+
+pub def dummy_digest : String
+  DUMMY_DIGEST
+end
+
+# Rails' rules: required while there is no digest yet, at most 72 bytes
+# (all bcrypt reads), and the confirmation, when one was given, the same.
+pub def check_password(errors : Errors, password : String?, confirmation : String?, digest : String) : Nil
+  if password.nil? || password.empty?
+    errors.add("password", "can't be blank") if digest.empty?
+    return
+  end
+  errors.add("password", "is too long (maximum is 72 bytes)") if password.bytesize > 72
+  if confirmation && confirmation != password
+    errors.add("password_confirmation", "doesn't match Password")
+  end
+end
+
+pub macro has_secure_password
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_password : String? = nil
+
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_password_confirmation : String? = nil
+
+  # The password being set: nil once it has been saved as the digest is
+  # not; it is never read back from the database.
+  def password : String?
+    @__kurt_password
+  end
+
+  # An empty password is no password, as in Rails: an edit form left blank
+  # keeps the old one.
+  def password=(value : String?) : String?
+    @__kurt_password = value && !value.empty? ? value : nil
+  end
+
+  def password_confirmation : String?
+    @__kurt_password_confirmation
+  end
+
+  def password_confirmation=(value : String?) : String?
+    @__kurt_password_confirmation = value
+  end
+
+  # `User.new(email_address: "...", password: "...")` and `User.create(...)`.
+  def self.new(*, password : String, password_confirmation : String? = nil, **fields)
+    record = new(**fields)
+    record.password = password
+    record.password_confirmation = password_confirmation
+    record
+  end
+
+  # `user.update(password: "...", password_confirmation: "...")`.
+  def update(*, password : String, password_confirmation : String? = nil, **fields)
+    self.password = password
+    @__kurt_password_confirmation = password_confirmation
+    update(**fields)
+  end
+
+  def __kurt_password_checks(errors : ::Kurt::Model::Errors) : Nil
+    ::Kurt::Model.check_password(errors, @__kurt_password, @__kurt_password_confirmation, password_digest)
+  end
+
+  # Turns a password that was set into the digest, just before the write.
+  def __kurt_digest_password : Nil
+    if plain = @__kurt_password
+      @password_digest = ::Kurt::Model.digest_password(plain) unless plain.empty?
+    end
+    @__kurt_password = nil
+    @__kurt_password_confirmation = nil
+  end
+
+  # A form's `password` and `password_confirmation`. Empty ones are kept as
+  # they came: on an edit form, an empty password leaves the old one.
+  def __kurt_assign_password(attributes : Hash(String, String)) : Nil
+    if raw = attributes["password"]?
+      self.password = raw
+    end
+    if raw = attributes["password_confirmation"]?
+      @__kurt_password_confirmation = raw
+    end
+  end
+
+  # True when *attempt* is this record's password.
+  def authenticate(attempt : String) : Bool
+    ::Kurt::Model.verify_password(attempt, password_digest)
+  end
+
+  # The record whose *column* is *value* and whose password *password* is;
+  # nil otherwise. A miss checks a password too, so it takes as long.
+  def self.authenticate_by(column : String, value : String, password : String) : self | Nil | ::Db::Errors::DBError
+    if record = query.where(column, value).first?!
+      return record.authenticate(password) ? record : nil
+    end
+    ::Kurt::Model.verify_password(password, ::Kurt::Model.dummy_digest)
+    nil
+  end
+end
+
+# Maps the class to its table. Writes, from the fields above it:
+#
+# * the row mapping (`db_serializable_non_strict`, so a column the class does
+#   not declare is passed over);
+# * `id`, unless the class declares it;
+# * `new(**fields)` with every field optional;
+# * class methods: `table_name`, `query`, `all`, `find`, `find?`, `first`,
+#   `first?`, `count`, `where`, `order`, `order_desc`, `limit`, `paginate`,
+#   `create`, `delete_all`, and one typed finder per field (`Post.title("Hi")`,
+#   a wrong field name is a compile error);
+# * instance methods: `save`, `destroy`, `persisted?`, `new_record?`, `valid?`,
+#   `errors`, `attributes`.
+#
+# `created_at` and `updated_at` fields of type Time are stamped by `save`.
+pub macro model(declaration)
+  {% has_id = declaration[:fields].any? { |f| f[:name] == "@id" } %}
+  {% unless has_id %}
+    property id : Int64 = 0_i64
+  {% end %}
+  # A field named @__kurt_... is the framework's own (a password being set),
+  # not a column.
+  {% columns = declaration[:fields].reject { |f| f[:name] == "@id" || f[:name].starts_with?("@__kurt") } %}
+
+  # The mapping reads the fields when it is typed, not from its argument; and
+  # a class with no fields yet (its table not migrated) would hand it `[]`.
+  ::Db::Serializable.db_serializable_with(nil, false)
+
+  # What validation found last; not a column.
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_errors : ::Kurt::Model::Errors? = nil
+
+  # What the last `assign` could not convert; not a column.
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_cast_errors : ::Kurt::Model::Errors? = nil
+
+  # The transaction a save or destroy is running in, while it runs.
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_on : ::Kurt::Model::Transaction? = nil
+
+  # An Int64 field takes an Int32 too: `Post.create(user_id: 1)`.
+  def initialize(*, id : Int64 | Int32 = 0_i64{% for f in columns %}, {{ f[:name].id.stringify[1..-1].id }} : {{ f[:type] }}{% if f[:type] <= Int64 %} | Int32{% end %} | Nil = nil{% end %})
+    @id = id.to_i64
+    {% for f in columns %}
+      {% name = f[:name].id.stringify[1..-1].id %}
+      \{% if @type.instance_vars.find { |v| v.name == {{ name.stringify }} }.has_default_value? %}
+        @{{ name }} = {% if f[:type] <= Int64 %}::Kurt::Model.coerce({{ name }}, Int64){% else %}{{ name }}.as({{ f[:type] }}){% end %} unless {{ name }}.nil?
+      \{% else %}
+        {% if f[:type].nilable? %}
+          @{{ name }} = {{ name }}
+        {% else %}
+          @{{ name }} = {{ name }}.nil? ? ::Kurt::Model.zero_value({{ f[:type] }}) : {% if f[:type] <= Int64 %}::Kurt::Model.coerce({{ name }}, Int64){% else %}{{ name }}.as({{ f[:type] }}){% end %}
+        {% end %}
+      \{% end %}
+    {% end %}
+  end
+
+  # A record from a form's permitted fields: `Post.new(post_params)`.
+  def initialize(attributes : Hash(String, String))
+    @id = 0_i64
+    {% for f in columns %}
+      {% name = f[:name].id.stringify[1..-1].id %}
+      \{% unless @type.instance_vars.find { |v| v.name == {{ name.stringify }} }.has_default_value? %}
+        @{{ name }} = {% if f[:type].nilable? %}nil{% else %}::Kurt::Model.zero_value({{ f[:type] }}){% end %}
+      \{% end %}
+    {% end %}
+    assign(attributes)
+  end
+
+  # Sets the fields *attributes* names, each converted to its field's type;
+  # keys that are not fields, and `id`, are passed over. A value that does
+  # not convert ("abc" for a number) is kept out and becomes a validation
+  # error, so the next `save` answers false with it in `errors`.
+  def assign(attributes : Hash(String, String)) : Nil
+    pending = ::Kurt::Model::Errors.new
+    {% for f in columns %}
+      {% name = f[:name].id.stringify[1..-1].id %}
+      {% inner = f[:type].nilable? ? f[:type].union_types.reject { |t| t == Nil }.first : f[:type] %}
+      if raw = attributes[{{ name.stringify }}]?
+        {% if f[:type].nilable? && !(inner <= String) %}
+          if raw.strip.empty?
+            @{{ name }} = nil
+          else
+            value = ::Kurt::Model.cast(raw, {{ inner }})
+            if value.is_a?(::Kurt::Model::CastError)
+              pending.add({{ name.stringify }}, value.message)
+            else
+              @{{ name }} = value
+            end
+          end
+        {% else %}
+          value = ::Kurt::Model.cast(raw, {{ inner }})
+          if value.is_a?(::Kurt::Model::CastError)
+            pending.add({{ name.stringify }}, value.message)
+          else
+            @{{ name }} = value
+          end
+        {% end %}
+      end
+    {% end %}
+    @__kurt_cast_errors = pending.empty? ? nil : pending
+    \{% if @type.has_method?("__kurt_assign_password") %}
+      __kurt_assign_password(attributes)
+    \{% end %}
+    nil
+  end
+
+  # Assigns the form's permitted fields and saves: `post.update(post_params)`.
+  def update(attributes : Hash(String, String), on : ::Kurt::Model::Transaction? = nil) : Bool | ::Db::Errors::DBError
+    assign(attributes)
+    save(on: on)
+  end
+
+  def self.create(attributes : Hash(String, String), on : ::Kurt::Model::Transaction? = nil) : self | ::Kurt::Model::Invalid | ::Db::Errors::DBError
+    record = new(attributes)
+    return ::Kurt::Model::Invalid.new({{ declaration[:name] }}, record.errors) unless record.save(on: on)!
+    record
+  end
+
+  # `Post.transaction do |tx| ... end`: see Kurt::Model.transaction.
+  def self.transaction(on : ::Kurt::Model::Transaction? = nil, & : ::Kurt::Model::Transaction -> T) : T | Nil | ::Db::Errors::DBError forall T
+    ::Kurt::Model.transaction(on) { |tx| yield tx }
+  end
+
+  # A query run in *tx*: `Post.on(tx).find(id)`.
+  def self.on(tx : ::Kurt::Model::Transaction?) : ::Kurt::Model::Query(self)
+    query.on(tx)
+  end
+
+  # `Post.includes(:user).order_desc(:id).all!`: see Query#includes.
+  def self.includes(*names : Symbol) : ::Kurt::Model::Query(self)
+    query.includes(*names)
+  end
+
+  # Loads the association *name* into *records*; see Query#includes.
+  def self.__kurt_preload(records : Array(self), name : String, on : ::Kurt::Model::Transaction?) : ::Db::Errors::DBError?
+    return nil if records.empty?
+    records[0].__kurt_preload_into(records, name, on)
+  end
+
+  \{% unless @type.methods.any? { |m| m.name == "__kurt_preload_into" } %}
+    # A model with no associations has nothing to include.
+    def __kurt_preload_into(records : Array(self), name : String, on : ::Kurt::Model::Transaction?) : ::Db::Errors::DBError?
+      ::Db::Errors::DBError.new(self.class.model_name + " has no association " + name)
+    end
+  \{% end %}
+
+  def self.table_name : String
+    \{% if ann = @type.annotation(::Kurt::Model::Table) %}
+      \{{ ann[0] }}
+    \{% else %}
+      ::Kurt::Inflector.pluralize(::Kurt::Inflector.underscore({{ declaration[:name] }}))
+    \{% end %}
+  end
+
+  # The class's own name, unqualified: "Post".
+  def self.model_name : String
+    {{ declaration[:name] }}
+  end
+
+  # The column names `save` writes, in order.
+  def self.column_names : Array(String)
+    [{% for f in columns %}{{ f[:name].id.stringify[1..-1] }}, {% end %}] of String
+  end
+
+  def self.query : ::Kurt::Model::Query(self)
+    ::Kurt::Model::Query(self).new
+  end
+
+  def self.all : Array(self) | ::Db::Errors::DBError
+    query.all
+  end
+
+  def self.find(id : Int64) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    query.find(id)
+  end
+
+  def self.find(id : Int32) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    query.find(id.to_i64)
+  end
+
+  # `Post.find(params[:id])`: text that is not a number is NotFound (404).
+  def self.find(id : String) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    query.find(id)
+  end
+
+  def self.find?(id : String) : self | Nil | ::Db::Errors::DBError
+    number = id.strip.to_i64?
+    number ? find?(number) : nil
+  end
+
+  def self.find?(id : Int32) : self | Nil | ::Db::Errors::DBError
+    query.where("id", id.to_i64).first?
+  end
+
+  def self.find?(id : Int64) : self | Nil | ::Db::Errors::DBError
+    query.where("id", id).first?
+  end
+
+  def self.first : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    query.order("id").first
+  end
+
+  def self.first? : self | Nil | ::Db::Errors::DBError
+    query.order("id").first?
+  end
+
+  def self.last? : self | Nil | ::Db::Errors::DBError
+    query.order_desc("id").first?
+  end
+
+  def self.count : Int64 | ::Db::Errors::DBError
+    query.count
+  end
+
+  def self.where(**conditions : **C) : ::Kurt::Model::Query(self) forall C
+    query.where(**conditions)
+  end
+
+  def self.where(column : String, value : ::Db::Value::DBValue) : ::Kurt::Model::Query(self)
+    query.where(column, value)
+  end
+
+  def self.order(column : String | Symbol) : ::Kurt::Model::Query(self)
+    query.order(column)
+  end
+
+  def self.order_desc(column : String | Symbol) : ::Kurt::Model::Query(self)
+    query.order_desc(column)
+  end
+
+  def self.limit(n : Int32) : ::Kurt::Model::Query(self)
+    query.limit(n)
+  end
+
+  def self.paginate(page : String?, per : Int32 = 25) : ::Kurt::Model::Query(self)
+    query.paginate(page, per)
+  end
+
+  def self.paginate(page : Int32, per : Int32 = 25) : ::Kurt::Model::Query(self)
+    query.paginate(page, per)
+  end
+
+  def self.delete_all : Int64 | ::Db::Errors::DBError
+    query.delete_all
+  end
+
+  # Builds a record and saves it: the record, or Invalid when it did not
+  # pass validation (`Post.create(...)!` hands that up, and the framework
+  # answers 422), or a DBError.
+  def self.create(*, on : ::Kurt::Model::Transaction? = nil, **fields : **F) : self | ::Kurt::Model::Invalid | ::Db::Errors::DBError forall F
+    record = new(**fields)
+    return ::Kurt::Model::Invalid.new({{ declaration[:name] }}, record.errors) unless record.save(on: on)!
+    record
+  end
+
+  # The first row with these *fields*, or a new one created with them, so
+  # running it twice (db/seeds.iyi) makes one row:
+  #
+  #   User.find_or_create_by(email: "ada@example.com") do |user|
+  #     user.name = "Ada"                 # only for a new one
+  #     user.password = "secret123"
+  #   end!
+  def self.find_or_create_by(*, on : ::Kurt::Model::Transaction? = nil, **fields : **F) : self | ::Kurt::Model::Invalid | ::Db::Errors::DBError forall F
+    if found = query.on(on).where(**fields).first?!
+      return found
+    end
+    record = new(**fields)
+    return ::Kurt::Model::Invalid.new({{ declaration[:name] }}, record.errors) unless record.save(on: on)!
+    record
+  end
+
+  def self.find_or_create_by(*, on : ::Kurt::Model::Transaction? = nil, **fields : **F, &block : self -> _) : self | ::Kurt::Model::Invalid | ::Db::Errors::DBError forall F
+    if found = query.on(on).where(**fields).first?!
+      return found
+    end
+    record = new(**fields)
+    yield record
+    return ::Kurt::Model::Invalid.new({{ declaration[:name] }}, record.errors) unless record.save(on: on)!
+    record
+  end
+
+  {% for f in columns %}
+    {% name = f[:name].id.stringify[1..-1] %}
+    # Rows whose `{{ name.id }}` is *value*.
+    def self.{{ name.id }}(value : {{ f[:type] }}{% if f[:type] <= Int64 %} | Int32{% end %}) : ::Kurt::Model::Query(self)
+      query.where({{ name }}, value)
+    end
+  {% end %}
+
+  def persisted? : Bool
+    @id != 0
+  end
+
+  # The transaction the running save or destroy is in, for a callback to
+  # write in it too: `Profile.create(user_id: id, on: current_transaction)!`.
+  # Nil outside a save or destroy, or when it runs without one.
+  def current_transaction : ::Kurt::Model::Transaction?
+    @__kurt_on
+  end
+
+  def new_record? : Bool
+    @id == 0
+  end
+
+  # What the last validation found: `save` and `valid?` fill it, and a form
+  # prints it (`post.errors.full_messages`). Empty before either has run.
+  def errors : ::Kurt::Model::Errors
+    found = @__kurt_errors
+    return found if found
+    fresh = ::Kurt::Model::Errors.new
+    @__kurt_errors = fresh
+    fresh
+  end
+
+  # Runs `before_validation`, the `validates` lines and `validate` (each when
+  # the model has it) and keeps what they found in `errors`. A DBError when a
+  # check that asks the database (uniqueness) or a callback could not run.
+  def __kurt_check : Bool | ::Db::Errors::DBError
+    \{% if @type.has_method?("__kurt_before_validation") %}
+      if failure = __kurt_before_validation
+        return failure
+      end
+    \{% end %}
+    found = ::Kurt::Model::Errors.new
+    if pending = @__kurt_cast_errors
+      pending.to_h.each { |field, messages| messages.each { |message| found.add(field, message) } }
+    end
+    \{% if @type.has_method?("__kurt_validations") %}
+      if failure = __kurt_validations(found)
+        @__kurt_errors = found
+        return failure
+      end
+    \{% end %}
+    \{% if @type.has_method?("__kurt_password_checks") %}
+      __kurt_password_checks(found)
+    \{% end %}
+    \{% if @type.has_method?("validate") %}
+      validate(found)
+    \{% end %}
+    @__kurt_errors = found
+    found.empty?
+  end
+
+  # True when every validation passes; the reasons are in `errors`. A check
+  # that could not reach the database counts as a failure, with its message.
+  def valid? : Bool
+    case checked = __kurt_check
+    in Bool then checked
+    in ::Db::Errors::DBError
+      errors.add("base", "could not be validated: " + checked.message)
+      false
+    end
+  end
+
+  # Column values in `column_names` order.
+  def attributes : Array(::Db::Value::DBValue)
+    values = [] of ::Db::Value::DBValue
+    {% for f in columns %}
+      values << @{{ f[:name].id.stringify[1..-1].id }}
+    {% end %}
+    values
+  end
+
+  # Validates, then inserts a new record or updates a persisted one. False
+  # when validation failed, with the reasons in `errors`; a DBError when the
+  # database did. As in Rails:
+  #
+  #   if post.save!                 # `!` hands a DBError up (503)
+  #     redirect_to path_to(post), notice: "Saved."
+  #   else
+  #     render "posts/edit", status: 422
+  #   end
+  #
+  # Callbacks run in Rails' order: before_validation, (validation),
+  # before_save, before_create or before_update, (the write), after_create or
+  # after_update, after_save.
+  #
+  # `save(on: tx)` saves in a transaction; callbacks see it as
+  # `current_transaction`, to write in the same one.
+  def save(on : ::Kurt::Model::Transaction? = nil) : Bool | ::Db::Errors::DBError
+    @__kurt_on = on
+    defer (@__kurt_on = nil)
+    return false unless __kurt_check!
+    \{% if @type.has_method?("__kurt_before_save") %}
+      if failure = __kurt_before_save
+        return failure
+      end
+    \{% end %}
+    {% if columns.any? { |f| f[:name] == "@updated_at" } %}
+      @updated_at = ::Kurt::Model.now
+    {% end %}
+    \{% if @type.has_method?("__kurt_digest_password") %}
+      __kurt_digest_password
+    \{% end %}
+    if new_record?
+      \{% if @type.has_method?("__kurt_before_create") %}
+        if failure = __kurt_before_create
+          return failure
+        end
+      \{% end %}
+      {% if columns.any? { |f| f[:name] == "@created_at" } %}
+        @created_at = ::Kurt::Model.now
+      {% end %}
+      @id = ::Kurt::Model.insert_row(self.class.table_name, self.class.column_names, attributes, on)!
+      \{% if @type.has_method?("__kurt_after_create") %}
+        if failure = __kurt_after_create
+          return failure
+        end
+      \{% end %}
+    else
+      \{% if @type.has_method?("__kurt_before_update") %}
+        if failure = __kurt_before_update
+          return failure
+        end
+      \{% end %}
+      ::Kurt::Model.update_row(self.class.table_name, self.class.column_names, attributes, @id, on)!
+      \{% if @type.has_method?("__kurt_after_update") %}
+        if failure = __kurt_after_update
+          return failure
+        end
+      \{% end %}
+    end
+    \{% if @type.has_method?("__kurt_after_save") %}
+      if failure = __kurt_after_save
+        return failure
+      end
+    \{% end %}
+    true
+  end
+
+  # Sets the fields given and saves: `post.update(title: "New")`. Answers
+  # what `save` does.
+  def update(*, on : ::Kurt::Model::Transaction? = nil{% for f in columns %}, {{ f[:name].id.stringify[1..-1].id }} : {{ f[:type] }}{% if f[:type] <= Int64 %} | Int32{% end %} | Nil = nil{% end %}) : Bool | ::Db::Errors::DBError
+    {% for f in columns %}
+      {% name = f[:name].id.stringify[1..-1].id %}
+      @{{ name }} = {% if f[:type] <= Int64 %}::Kurt::Model.coerce({{ name }}, Int64){% else %}{{ name }}.as({{ f[:type] }}){% end %} unless {{ name }}.nil?
+    {% end %}
+    save(on: on)
+  end
+
+  # Deletes the row. NotFound when it was already gone.
+  # before_destroy and after_destroy run around it, and the `dependent:`
+  # records go first. A model with dependents is destroyed in a transaction
+  # (its own, unless *on* is one), so it goes with them or not at all.
+  def destroy(on : ::Kurt::Model::Transaction? = nil) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    \{% if @type.has_method?("__kurt_dependents") %}
+      if on.nil?
+        done = ::Kurt::Model.transaction { |tx| __kurt_destroy(tx) }
+        return done || ::Kurt::Model::NotFound.new({{ declaration[:name] }})
+      end
+    \{% end %}
+    __kurt_destroy(on)
+  end
+
+  def __kurt_destroy(on : ::Kurt::Model::Transaction?) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    @__kurt_on = on
+    defer (@__kurt_on = nil)
+    \{% if @type.has_method?("__kurt_before_destroy") %}
+      if failure = __kurt_before_destroy
+        return failure
+      end
+    \{% end %}
+    \{% if @type.has_method?("__kurt_dependents") %}
+      if failure = __kurt_dependents(on)
+        return failure
+      end
+    \{% end %}
+    gone = ::Kurt::Model.delete_row(self.class.table_name, @id, on)!
+    return ::Kurt::Model::NotFound.new({{ declaration[:name] }}) if gone == 0
+    \{% if @type.has_method?("__kurt_after_destroy") %}
+      if failure = __kurt_after_destroy
+        return failure
+      end
+    \{% end %}
+    self
+  end
+
+  # Adds *by* to an integer column in the database and here, without
+  # rewriting the other columns: `post.increment(:comments_count)`.
+  def increment(column : Symbol, by : Int64 = 1_i64, on : ::Kurt::Model::Transaction? = nil) : self | ::Db::Errors::DBError
+    name = column.to_s
+    ::Kurt::Model.increment_column(self.class.table_name, name, by, @id, on)!
+    {% for f in columns %}
+      {% if f[:type].stringify == "Int64" %}
+        @{{ f[:name].id.stringify[1..-1].id }} += by if name == {{ f[:name].id.stringify[1..-1] }}
+      {% end %}
+    {% end %}
+    self
+  end
+end
+
+# `belongs_to user : User` writes `user`, the linked record by the `user_id`
+# column, and `user?`, nil when the link is empty or dangling.
+# `belongs_to author : User, foreign_key: writer_id` names another column.
+pub macro belongs_to(decl, foreign_key = nil)
+  {% key = foreign_key ? foreign_key.id : (decl.var.stringify + "_id").id %}
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_{{ decl.var }}_loaded : Bool = false
+
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_{{ decl.var }} : {{ decl.type }}? = nil
+
+  def {{ decl.var }} : {{ decl.type }} | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    if @__kurt_{{ decl.var }}_loaded
+      return @__kurt_{{ decl.var }} || ::Kurt::Model::NotFound.new({{ decl.type.stringify }})
+    end
+    {{ decl.type }}.find({{ key }})
+  end
+
+  def {{ decl.var }}? : {{ decl.type }} | Nil | ::Db::Errors::DBError
+    return @__kurt_{{ decl.var }} if @__kurt_{{ decl.var }}_loaded
+    {{ decl.type }}.find?({{ key }})
+  end
+
+  def __kurt_set_{{ decl.var }}(record : {{ decl.type }}?) : Nil
+    @__kurt_{{ decl.var }} = record
+    @__kurt_{{ decl.var }}_loaded = true
+  end
+
+  ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|
+    ids = [] of ::Db::Value::DBValue
+    records.each do |record|
+      id = record.{{ key }}
+      ids << id unless id.nil? || id == 0 || ids.includes?(id)
+    end
+    found = ids.empty? ? [] of {{ decl.type }} : {{ decl.type }}.query.on(on).where_in("id", ids).all!
+    by_id = {} of Int64 => {{ decl.type }}
+    found.each { |row| by_id[row.id] = row }
+    records.each do |record|
+      id = record.{{ key }}
+      record.__kurt_set_{{ decl.var }}(id.nil? ? nil : by_id[id.to_i64]?)
+    end
+  end
+end
+
+# One association's part of `__kurt_preload_into`, the chain `includes`
+# calls: its name, and the block that loads it for the records. Instance
+# methods, so the chain can see the links before it (previous_def).
+pub macro __kurt_preload_link(name, chained, &block)
+  def __kurt_preload_into(__kurt_records : Array(self), name : String, __kurt_on : ::Kurt::Model::Transaction?) : ::Db::Errors::DBError?
+    unless name == {{ name }}
+      {% if chained %}
+        return previous_def
+      {% else %}
+        return ::Db::Errors::DBError.new(self.class.model_name + " has no association " + name)
+      {% end %}
+    end
+    {{ block.args[0] }} = __kurt_records
+    {{ block.args[1] }} = __kurt_on
+    {{ block.body }}
+    nil
+  end
+end
+
+# `has_many comments : Comment` writes `comments`, a query over the comments
+# whose `<this model>_id` is this record's id. Nothing runs until the query
+# is: `post.comments.order(:id).limit(5).all`.
+# `has_many posts : Post, foreign_key: author_id` names another column.
+#
+# `dependent: :destroy` destroys them first when this record is destroyed,
+# each with its callbacks and its own dependents; `dependent: :delete_all`
+# deletes their rows in one statement, without loading them.
+pub macro has_many(decl, foreign_key = nil, dependent = nil)
+  {% key = foreign_key ? foreign_key.id.stringify : (@type.name.split("::").last.underscore + "_id") %}
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_{{ decl.var }} : Array({{ decl.type }})? = nil
+
+  def {{ decl.var }} : ::Kurt::Model::Query({{ decl.type }})
+    found = {{ decl.type }}.query.where({{ key }}, @id)
+    if loaded = @__kurt_{{ decl.var }}
+      found.__kurt_preload_rows(loaded)
+    end
+    found
+  end
+
+  def __kurt_set_{{ decl.var }}(rows : Array({{ decl.type }})) : Nil
+    @__kurt_{{ decl.var }} = rows
+  end
+
+  ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|
+    ids = records.map { |record| record.id.as(::Db::Value::DBValue) }
+    children = ids.empty? ? [] of {{ decl.type }} : {{ decl.type }}.query.on(on).where_in({{ key }}, ids).all!
+    grouped = {} of Int64 => Array({{ decl.type }})
+    children.each do |child|
+      owner = child.{{ key.id }}.to_i64
+      (grouped[owner] ||= [] of {{ decl.type }}) << child
+    end
+    records.each { |record| record.__kurt_set_{{ decl.var }}(grouped[record.id]? || [] of {{ decl.type }}) }
+  end
+  {% if dependent %}
+    ::Kurt::Model.__kurt_dependent({{ decl.type }}, {{ key }}, {{ dependent }}, {{ @type.methods.any? { |m| m.name == "__kurt_dependents" } }})
+  {% end %}
+end
+
+# One `dependent:` link in the chain `destroy` runs before deleting the row.
+pub macro __kurt_dependent(type, key, dependent, chained = false)
+  {% unless dependent == :destroy || dependent == :delete_all %}
+    {% raise "dependent: is :destroy or :delete_all, not " + dependent.stringify %}
+  {% end %}
+  def __kurt_dependents(on : ::Kurt::Model::Transaction?) : ::Db::Errors::DBError?
+    {% if chained %}
+      if failure = previous_def
+        return failure
+      end
+    {% end %}
+    {% if dependent == :delete_all %}
+      {{ type }}.query.where({{ key }}, @id).on(on).delete_all!
+    {% else %}
+      {{ type }}.query.where({{ key }}, @id).on(on).all!.each do |child|
+        gone = child.destroy(on: on)
+        return gone if gone.is_a?(::Db::Errors::DBError)
+      end
+    {% end %}
+    nil
+  end
+end
+
+# `has_one profile : Profile`: the one record whose `<this model>_id` is
+# this record's id.
+pub macro has_one(decl, foreign_key = nil, dependent = nil)
+  {% key = foreign_key ? foreign_key.id.stringify : (@type.name.split("::").last.underscore + "_id") %}
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_{{ decl.var }}_loaded : Bool = false
+
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_{{ decl.var }} : {{ decl.type }}? = nil
+
+  def {{ decl.var }} : {{ decl.type }} | ::Kurt::Model::NotFound | ::Db::Errors::DBError
+    if @__kurt_{{ decl.var }}_loaded
+      return @__kurt_{{ decl.var }} || ::Kurt::Model::NotFound.new({{ decl.type.stringify }})
+    end
+    {{ decl.type }}.query.where({{ key }}, @id).first
+  end
+
+  def {{ decl.var }}? : {{ decl.type }} | Nil | ::Db::Errors::DBError
+    return @__kurt_{{ decl.var }} if @__kurt_{{ decl.var }}_loaded
+    {{ decl.type }}.query.where({{ key }}, @id).first?
+  end
+
+  def __kurt_set_{{ decl.var }}(record : {{ decl.type }}?) : Nil
+    @__kurt_{{ decl.var }} = record
+    @__kurt_{{ decl.var }}_loaded = true
+  end
+
+  ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|
+    ids = records.map { |record| record.id.as(::Db::Value::DBValue) }
+    children = ids.empty? ? [] of {{ decl.type }} : {{ decl.type }}.query.on(on).where_in({{ key }}, ids).order("id").all!
+    by_owner = {} of Int64 => {{ decl.type }}
+    children.each do |child|
+      owner = child.{{ key.id }}.to_i64
+      by_owner[owner] = child unless by_owner.has_key?(owner)
+    end
+    records.each { |record| record.__kurt_set_{{ decl.var }}(by_owner[record.id]?) }
+  end
+  {% if dependent %}
+    ::Kurt::Model.__kurt_dependent({{ decl.type }}, {{ key }}, {{ dependent }}, {{ @type.methods.any? { |m| m.name == "__kurt_dependents" } }})
+  {% end %}
+end

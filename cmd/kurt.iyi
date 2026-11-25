@@ -1,0 +1,1044 @@
+# The `kurt` command.
+#
+#   kurt new blog
+#   cd blog
+#   kurt generate scaffold Post title:string body:text published:bool
+#   kurt db:migrate
+#   kurt dev
+#
+# Build it with `make` in the Kurt checkout (bin/kurt).
+module cmd/kurt
+
+import std/text
+import std/dir::{Dir}
+import std/time::{Time}
+import std/random::{Random}
+import std/process::{Process, ProcessResult, ProcessError, ChildProcess}
+import std/file
+import std/signal::{Signal}
+import std/regex::{Regex}
+import db
+import sqlite
+import pg
+import db/db/core::{Database}
+import db/db/errors::{DBError}
+import environment::{database_url, postgres_url?}
+import migrator::{migrate, rollback, status, MigrationError, Migration}
+import inflector::{underscore, camelize}
+import generators::*
+import autoload::*
+import schema::{Table, introspect, to_json, parse, find}
+import fixtures::{FixtureSet, read_fixture_sets}
+import inflector::{pluralize}
+
+VERSION = "0.1.0"
+
+USAGE = <<-TEXT
+kurt #{VERSION}: a Rails-like framework for iyi
+
+Usage:
+  kurt new NAME [--css none]             a new application in ./NAME, with Tailwind CSS
+                                         and daisyUI unless --css none
+  kurt generate scaffold NAME FIELD...   model, migration, controller, views, routes, test
+  kurt generate model NAME FIELD...      model and migration
+  kurt generate controller NAME ACTION...
+  kurt generate migration NAME
+  kurt generate authentication           users, sign-in, sign-up; sign-in required
+  kurt db:migrate                        run pending migrations
+  kurt db:rollback [STEPS]               undo the last migration(s)
+  kurt db:status                         which migrations have run
+  kurt db:reset                          drop the SQLite database, migrate, seed
+  kurt db:seed                           run db/seeds.iyi
+  kurt dev [-p PORT] [--no-reload]       run the application; rebuild and reload on change
+  kurt routes                            every route: verb, path, controller#action
+  kurt test                              run every test/*_test.iyi on a fresh test database,
+                                         with test/fixtures/*.yml loaded
+  kurt build                             a release binary in bin/NAME
+  kurt css:build [--minify]              compile app/assets/tailwind/app.css
+  kurt css:install                       download the Tailwind CLI and daisyUI
+  kurt version
+
+FIELD is name:type, with type one of string, text, int, float, bool, time,
+references. `g` is short for generate.
+
+The database is DATABASE_URL, or sqlite3:./db/<env>.sqlite3 with env from
+KURT_ENV (development by default).
+TEXT
+
+def fail(message : String) : NoReturn
+  STDERR.puts "kurt: " + message
+  exit 1
+end
+
+def say(action : String, path : String) : Nil
+  puts "  " + action.rjust(8) + "  " + path
+end
+
+def write(path : String, contents : String) : Nil
+  if File.exists?(path)
+    say("exists", path)
+    return
+  end
+  dir = File.dirname(path)
+  Dir.mkdir_p(dir) unless dir.empty? || Dir.exists?(dir)
+  File.write(path, contents.empty? || contents.ends_with?("\n") ? contents : contents + "\n")
+  say("create", path)
+end
+
+def update(path : String, contents : String) : Nil
+  return if File.read(path) == contents
+  File.write(path, contents)
+  say("update", path)
+end
+
+# The Kurt checkout this binary was built from: bin/kurt's parent, or
+# KURT_PATH. A symlink to bin/kurt (~/.local/bin/kurt, say) is followed to
+# the checkout it points into.
+def framework_path : String?
+  if path = Program.env("KURT_PATH")
+    return path unless path.empty?
+  end
+  if exe = Process.executable
+    root = File.dirname(File.dirname(File.real_path(exe)))
+    return root if File.exists?(root + "/model.iyi") && File.exists?(root + "/generators.iyi")
+  end
+  nil
+end
+
+# The application's name, from its iyi.mod.
+def app_name : String
+  fail("not in a Kurt application: no iyi.mod here") unless File.exists?("iyi.mod")
+  File.read("iyi.mod").lines.each do |line|
+    stripped = line.strip
+    return stripped[7, stripped.size - 7].strip if stripped.starts_with?("module ")
+  end
+  fail("iyi.mod names no module")
+end
+
+def require_app : String
+  name = app_name
+  fail("not in a Kurt application: no config/routes.iyi") unless File.exists?("config/routes.iyi")
+  name
+end
+
+# ---------------------------------------------------------------------------
+# new
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# css: Tailwind CSS (its standalone CLI, no Node) with daisyUI
+# ---------------------------------------------------------------------------
+
+TAILWIND_VERSION = "4.3.5"
+DAISYUI_VERSION  = "5.8.2"
+CSS_DIR    = "app/assets/tailwind"
+CSS_INPUT  = CSS_DIR + "/app.css"
+CSS_OUTPUT = "public/assets/app.css"
+DAISYUI_FILES = ["daisyui.mjs", "daisyui-theme.mjs"]
+
+# An application made with Tailwind (the default) has its input file.
+def tailwind_app? : Bool
+  File.exists?(CSS_INPUT)
+end
+
+# Where the Tailwind CLI is kept, once for every application.
+def kurt_cache : String
+  base = Program.env("XDG_CACHE_HOME") || ((Program.env("HOME") || ".") + "/.cache")
+  base + "/kurt"
+end
+
+def tailwind_binary : String
+  kurt_cache + "/tailwindcss-v" + TAILWIND_VERSION
+end
+
+# The Tailwind release file for this machine: tailwindcss-macos-arm64 and
+# the like.
+def tailwind_asset : String?
+  case result = Process.run("uname", ["-sm"])
+  in ProcessResult
+    parts = result.stdout.strip.split(" ")
+    return nil unless result.success? && parts.size == 2
+    os = parts[0] == "Darwin" ? "macos" : (parts[0] == "Linux" ? "linux" : "")
+    arch = parts[1] == "arm64" || parts[1] == "aarch64" ? "arm64" : (parts[1] == "x86_64" ? "x64" : "")
+    return nil if os.empty? || arch.empty?
+    musl = os == "linux" && File.exists?("/etc/alpine-release") ? "-musl" : ""
+    "tailwindcss-" + os + "-" + arch + musl
+  in ProcessError, Cancelled
+    nil
+  end
+end
+
+# Downloads *url* to *path* with curl; false, with the reason printed, when
+# it could not.
+def fetch(url : String, path : String) : Bool
+  case result = Process.run("curl", ["-fsSL", "--retry", "2", "-o", path, url])
+  in ProcessResult
+    STDERR.puts "kurt: could not download " + url + ": " + result.stderr.strip unless result.success?
+    result.success?
+  in ProcessError
+    STDERR.puts "kurt: could not run curl: " + result.message
+    false
+  in Cancelled
+    false
+  end
+end
+
+def sha256(path : String) : String?
+  [{"shasum", ["-a", "256", path]}, {"sha256sum", [path]}].each do |tool|
+    case result = Process.run(tool[0], tool[1])
+    in ProcessResult
+      return result.stdout.split(" ")[0] if result.success?
+    in ProcessError, Cancelled
+      nil
+    end
+  end
+  nil
+end
+
+# The Tailwind CLI, downloaded on first use and checked against the
+# release's sha256sums.txt; nil when it could not be had.
+def ensure_tailwind : String?
+  binary = tailwind_binary
+  return binary if File.exists?(binary)
+  asset = tailwind_asset
+  if asset.nil?
+    STDERR.puts "kurt: Tailwind has no standalone CLI for this machine; see https://tailwindcss.com/docs/installation"
+    return nil
+  end
+  Dir.mkdir_p(kurt_cache) unless Dir.exists?(kurt_cache)
+  base = "https://github.com/tailwindlabs/tailwindcss/releases/download/v" + TAILWIND_VERSION + "/"
+  partial = binary + ".download"
+  sums = binary + ".sha256sums"
+  say("download", "Tailwind CSS v" + TAILWIND_VERSION + " (" + asset + ")")
+  ok = fetch(base + asset, partial) && fetch(base + "sha256sums.txt", sums)
+  if ok
+    line = File.read(sums).lines.find { |l| l.strip.ends_with?(asset) }
+    expected = line ? line.split(" ")[0] : ""
+    if expected.empty? || sha256(partial) != expected
+      STDERR.puts "kurt: the downloaded Tailwind CLI does not match its checksum; not using it"
+      ok = false
+    end
+  end
+  File.delete(sums) if File.exists?(sums)
+  unless ok
+    File.delete(partial) if File.exists?(partial)
+    return nil
+  end
+  Process.run("chmod", ["+x", partial])
+  File.rename(partial, binary)
+  say("create", binary)
+  binary
+end
+
+# daisyUI's plugin files, next to the input file.
+def ensure_daisyui : Bool
+  base = "https://github.com/saadeghi/daisyui/releases/download/v" + DAISYUI_VERSION + "/"
+  DAISYUI_FILES.all? do |file|
+    path = CSS_DIR + "/" + file
+    next true if File.exists?(path)
+    Dir.mkdir_p(CSS_DIR) unless Dir.exists?(CSS_DIR)
+    if fetch(base + file, path)
+      say("create", path + " (daisyUI v" + DAISYUI_VERSION + ")")
+      true
+    else
+      File.delete(path) if File.exists?(path)
+      false
+    end
+  end
+end
+
+# Compiles app/assets/tailwind/app.css into public/assets/app.css. True in
+# an application without Tailwind, which has nothing to build.
+def build_css(minify : Bool = false) : Bool
+  return true unless tailwind_app?
+  binary = ensure_tailwind
+  return false if binary.nil?
+  return false unless ensure_daisyui
+  args = ["-i", CSS_INPUT, "-o", CSS_OUTPUT]
+  args << "--minify" if minify
+  case result = Process.run(binary, args)
+  in ProcessResult
+    STDERR.puts "kurt: Tailwind could not build " + CSS_INPUT + ":\n" + result.stderr unless result.success?
+    result.success?
+  in ProcessError
+    STDERR.puts "kurt: could not run " + binary + ": " + result.message
+    false
+  in Cancelled
+    false
+  end
+end
+
+def cmd_css(command : String, args : Array(String)) : Nil
+  require_app
+  fail("this application has no " + CSS_INPUT + " (it was made with --css none)") unless tailwind_app?
+  if command == "css:install"
+    fail("could not install the Tailwind CLI") if ensure_tailwind.nil?
+    fail("could not install daisyUI") unless ensure_daisyui
+    puts "kurt: Tailwind CSS v" + TAILWIND_VERSION + " and daisyUI v" + DAISYUI_VERSION + " are ready"
+  else
+    fail("the CSS did not build") unless build_css(args.includes?("--minify"))
+    say("build", CSS_OUTPUT)
+  end
+end
+
+def cmd_new(args : Array(String)) : Nil
+  # `--css none` (or --css=none) leaves out Tailwind and daisyUI.
+  css = "tailwind"
+  names = [] of String
+  i = 0
+  while i < args.size
+    arg = args[i]
+    if arg == "--css"
+      fail("--css needs a value: tailwind or none") if i + 1 >= args.size
+      css = args[i + 1]
+      i += 1
+    elsif arg.starts_with?("--css=")
+      css = arg[6, arg.size - 6]
+    else
+      names << arg
+    end
+    i += 1
+  end
+  fail("--css is tailwind or none, not `" + css + "`") unless css == "tailwind" || css == "none"
+  daisy = css == "tailwind"
+  fail("usage: kurt new NAME [--css tailwind|none]") if names.empty?
+  dir = names[0]
+  name = underscore(File.basename(dir)).gsub("-", "_")
+  fail(dir + " already exists") if Dir.exists?(dir)
+  fail("`" + name + "` is not a usable name: letters, digits and underscores, starting with a letter") unless name.size > 0 && name[0].ascii_letter? && name.chars.all? { |c| c.ascii_alphanumeric? || c == '_' }
+  framework = framework_path
+  css_pending = false
+  Dir.mkdir_p(dir)
+  Dir.cd(dir) do
+    # The release this command is, unless KURT_PATH names a checkout.
+    local = (Program.env("KURT_PATH") || "").presence
+    write("iyi.mod", mod_file(name, local, VERSION))
+    write("config/application.iyi", application_config(Random::Secure.hex(32)))
+    write("config/routes.iyi", routes_file)
+    write("app/models/.keep", "")
+    write("app/controllers/application_controller.iyi", application_controller)
+    write("app/controllers/home_controller.iyi", home_controller)
+    write("app/views/layouts/application.eiy", layout_view(name, daisy))
+    write("app/views/home/index.eiy", home_view(name, daisy))
+    if daisy
+      write(CSS_INPUT, tailwind_css)
+    else
+      write("public/assets/app.css", stylesheet)
+    end
+    if root = framework
+      logo = root + "/kurt.svg"
+      write("public/icon.svg", File.read(logo)) if File.exists?(logo)
+    end
+    write("db/migrations/.keep", "")
+    write("test/fixtures/.keep", "")
+    write("db/seeds.iyi", seeds_file)
+    write(".gitignore", gitignore(daisy))
+    write("llms.txt", llms_txt(name))
+    if daisy
+      if build_css
+        say("build", CSS_OUTPUT)
+      else
+        css_pending = true
+      end
+    end
+  end
+  puts ""
+  puts "Created " + dir + ". Next:"
+  puts "  cd " + dir
+  puts "  kurt generate scaffold Post title:string body:text published:bool"
+  puts "  kurt db:migrate"
+  puts "  kurt dev"
+  if css_pending
+    puts ""
+    puts "Tailwind CSS and daisyUI could not be downloaded; run `kurt css:install` when you are online."
+  end
+end
+
+# ---------------------------------------------------------------------------
+# generate
+# ---------------------------------------------------------------------------
+
+def migration_path(name : String) : String
+  existing = Dir.exists?("db/migrations") ? Dir.entries("db/migrations") : [] of String
+  stamp = timestamp(Time.utc).to_i64
+  existing.each do |file|
+    fail("a migration named " + name + " exists already: db/migrations/" + file) if file.ends_with?("_" + name + ".sql")
+    # Two generated in the same second still sort, and never share a version.
+    if version = file.split("_")[0].to_i64?
+      stamp = version + 1 if version >= stamp
+    end
+  end
+  "db/migrations/" + stamp.to_s + "_" + name + ".sql"
+end
+
+def add_route(line : String) : Nil
+  update("config/routes.iyi", append_route(File.read("config/routes.iyi"), line))
+end
+
+def add_nav(names : Names) : Nil
+  path = "app/views/layouts/application.eiy"
+  return unless File.exists?(path)
+  source = File.read(path)
+  link = nav_link(names, tailwind_app?)
+  return if source.includes?(link)
+  update(path, source.sub("<!-- kurt:nav -->", link + "<!-- kurt:nav -->"))
+end
+
+def model_path(model : String) : String
+  "app/models/" + underscore(model) + ".iyi"
+end
+
+def gen_model(names : Names, fields : Array(Field)) : Nil
+  path = model_path(names.model)
+  fail(names.model + " exists already: " + path) if File.exists?(path)
+  known = [] of String
+  fields.each do |field|
+    next unless field.reference?
+    target = camelize(field.name)
+    target_path = model_path(target)
+    if File.exists?(target_path)
+      known << target
+      update(target_path, add_has_many(File.read(target_path), names))
+    end
+  end
+  write(path, model_file(names, fields, known))
+  write(migration_path("create_" + names.plural), create_table_migration(names, fields, postgres_url?(database_url)))
+end
+
+# The first text column a `create_<table>` migration declares, if any.
+def migration_label(table : String) : String?
+  return nil unless Dir.exists?("db/migrations")
+  file = Dir.entries("db/migrations").find { |f| f.ends_with?("_create_" + table + ".sql") }
+  return nil if file.nil?
+  File.read("db/migrations/" + file).lines.each do |line|
+    parts = line.strip.split(" ")
+    next if parts.size < 2 || parts[0] == "id" || parts[0] == "--"
+    type = parts[1].upcase
+    return parts[0] if type.starts_with?("TEXT") || type.starts_with?("VARCHAR")
+  end
+  nil
+end
+
+# For each referenced model that has a file: the column a form's select
+# and the pages show it by, its first text column in db/schema.json (a
+# User by its name, a Post by its title), or its id.
+def reference_labels(fields : Array(Field)) : Hash(String, String)
+  labels = {} of String => String
+  tables = read_schema
+  fields.each do |field|
+    next unless field.reference?
+    target = camelize(field.name)
+    next unless File.exists?(model_path(target))
+    table_name = pluralize(underscore(target))
+    label = "id"
+    if table = find(tables, table_name)
+      if column = table.columns.find { |c| c.type == "String" && c.name != "id" }
+        label = column.name
+      end
+    else
+      # Not migrated yet: its create migration says what it will have.
+      label = migration_label(table_name) || "id"
+    end
+    labels[target] = label
+  end
+  labels
+end
+
+def gen_scaffold(app : String, names : Names, fields : Array(Field)) : Nil
+  labels = reference_labels(fields)
+  gen_model(names, fields)
+  write(names.controller_file, scaffold_controller(names, fields, labels))
+  base = "app/views/" + names.plural + "/"
+  daisy = tailwind_app?
+  write(base + "index.eiy", index_view(names, fields, labels, daisy))
+  write(base + "show.eiy", show_view(names, fields, labels, daisy))
+  write(base + "new.eiy", new_view(names, daisy))
+  write(base + "edit.eiy", edit_view(names, daisy))
+  write(base + "_form.eiy", form_view(names, fields, labels, daisy))
+  add_route("resources \"" + names.plural + "\", " + names.controller)
+  add_nav(names)
+  test = scaffold_test(app, names, fields, auth_sign_in(names.plural))
+  # With authentication, the signed-in tester is one of the users.
+  test = test.gsub("User.count.as(Int64) == 0", "User.count.as(Int64) == 1") if names.model == "User" && auth_app?
+  write("test/" + names.plural + "_test.iyi", test)
+end
+
+def gen_controller(name : String, actions : Array(String)) : Nil
+  actions = ["index"] if actions.empty?
+  plural = underscore(name).sub("_controller", "")
+  klass = camelize(plural) + "Controller"
+  write("app/controllers/" + plural + "_controller.iyi", plain_controller(plural, actions))
+  actions.each { |action| write("app/views/" + plural + "/" + action + ".eiy", plain_view(plural, action, tailwind_app?)) }
+  actions.each do |action|
+    path = "/" + plural + (action == "index" ? "" : "/" + action)
+    add_route("get \"" + path + "\", " + klass + ", :" + action)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# generate authentication
+# ---------------------------------------------------------------------------
+
+AUTH_MARKER = "app/controllers/sessions_controller.iyi"
+
+def auth_app? : Bool
+  File.exists?(AUTH_MARKER)
+end
+
+# The users table's text columns (not the digest), from db/schema.json or,
+# before it is migrated, from its create migration.
+def user_text_columns : Array(String)
+  skip = ["id", "password_digest", "created_at", "updated_at"]
+  if table = find(read_schema, "users")
+    return table.columns.select { |c| c.type == "String" || c.type == "String?" }.map(&.name).reject { |n| skip.includes?(n) }
+  end
+  found = [] of String
+  return found unless Dir.exists?("db/migrations")
+  file = Dir.entries("db/migrations").sorted.find { |f| f.ends_with?("_create_users.sql") }
+  return found if file.nil?
+  File.read("db/migrations/" + file).lines.each do |line|
+    parts = line.strip.split(" ")
+    next if parts.size < 2 || skip.includes?(parts[0]) || parts[0] == "--"
+    type = parts[1].upcase
+    found << parts[0] if type.starts_with?("TEXT") || type.starts_with?("VARCHAR")
+  end
+  found
+end
+
+# The column a user signs in with: email_address, or an email column the
+# users table has.
+def auth_login(columns : Array(String)) : String
+  return "email_address" if columns.includes?("email_address")
+  return "email" if columns.includes?("email")
+  "email_address"
+end
+
+# The line that signs a generated test in; empty without authentication.
+def auth_sign_in(tag : String) : String
+  return "" unless auth_app?
+  columns = user_text_columns
+  auth_sign_in_line(auth_login(columns), columns, tag)
+end
+
+def insert_after_line(path : String, line_start : String, text : String) : Bool
+  return false unless File.exists?(path)
+  source = File.read(path)
+  lines = source.lines
+  index = lines.index { |l| l.starts_with?(line_start) }
+  return false if index.nil?
+  # Set apart from what follows by a blank line.
+  update(path, (lines[0, index + 1] + [text.rstrip + "\n"] + lines[index + 1, lines.size - index - 1]).join("\n") + "\n")
+  true
+end
+
+# Before the class's last `end`.
+def insert_before_last_end(path : String, text : String) : Bool
+  return false unless File.exists?(path)
+  source = File.read(path).rstrip
+  return false unless source.ends_with?("end")
+  update(path, source[0, source.size - 3] + text + "end\n")
+  true
+end
+
+def gen_authentication(app : String) : Nil
+  fail("authentication is set up already: " + AUTH_MARKER + " exists") if auth_app?
+  daisy = tailwind_app?
+  has_model = File.exists?("app/models/user.iyi")
+  columns = has_model ? user_text_columns : [] of String
+  login = auth_login(columns)
+  fields = columns.includes?(login) ? columns : [login] + columns
+
+  if has_model
+    model = File.read("app/models/user.iyi")
+    fail("app/models/user.iyi has has_secure_password already") if model.includes?("has_secure_password")
+    insert_after_line("app/models/user.iyi", "class User", auth_user_lines(login))
+    write(migration_path("add_authentication_to_users"), auth_columns_migration(login, !columns.includes?(login)))
+    users_scaffold_takes_passwords(daisy)
+  else
+    write("app/models/user.iyi", auth_user_model(login))
+    write(migration_path("create_users"), auth_users_migration(login, postgres_url?(database_url)))
+  end
+
+  write("app/controllers/sessions_controller.iyi", sessions_controller(login))
+  write("app/controllers/registrations_controller.iyi", registrations_controller(fields))
+  unless File.read("app/controllers/application_controller.iyi").includes?("require_authentication")
+    insert_before_last_end("app/controllers/application_controller.iyi", "\n" + auth_application_lines)
+  end
+  if File.exists?("app/controllers/home_controller.iyi") && !File.read("app/controllers/home_controller.iyi").includes?("allow_unauthenticated_access")
+    insert_after_line("app/controllers/home_controller.iyi", "class HomeController", "  allow_unauthenticated_access\n")
+  end
+  write("app/views/sessions/new.eiy", sessions_view(login, daisy))
+  write("app/views/registrations/new.eiy", registrations_view(login, fields, daisy))
+  layout = "app/views/layouts/application.eiy"
+  if File.exists?(layout) && !File.read(layout).includes?("current_user?")
+    update(layout, File.read(layout).sub("<!-- kurt:nav -->", "<!-- kurt:nav -->" + auth_nav(daisy)))
+  end
+  auth_routes.each { |route| add_route(route) }
+
+  write("test/sessions_test.iyi", sessions_test(login, fields))
+  sign_in_existing_tests(login, fields)
+
+  puts ""
+  puts "Authentication is in. Next:"
+  puts "  kurt db:migrate"
+  puts "  kurt dev        # /signup, then /login; every page now needs a signed-in user"
+  puts ""
+  puts "Pages anyone may see: `allow_unauthenticated_access` (or `only: [:index, :show]`) in their controller."
+end
+
+# A users scaffold made before: its form and its permit list take a password.
+def users_scaffold_takes_passwords(daisy : Bool) : Nil
+  controller = "app/controllers/users_controller.iyi"
+  if File.exists?(controller)
+    source = File.read(controller)
+    unless source.includes?(":password")
+      update(controller, source.sub(/params\.require\(:user\)\.permit\(([^)]*)\)/) { |m| m[0, m.size - 1] + ", :password, :password_confirmation)" })
+    end
+  end
+  form = "app/views/users/_form.eiy"
+  if File.exists?(form)
+    source = File.read(form)
+    unless source.includes?("user[password]")
+      inputs = auth_input("user_password", "user[password]", "Password", "password", "", " maxlength=\"72\" autocomplete=\"new-password\"", daisy) +
+               auth_input("user_password_confirmation", "user[password_confirmation]", "Password confirmation", "password", "", " autocomplete=\"new-password\"", daisy)
+      marker = daisy ? "    <div class=\"card-actions" : "  <div class=\"actions\">"
+      update(form, source.sub(marker, inputs + marker)) if source.includes?(marker)
+    end
+  end
+end
+
+# Tests written before sign-in was the rule sign in as a user of their own.
+def sign_in_existing_tests(login : String, fields : Array(String)) : Nil
+  return unless Dir.exists?("test")
+  Dir.entries("test").sorted.each do |file|
+    next unless file.ends_with?("_test.iyi") && file != "sessions_test.iyi"
+    path = "test/" + file
+    source = File.read(path)
+    next if source.includes?("sign_in_as(") || !source.includes?("app = RouteHandler.new(routes)\n")
+    tag = file[0, file.size - 9]
+    source = source.sub("app = RouteHandler.new(routes)\n", "app = RouteHandler.new(routes)\n" + auth_sign_in_line(login, fields, tag))
+    if file == "users_test.iyi"
+      # The signed-in tester is a user too, and a user now needs a password.
+      source = source.gsub("User.count.as(Int64) == 0", "User.count.as(Int64) == 1")
+      # A test written before address rules sends "Example" as one.
+      source = source.gsub("user%5B" + login + "%5D=Example", "user%5B" + login + "%5D=example%40example.com")
+      source = source.gsub(/form_request\("POST", "\/users", "([^"]*)"\)/) { |m| m[0, m.size - 2] + "&user%5Bpassword%5D=" + AUTH_PASSWORD + "&user%5Bpassword_confirmation%5D=" + AUTH_PASSWORD + "\")" }
+    end
+    update(path, source)
+  end
+end
+
+def cmd_generate(args : Array(String)) : Nil
+  fail("usage: kurt generate (scaffold|model|controller|migration) NAME ..., or kurt generate authentication") if args.empty?
+  kind = args[0]
+  app = require_app
+  if kind == "authentication"
+    gen_authentication(app)
+    return
+  end
+  fail("usage: kurt generate (scaffold|model|controller|migration) NAME ...") if args.size < 2
+  name = args[1]
+  rest = args[2, args.size - 2]
+  case kind
+  when "scaffold", "resource"
+    fields = parse_fields(rest)
+    fail(fields) if fields.is_a?(String)
+    gen_scaffold(app, Names.new(name), fields)
+  when "model"
+    fields = parse_fields(rest)
+    fail(fields) if fields.is_a?(String)
+    gen_model(Names.new(name), fields)
+  when "controller"
+    gen_controller(name, rest)
+  when "migration"
+    write(migration_path(underscore(name)), empty_migration)
+  else
+    fail("unknown generator `" + kind + "`: scaffold, model, controller or migration")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# db
+# ---------------------------------------------------------------------------
+
+def open_database : Database
+  url = database_url
+  if url.starts_with?("sqlite3:./")
+    dir = File.dirname(url[8, url.size - 8].split("?")[0])
+    Dir.mkdir_p(dir) unless Dir.exists?(dir)
+  end
+  case opened = Db.open(url)
+  in Database then opened
+  in DBError  then fail("cannot open " + url + ": " + opened.message)
+  end
+end
+
+def report(result : Array(Migration) | MigrationError | DBError, verb : String) : Nil
+  case result
+  in Array(Migration)
+    puts result.empty? ? "nothing to " + verb : ""
+    result.each { |m| puts "  " + verb.rjust(8) + "  " + m.label }
+  in MigrationError, DBError
+    fail(result.message)
+  end
+end
+
+SCHEMA = "db/schema.json"
+
+def read_schema : Array(Table)
+  File.exists?(SCHEMA) ? parse(File.read(SCHEMA)) : [] of Table
+end
+
+# Reads the tables back from the database into db/schema.json, then puts
+# each model's columns in the comment at the top of its file.
+def dump_schema(database : Database) : Nil
+  tables = case found = introspect(database, database_url)
+           in Array(Table) then found
+           in DBError      then fail("reading the schema: " + found.message)
+           end
+  json = to_json(tables)
+  if !File.exists?(SCHEMA) || File.read(SCHEMA) != json
+    File.write(SCHEMA, json)
+    say("dump", SCHEMA)
+  end
+  sources("app/models").each do |source|
+    path = "app/models/" + File.basename(source.path)
+    annotated = annotate(source.text, tables)
+    update(path, annotated) unless annotated == source.text
+  end
+end
+
+def cmd_migrate : Nil
+  app_name
+  database = open_database
+  report(migrate(database, database_url, "db/migrations"), "migrate")
+  dump_schema(database)
+end
+
+def cmd_rollback(args : Array(String)) : Nil
+  app_name
+  steps = args.empty? ? 1 : (args[0].to_i? || fail("STEPS is a number"))
+  database = open_database
+  report(rollback(database, database_url, "db/migrations", steps), "rollback")
+  dump_schema(database)
+end
+
+def cmd_status : Nil
+  app_name
+  case rows = status(open_database, "db/migrations")
+  in Array(Tuple(Migration, Bool))
+    puts "nothing in db/migrations" if rows.empty?
+    rows.each { |row| puts (row[1] ? "  up    " : "  down  ") + row[0].label }
+  in MigrationError, DBError
+    fail(rows.message)
+  end
+end
+
+def sqlite_file(url : String) : String?
+  return nil unless url.starts_with?("sqlite3:./")
+  url[8, url.size - 8].split("?")[0]
+end
+
+def cmd_reset : Nil
+  app_name
+  file = sqlite_file(database_url)
+  fail("db:reset drops SQLite files only; drop " + database_url + " yourself") if file.nil?
+  [file, file + "-wal", file + "-shm"].each do |path|
+    if File.exists?(path)
+      File.delete(path)
+      say("remove", path)
+    end
+  end
+  cmd_migrate
+  cmd_seed if File.exists?("db/seeds.iyi")
+end
+
+# db/seeds.iyi: the rows a new database starts with, written with the
+# models. Run it again and again: `find_or_create_by` makes it safe to.
+def cmd_seed : Nil
+  name = require_app
+  seeds = source?("db/seeds.iyi") || fail("no db/seeds.iyi")
+  build_app(name)
+  emit(BUILD + "/seeds.iyi", seeds_module(seeds))
+  exec_iyi(["run", BUILD + "/seeds.iyi"])
+end
+
+# test/fixtures/<table>.yml, each file one table's rows; read at build
+# time so a mistake in one stops `kurt test` before anything runs.
+def read_fixtures : Array(FixtureSet)
+  case sets = read_fixture_sets
+  in Array(FixtureSet) then sets
+  in String            then fail(sets)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# dev, test
+# ---------------------------------------------------------------------------
+
+BUILD = ".kurt/build"
+
+def sources(dir : String) : Array(Source)
+  return [] of Source unless Dir.exists?(dir)
+  root = Dir.current
+  Dir.entries(dir).select { |f| f.ends_with?(".iyi") }.sorted.map do |file|
+    path = dir + "/" + file
+    Source.new(root + "/" + path, File.read(path))
+  end
+end
+
+def source?(path : String) : Source?
+  File.exists?(path) ? Source.new(Dir.current + "/" + path, File.read(path)) : nil
+end
+
+# Writes *contents* only when it changed, so iyi's cache keeps what did not.
+def emit(path : String, contents : String) : Nil
+  dir = File.dirname(path)
+  Dir.mkdir_p(dir) unless Dir.exists?(dir)
+  return if File.exists?(path) && File.read(path) == contents
+  File.write(path, contents)
+end
+
+# The application's files, as the modules iyi compiles, in .kurt/build.
+# Answers the entry file's path.
+def build_app(name : String, tests : Bool = false) : String
+  root = Dir.current
+  mod = File.read("iyi.mod").lines.map do |line|
+    stripped = line.strip
+    # A relative `replace` is relative to the application, not to the build.
+    if stripped.starts_with?("replace ") && stripped.includes?("=> ")
+      target = stripped[stripped.index("=> ").as(Int32) + 3, stripped.size].strip
+      target.starts_with?("/") ? line : stripped[0, stripped.index("=> ").as(Int32) + 3] + root + "/" + target
+    else
+      line
+    end
+  end
+  emit(BUILD + "/iyi.mod", mod.join("\n") + "\n")
+  emit(BUILD + "/iyi.sum", File.read("iyi.sum")) if File.exists?("iyi.sum")
+  generated = root + "/" + BUILD
+  models = sources("app/models")
+  tables = read_schema
+  missing = missing_tables(models, tables)
+  unless missing.empty?
+    STDERR.puts "kurt: no table in " + SCHEMA + " for " + missing.join(", ") + ": run `kurt db:migrate` (a model's fields come from its table)"
+  end
+  emit(BUILD + "/app/models.iyi", models_module(models, tables, root + "/" + SCHEMA))
+  model_names = [] of String
+  models.each { |source| model_tables(source.text).each { |pair| model_names << pair[0] } }
+  emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers"), model_names))
+  routes = source?("config/routes.iyi") || fail("no config/routes.iyi")
+  emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi"))
+  entry = BUILD + "/" + name + ".iyi"
+  migrations = [] of Tuple(String, String)
+  if Dir.exists?("db/migrations")
+    Dir.entries("db/migrations").select { |f| f.ends_with?(".sql") }.sorted.each do |file|
+      migrations << {"db/migrations/" + file, File.read("db/migrations/" + file)}
+    end
+  end
+  emit(entry, entry_module(name, source?("config/application.iyi"), generated + "/" + name + ".iyi", migrations))
+  # Tests from an earlier build that no longer have a file go.
+  Dir.entries(BUILD).each do |file|
+    File.delete(BUILD + "/" + file) if file.ends_with?("_test.iyi") && !File.exists?("test/" + file)
+  end
+  if tests
+    model_pairs = [] of Tuple(String, String)
+    models.each { |source| model_tables(source.text).each { |pair| model_pairs << pair } }
+    emit(BUILD + "/app/fixtures.iyi", fixtures_module(read_fixtures, model_pairs, root + "/test/fixtures", root + "/" + SCHEMA))
+    sources("test").each do |source|
+      next unless source.path.ends_with?("_test.iyi")
+      file = File.basename(source.path)
+      emit(BUILD + "/" + file, test_module(file[0, file.size - 4], source))
+    end
+  end
+  entry
+end
+
+def exec_iyi(args : Array(String), env : Hash(String, String)? = nil) : NoReturn
+  failure = Process.exec("iyi", args, env: env)
+  fail("could not start iyi: " + failure.message + " (is ~/.local/bin on PATH?)")
+end
+
+# What `kurt dev` watches: the application's code, views, settings and
+# schema. public/ is served from disk as it is, so it needs no restart.
+WATCHED = ["app", "config", "db/schema.json", "iyi.mod"]
+
+# Every watched file with its modification time.
+def snapshot : Hash(String, Int64)
+  found = {} of String => Int64
+  WATCHED.each { |path| collect(path, found) }
+  found
+end
+
+def collect(path : String, found : Hash(String, Int64)) : Nil
+  if Dir.exists?(path)
+    Dir.entries(path).each do |entry|
+      next if entry.starts_with?(".")
+      collect(path + "/" + entry, found)
+    end
+  elsif File.exists?(path)
+    found[path] = File.info(path).modification_time
+  end
+end
+
+# What changed between two snapshots, for the log line.
+def changes(before : Hash(String, Int64), after : Hash(String, Int64)) : Array(String)
+  changed = [] of String
+  after.each { |path, time| changed << path if before[path]? != time }
+  before.each_key { |path| changed << path unless after.has_key?(path) }
+  changed
+end
+
+# Compiles the application into *output*; false when it does not build,
+# with iyi's errors already printed.
+def compile(name : String, output : String) : Bool
+  entry = build_app(name)
+  Dir.mkdir_p(File.dirname(output)) unless Dir.exists?(File.dirname(output))
+  started = Time.utc.to_unix_ms
+  case result = Process.run("iyi", ["build", entry, "-o", output], capture: false)
+  in ProcessResult
+    if result.success?
+      took = Time.utc.to_unix_ms - started
+      puts "kurt: built in " + (took // 1000).to_s + "." + (took % 1000 // 100).to_s + "s"
+      true
+    else
+      STDERR.puts "kurt: the build failed; the running server, if any, is the last one that built"
+      false
+    end
+  in ProcessError
+    fail("could not start iyi: " + result.message + " (is ~/.local/bin on PATH?)")
+  in Cancelled
+    false
+  end
+end
+
+def start_server(binary : String, args : Array(String)) : ChildProcess?
+  env = {"KURT_LIVE_RELOAD" => "1"}
+  case child = Process.spawn(binary, args, env: env)
+  in ChildProcess  then child
+  in ProcessError
+    STDERR.puts "kurt: could not start " + binary + ": " + child.message
+    nil
+  end
+end
+
+# Asks the server to stop, and stops it if it has not after half a second:
+# a stopping iyi-web server waits for the requests it is serving, and a
+# page's live-reload stream is one of them.
+def stop_server(server : ChildProcess?) : Nil
+  return if server.nil?
+  return if server.ended?
+  server.terminate
+  10.times do
+    break if server.ended?
+    sleep(50)
+  end
+  server.kill unless server.ended?
+  server.wait
+  nil
+end
+
+# Runs the application, and builds and restarts it whenever a watched file
+# changes. A change that does not build leaves the last good server
+# running. Pages reload themselves when their server restarts.
+def cmd_dev(args : Array(String)) : Nil
+  name = require_app
+  if args.includes?("--no-reload")
+    exec_iyi(["run", build_app(name), "--"] + args.reject { |a| a == "--no-reload" })
+  end
+  binary = ".kurt/bin/" + name
+  fresh = binary + ".next"
+  seen = snapshot
+  build_css
+  server = compile(name, binary) ? start_server(binary, args) : nil
+  puts "kurt: watching app/, config/ and db/schema.json; Ctrl+C stops"
+  group do |g|
+    # However kurt dev is stopped (Ctrl+C, a kill, a closed terminal),
+    # the server it started stops with it rather than holding the port.
+    g.spawn(unit: :same) do
+      Signal.wait(Signal::INT, Signal::TERM, Signal::HUP)
+      stop_server(server)
+      exit 0
+    end
+    loop do
+      sleep(400)
+      now = snapshot
+      next if now == seen
+      # Editors write in several steps; let the last one land.
+      sleep(200)
+      now = snapshot
+      changes(seen, now).each { |path| say("change", path) }
+      seen = now
+      # The views a change touched may use classes the CSS does not have yet.
+      build_css
+      next unless compile(name, fresh)
+      stop_server(server)
+      File.rename(fresh, binary)
+      File.rename(fresh + ".dwarf", binary + ".dwarf") if File.exists?(fresh + ".dwarf")
+      server = start_server(binary, args)
+    end
+  end
+end
+
+def cmd_build(args : Array(String)) : Nil
+  name = require_app
+  fail("the CSS did not build") unless build_css(minify: true)
+  entry = build_app(name)
+  Dir.mkdir_p("bin") unless Dir.exists?("bin")
+  exec_iyi(["build", "--release", entry, "-o", "bin/" + name] + args)
+end
+
+# Every route the application has, from its own router: what resources
+# registered for the actions its controllers define, nested ones and
+# namespaces with their full paths.
+def cmd_routes : Nil
+  name = require_app
+  exec_iyi(["run", build_app(name)], {"KURT_PRINT_ROUTES" => "1"})
+end
+
+def cmd_test(args : Array(String)) : Nil
+  name = require_app
+  build_app(name, tests: true)
+  env = {"KURT_ENV" => "test", "IYI_WEB_ENV" => "test"}
+  url = Program.env("DATABASE_URL") || "sqlite3:./db/test.sqlite3"
+  env["DATABASE_URL"] = url
+  if file = sqlite_file(url)
+    [file, file + "-wal", file + "-shm"].each { |path| File.delete(path) if File.exists?(path) }
+  end
+  Dir.mkdir_p("db") unless Dir.exists?("db")
+  database = case opened = Db.open(url)
+             in Database then opened
+             in DBError  then fail("cannot open " + url + ": " + opened.message)
+             end
+  case ran = migrate(database, url, "db/migrations")
+  in Array(Migration) then nil
+  in MigrationError, DBError then fail("migrating the test database: " + ran.message)
+  end
+  database.close
+  exec_iyi(["test", BUILD, "-p", "1"] + args, env)
+end
+
+# ---------------------------------------------------------------------------
+
+args = Program.args
+command = args.empty? ? "help" : args[0]
+rest = args.size > 1 ? args[1, args.size - 1] : [] of String
+
+case command
+when "new"                       then cmd_new(rest)
+when "generate", "g"             then cmd_generate(rest)
+when "db:migrate"                then cmd_migrate
+when "db:rollback"               then cmd_rollback(rest)
+when "db:status"                 then cmd_status
+when "db:reset"                  then cmd_reset
+when "db:seed"                   then cmd_seed
+when "dev", "server", "s"        then cmd_dev(rest)
+when "test"                      then cmd_test(rest)
+when "build"                     then cmd_build(rest)
+when "css:install", "css:build"  then cmd_css(command, rest)
+when "routes"                    then cmd_routes
+when "version", "--version", "-v" then puts "kurt " + VERSION
+when "help", "--help", "-h"      then puts USAGE
+else
+  STDERR.puts USAGE
+  fail("unknown command `" + command + "`")
+end
