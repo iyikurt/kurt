@@ -1,0 +1,80 @@
+# A request's parameters, and Rails' strong parameters over them:
+#
+#   private def post_params : Hash(String, String)
+#     params.require(:post).permit(:title, :body, :published)
+#   end
+#
+#   post.update(post_params)
+#
+# `require(:post)` reads the `post[...]` fields a form sends; `permit` keeps
+# the named ones and is the only way to the `Hash(String, String)` a model
+# is assigned from. So handing a model the parameters unfiltered is not a
+# runtime error, as Rails' ForbiddenAttributesError is: it does not compile.
+#
+# Nothing here knows about HTTP; the controller builds one from the path,
+# the form body and the query string.
+module strong_parameters
+
+import std/text
+
+pub class Parameters
+  @values : Hash(String, String)
+
+  def initialize(@values : Hash(String, String))
+  end
+
+  def []?(key : String) : String?
+    @values[key]?
+  end
+
+  def []?(key : Symbol) : String?
+    @values[key.to_s]?
+  end
+
+  # The value, or "" when there is none.
+  def [](key : String) : String
+    @values[key]? || ""
+  end
+
+  def [](key : Symbol) : String
+    self[key.to_s]
+  end
+
+  def has_key?(key : String | Symbol) : Bool
+    @values.has_key?(key.to_s)
+  end
+
+  def keys : Array(String)
+    @values.keys
+  end
+
+  def empty? : Bool
+    @values.empty?
+  end
+
+  # The fields a form sent as `post[title]`, `post[body]`, under their own
+  # names: `title`, `body`. Empty when it sent none, which a model's
+  # validation then answers.
+  def require(key : String | Symbol) : Parameters
+    prefix = key.to_s + "["
+    nested = {} of String => String
+    @values.each do |name, value|
+      if name.starts_with?(prefix) && name.ends_with?("]")
+        nested[name[prefix.size, name.size - prefix.size - 1]] = value
+      end
+    end
+    Parameters.new(nested)
+  end
+
+  # Only the named keys, the ones that were sent.
+  def permit(*keys : Symbol) : Hash(String, String)
+    allowed = {} of String => String
+    keys.each do |key|
+      name = key.to_s
+      if value = @values[name]?
+        allowed[name] = value
+      end
+    end
+    allowed
+  end
+end

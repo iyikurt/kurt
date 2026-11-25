@@ -1,0 +1,56 @@
+module test/migrator_test
+
+import db
+import sqlite
+import db/db/errors::{DBError}
+import migrator::*
+
+URL = "sqlite3:%3Amemory%3A?max_pool_size=1"
+DIR = "test/fixtures/migrations"
+
+def run_all : Nil | DBError | MigrationError
+  assert statements("CREATE TABLE a (x TEXT DEFAULT 'p;q'); -- only a comment\n; INSERT INTO a VALUES ('1')") == ["CREATE TABLE a (x TEXT DEFAULT 'p;q')", "INSERT INTO a VALUES ('1')"]
+  up, down = parse_sections("-- up\nCREATE TABLE t (x INT);\n-- down\nDROP TABLE t;\n")
+  assert up == "CREATE TABLE t (x INT);"
+  assert down == "DROP TABLE t;"
+
+  db = Db.open(URL)!
+  loaded = load(DIR)!
+  assert loaded.map(&.label) == ["20260101000000_create_users", "20260102000000_create_posts"]
+
+  ran = migrate(db, URL, DIR)!
+  assert ran.size == 2
+  assert applied(db)! == ["20260101000000", "20260102000000"]
+  assert migrate(db, URL, DIR)!.empty?
+  db.exec("INSERT INTO posts (id) VALUES (1)")!
+  assert db.scalar("SELECT title FROM posts")! == "a;b"
+
+  undone = rollback(db, URL, DIR)!
+  assert undone.map(&.name) == ["create_posts"]
+  assert applied(db)! == ["20260101000000"]
+  assert status(db, DIR)!.map { |pair| pair[1] } == [true, false]
+  rollback(db, URL, DIR, 5)!
+  assert applied(db)!.empty?
+
+  # what a release binary carries: (path, text) pairs, run in timestamp order
+  carried = from_files([{"db/migrations/20260102000000_b.sql", "-- up\nCREATE TABLE b (x INT);"},
+                        {"db/migrations/20260101000000_a.sql", "-- up\nCREATE TABLE a2 (x INT);\n-- down\nDROP TABLE a2;"}])!
+  assert carried.map(&.label) == ["20260101000000_a", "20260102000000_b"]
+  fresh = Db.open(URL)!
+  assert migrate(fresh, URL, carried)!.size == 2
+  assert migrate(fresh, URL, carried)!.empty?
+  assert status(fresh, carried)!.map { |row| row[1] } == [true, true]
+  case bad = from_files([{"x/nope.sql", "-- up\nSELECT 1;"}])
+  in MigrationError then assert bad.message.includes?("nope.sql")
+  in Array(Migration) then assert false
+  end
+  puts "migrator: all assertions passed"
+  nil
+end
+
+case result = run_all
+in Nil then nil
+in DBError, MigrationError
+  STDERR.puts "FAILED: " + result.message
+  exit 1
+end

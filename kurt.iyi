@@ -1,0 +1,17 @@
+# Kurt: a Rails-like layer for iyi, over iyi-web and db.
+#
+# An application imports the modules it uses:
+#
+#   import kurt/model::*         derive model, Query, belongs_to, has_many,
+#                                  NotFound, Invalid, Errors
+#   import kurt/controllers::*   Controller, resources, route, before_action,
+#                                  Unauthorized, Forbidden, install_error_pages
+#   import kurt/datasource::{database}
+#   import kurt/migrator::*      what `kurt db:migrate` runs
+#
+# `kurt new` writes an application that does this already; see README.md.
+module kurt
+
+pub def version : String
+  "0.1.0"
+end

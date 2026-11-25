@@ -1,0 +1,234 @@
+# Fixtures, as in Rails: rows for the test database, written as YAML in
+# test/fixtures/<table>.yml, one entry per label.
+#
+#   # test/fixtures/users.yml
+#   ada:
+#     name: Ada
+#     email: ada@example.com
+#     password: secret123        # a table with password_digest gets its digest
+#
+#   # test/fixtures/posts.yml
+#   welcome:
+#     title: Welcome
+#     user: ada                  # user_id: the id of users.yml's ada
+#
+# Each test file starts with them loaded afresh into the test database (what
+# an earlier file changed is gone), and reaches a row by its label:
+# `users(:ada)`. A label's
+# id is the same on every run (`fixture_id`), which is how one fixture
+# points at another by label. created_at and updated_at are filled in when
+# the table has them.
+module fixtures
+
+import std/text
+import std/dir::{Dir}
+import std/file
+import std/time::{Time}
+import std/regex::{Regex}
+import std/yaml::{YAML, Any}
+import std/password::{Bcrypt}
+import db/db/core::{Database}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue}
+import environment::{numbered_placeholders}
+import schema::{Table, Column, find}
+
+pub class Fixture
+  getter label : String
+  getter values : Array(Tuple(String, Any))
+
+  def initialize(@label : String, @values : Array(Tuple(String, Any)))
+  end
+end
+
+# The fixtures of one table: test/fixtures/users.yml is the users table's.
+pub class FixtureSet
+  getter table : String
+  getter path : String
+  getter fixtures : Array(Fixture)
+
+  def initialize(@table : String, @path : String, @fixtures : Array(Fixture))
+  end
+
+  def labels : Array(String)
+    @fixtures.map(&.label)
+  end
+end
+
+# A row ready to insert: its columns and their values.
+pub class FixtureRow
+  getter table : String
+  getter columns : Array(String)
+  getter values : Array(DBValue)
+
+  def initialize(@table : String, @columns : Array(String), @values : Array(DBValue))
+  end
+end
+
+# A label's id: a hash of the label (FNV-1a), below 2^30 as in Rails, the
+# same on every run and in every table.
+pub def fixture_id(label : String) : Int64
+  hash = 2166136261_u64
+  label.each_byte { |byte| hash = ((hash ^ byte.to_u64) * 16777619_u64) & 0xFFFFFFFF_u64 }
+  (hash % 1073741823_u64).to_i64 + 1
+end
+
+def key_text(key : Any) : String
+  key.as_s? || key.to_s
+end
+
+# The fixtures in *text*, the YAML of *path*; a String says what is wrong.
+pub def parse_fixtures(table : String, path : String, text : String) : FixtureSet | String
+  doc = YAML.parse?(text)
+  return path + ": not YAML this reader takes" if doc.nil?
+  return FixtureSet.new(table, path, [] of Fixture) if doc.null?
+  entries = doc.as_h?
+  return path + ": a mapping of labels to rows" if entries.nil?
+  fixtures = [] of Fixture
+  entries.each do |key, row|
+    label = key_text(key)
+    return path + ": label " + label + " is not a name (letters, digits and _)" unless label.matches?(/\A[a-z_][a-z0-9_]*\z/i)
+    values = [] of Tuple(String, Any)
+    unless row.null?
+      fields = row.as_h?
+      return path + ": " + label + " is not a mapping of columns to values" if fields.nil?
+      fields.each { |column, value| values << {key_text(column), value} }
+    end
+    fixtures << Fixture.new(label, values)
+  end
+  FixtureSet.new(table, path, fixtures)
+end
+
+def parse_time(text : String) : Time?
+  ["%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M", "%Y-%m-%d %H:%M", "%Y-%m-%d"].each do |pattern|
+    parsed = Time.parse_utc(text, pattern)
+    return parsed if parsed.is_a?(Time)
+  end
+  nil
+end
+
+# *value* as the column's type wants it; a String says what is wrong.
+def column_value(value : Any, column : Column) : DBValue | String
+  return nil if value.null?
+  case column.type
+  when "Int64", "Int32"
+    if number = value.as_i?
+      return number
+    end
+    if number = (value.as_s? || "").to_i64?
+      return number
+    end
+  when "Float64"
+    if number = value.as_f?
+      return number
+    end
+    if number = value.as_i?
+      return number.to_f
+    end
+  when "Bool"
+    if flag = value.as_bool?
+      return flag
+    end
+    return false if value.as_bool? == false
+  when "Time"
+    if text = value.as_s?
+      if time = parse_time(text)
+        return time
+      end
+    end
+  else
+    return value.as_s? || value.to_s
+  end
+  "is not a " + column.type + ": " + value.to_s
+end
+
+# The rows *set* inserts into its table, as *tables* (db/schema.json) has
+# it; a String says what is wrong.
+pub def fixture_rows(set : FixtureSet, tables : Array(Table), now : Time = Time.utc) : Array(FixtureRow) | String
+  table = find(tables, set.table)
+  return set.path + ": no table " + set.table + " in db/schema.json (run `kurt db:migrate`)" if table.nil?
+  names = table.columns.map(&.name)
+  rows = [] of FixtureRow
+  set.fixtures.each do |fixture|
+    columns = [] of String
+    values = [] of DBValue
+    where = set.path + ": " + fixture.label + ": "
+    fixture.values.each do |pair|
+      key, value = pair
+      if column = table.columns.find { |c| c.name == key }
+        converted = column_value(value, column)
+        return where + key + " " + converted if converted.is_a?(String) && column.type != "String"
+        columns << key
+        values << converted
+      elsif key == "password" && names.includes?("password_digest")
+        password = value.as_s? || value.to_s
+        columns << "password_digest"
+        values << Bcrypt.hash(password, 4)
+      elsif names.includes?(key + "_id")
+        label = value.as_s?
+        return where + key + " names a fixture by its label" if label.nil?
+        columns << key + "_id"
+        values << fixture_id(label)
+      else
+        return where + "no column " + key + " in " + set.table
+      end
+    end
+    unless columns.includes?("id")
+      columns.unshift("id")
+      values.unshift(fixture_id(fixture.label))
+    end
+    ["created_at", "updated_at"].each do |stamp|
+      if names.includes?(stamp) && !columns.includes?(stamp)
+        columns << stamp
+        values << now
+      end
+    end
+    rows << FixtureRow.new(set.table, columns, values)
+  end
+  rows
+end
+
+# Empties each set's table and inserts its rows. On PostgreSQL the id
+# sequence moves past the fixtures, so a test's own records get new ids.
+pub def load_fixtures(database : Database, postgres : Bool, sets : Array(FixtureSet), tables : Array(Table)) : Nil | DBError | String
+  all = [] of FixtureRow
+  sets.each do |set|
+    rows = fixture_rows(set, tables)
+    return rows if rows.is_a?(String)
+    rows.each { |row| all << row }
+  end
+  sets.each { |set| database.exec("DELETE FROM " + set.table)! }
+  all.each do |row|
+    sql = "INSERT INTO " + row.table + " (" + row.columns.join(", ") + ") VALUES (" + row.columns.map { |_| "?" }.join(", ") + ")"
+    database.exec(postgres ? numbered_placeholders(sql) : sql, args: row.values)!
+  end
+  if postgres
+    sets.each do |set|
+      next if set.fixtures.empty?
+      database.exec("SELECT setval(pg_get_serial_sequence('" + set.table + "', 'id'), (SELECT MAX(id) FROM " + set.table + "))")!
+    end
+  end
+  nil
+end
+
+# Every set in *dir* (test/fixtures), sorted by file; a String says what is
+# wrong.
+pub def read_fixture_sets(dir : String = "test/fixtures") : Array(FixtureSet) | String
+  sets = [] of FixtureSet
+  return sets unless Dir.exists?(dir)
+  Dir.entries(dir).select { |f| f.ends_with?(".yml") || f.ends_with?(".yaml") }.sorted.each do |file|
+    path = dir + "/" + file
+    set = parse_fixtures(file[0, file.rindex(".").as(Int32)], path, File.read(path))
+    return set if set.is_a?(String)
+    sets << set
+  end
+  sets
+end
+
+# What a test file does first: the fixtures in *dir*, loaded into *database*
+# over what is there.
+pub def reload_fixtures(database : Database, postgres : Bool, tables : Array(Table), dir : String = "test/fixtures") : Nil | DBError | String
+  sets = read_fixture_sets(dir)
+  return sets if sets.is_a?(String)
+  load_fixtures(database, postgres, sets, tables)
+end

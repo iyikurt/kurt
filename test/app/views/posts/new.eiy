@@ -1,0 +1,1 @@
+<form><% @post.errors.full_messages.each do |m| %><p class="error"><%= m %></p><% end %><input name="title" value="<%= @post.title %>"></form>

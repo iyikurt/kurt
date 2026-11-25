@@ -1,0 +1,5 @@
+<%= link_to "All <posts>", "/posts", class: "btn", data_turbo: false %>
+<%= button_to "Delete", "/posts/1", method: :delete, class: "danger", confirm: "Delete Bob's post?" %>
+<%= render "_item.eiy", collection: @posts %>
+<%= render "_note.eiy", note: "a note & more" %>
+<%= current_page?("/helpers") %>

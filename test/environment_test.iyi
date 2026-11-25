@@ -1,0 +1,12 @@
+module test/environment_test
+
+import environment::*
+
+# what production refuses as a session secret
+assert session_secret_problem("") == "SESSION_SECRET is not set; production needs its own (openssl rand -hex 32)"
+assert session_secret_problem("short") == "SESSION_SECRET is 5 bytes; it needs 32 or more (openssl rand -hex 32)"
+assert session_secret_problem("x" * 32).nil?
+# outside production the development secret stands in
+assert !production?
+assert session_secret("dev-secret") == (Program.env("SESSION_SECRET") || "dev-secret")
+puts "environment: all assertions passed"

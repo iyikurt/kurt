@@ -1,0 +1,189 @@
+# Migrations: plain SQL files named by a timestamp, and a table recording
+# which have run.
+#
+#   db/migrations/20261123153000_create_posts.sql
+#
+#   -- up
+#   CREATE TABLE posts (id INTEGER PRIMARY KEY, title TEXT NOT NULL);
+#
+#   -- down
+#   DROP TABLE posts;
+#
+# Each migration runs in a transaction with the row that records it, so one
+# that fails leaves nothing behind and runs again next time. A migration
+# that has been shared is never edited; a change is a new migration.
+module migrator
+
+import std/text
+import std/dir::{Dir}
+import db/db/core::{Database, Transaction}
+import db/db/errors::{DBError}
+import environment::{postgres_url?, numbered_placeholders}
+
+pub class Migration
+  getter version : String
+  getter name : String
+  getter path : String
+  getter up : String
+  getter down : String
+
+  def initialize(@version : String, @name : String, @path : String, @up : String, @down : String)
+  end
+
+  def label : String
+    @version + "_" + @name
+  end
+end
+
+# A migration file that cannot be used: a name without a timestamp, or no
+# `-- up` section.
+pub class MigrationError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+impl Error for MigrationError
+  def message : String
+    @message
+  end
+end
+
+# Splits a file at its `-- up` and `-- down` markers.
+pub def parse_sections(source : String) : Tuple(String, String)
+  up = ""
+  down = ""
+  section = ""
+  source.lines.each do |line|
+    marker = line.strip.downcase
+    if marker == "-- up" || marker == "--up"
+      section = "up"
+    elsif marker == "-- down" || marker == "--down"
+      section = "down"
+    elsif section == "up"
+      up += line + "\n"
+    elsif section == "down"
+      down += line + "\n"
+    end
+  end
+  {up.strip, down.strip}
+end
+
+# The statements of a section, split at semicolons outside quotes.
+pub def statements(sql : String) : Array(String)
+  out = [] of String
+  current = ""
+  quoted = false
+  sql.each_char do |c|
+    if c == '\''
+      quoted = !quoted
+      current += c.to_s
+    elsif c == ';' && !quoted
+      out << current.strip unless current.strip.empty?
+      current = ""
+    else
+      current += c.to_s
+    end
+  end
+  out << current.strip unless current.strip.empty?
+  # A statement that is only comments is not sent.
+  out.reject { |s| s.lines.all? { |l| l.strip.empty? || l.strip.starts_with?("--") } }
+end
+
+# Every migration in *dir*, oldest first.
+pub def load(dir : String) : Array(Migration) | MigrationError
+  return [] of Migration unless Dir.exists?(dir)
+  names = Dir.entries(dir).select { |f| f.ends_with?(".sql") }.sorted
+  from_files(names.map { |file| {dir + "/" + file, File.read(dir + "/" + file)} })
+end
+
+# Migrations from (path, text) pairs: what `load` reads from db/migrations,
+# and what a release binary carries inside it (`./bin/app db:migrate`).
+pub def from_files(files : Array(Tuple(String, String))) : Array(Migration) | MigrationError
+  found = [] of Migration
+  files.sorted_by { |pair| File.basename(pair[0]) }.each do |pair|
+    path, text = pair
+    file = File.basename(path)
+    stem = file[0, file.size - 4]
+    cut = stem.index("_")
+    return MigrationError.new(file + ": a migration's name is <timestamp>_<name>.sql") if cut.nil? || cut == 0
+    version = stem[0, cut]
+    return MigrationError.new(file + ": the timestamp must be digits") unless version.chars.all?(&.ascii_number?)
+    up, down = parse_sections(text)
+    return MigrationError.new(file + ": no `-- up` section") if up.empty?
+    found << Migration.new(version, stem[cut + 1, stem.size - cut - 1], path, up, down)
+  end
+  found
+end
+
+def sql_for(postgres : Bool, sql : String) : String
+  postgres ? numbered_placeholders(sql) : sql
+end
+
+def ensure_table(db : Database) : Nil | DBError
+  db.exec("CREATE TABLE IF NOT EXISTS schema_migrations (version VARCHAR(32) PRIMARY KEY)")!
+  nil
+end
+
+# The versions that have run.
+pub def applied(db : Database) : Array(String) | DBError
+  ensure_table(db)!
+  db.query_all("SELECT version FROM schema_migrations ORDER BY version", as: String)
+end
+
+def apply(tx : Transaction, postgres : Bool, migration : Migration, direction : String) : Bool | DBError
+  conn = tx.connection
+  body = direction == "up" ? migration.up : migration.down
+  statements(body).each { |statement| conn.exec(statement)! }
+  if direction == "up"
+    conn.exec(sql_for(postgres, "INSERT INTO schema_migrations (version) VALUES (?)"), migration.version)!
+  else
+    conn.exec(sql_for(postgres, "DELETE FROM schema_migrations WHERE version = ?"), migration.version)!
+  end
+  true
+end
+
+# Runs every migration not yet recorded, oldest first; answers the ones it
+# ran. Stops at the first that fails, with the ones before it applied.
+pub def migrate(db : Database, url : String, dir : String) : Array(Migration) | MigrationError | DBError
+  migrate(db, url, load(dir)!)
+end
+
+pub def migrate(db : Database, url : String, migrations : Array(Migration)) : Array(Migration) | MigrationError | DBError
+  postgres = postgres_url?(url)
+  done = applied(db)!
+  ran = [] of Migration
+  migrations.each do |migration|
+    next if done.includes?(migration.version)
+    db.transaction { |tx| apply(tx, postgres, migration, "up") }!
+    ran << migration
+  end
+  ran
+end
+
+# Undoes the last *steps* migrations that ran, newest first.
+pub def rollback(db : Database, url : String, dir : String, steps : Int32 = 1) : Array(Migration) | MigrationError | DBError
+  postgres = postgres_url?(url)
+  done = applied(db)!
+  all = load(dir)!
+  undone = [] of Migration
+  done.reversed.first(steps).each do |version|
+    migration = all.find { |m| m.version == version }
+    return MigrationError.new("migration " + version + " has run but its file is gone") if migration.nil?
+    return MigrationError.new(migration.label + " has no `-- down` section") if migration.down.empty?
+    db.transaction { |tx| apply(tx, postgres, migration, "down") }!
+    undone << migration
+  end
+  undone
+end
+
+# Each migration in *dir* and whether it has run.
+pub def status(db : Database, dir : String) : Array(Tuple(Migration, Bool)) | MigrationError | DBError
+  status(db, load(dir)!)
+end
+
+pub def status(db : Database, migrations : Array(Migration)) : Array(Tuple(Migration, Bool)) | MigrationError | DBError
+  done = applied(db)!
+  migrations.map { |m| {m, done.includes?(m.version)} }
+end

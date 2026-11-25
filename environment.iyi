@@ -1,0 +1,76 @@
+# Where the application runs and which database it talks to. Nothing here
+# opens anything: `kurt/connection` holds the pool, and the CLI opens its
+# own for `db:migrate`.
+module environment
+
+import std/text
+
+# development, test or production; KURT_ENV picks it.
+pub def env : String
+  Program.env("KURT_ENV") || "development"
+end
+
+pub def production? : Bool
+  env == "production"
+end
+
+pub def development? : Bool
+  env == "development"
+end
+
+# DATABASE_URL, or the convention `sqlite3:./db/<env>.sqlite3`.
+pub def database_url : String
+  if url = Program.env("DATABASE_URL")
+    return url unless url.empty?
+  end
+  "sqlite3:./db/" + env + ".sqlite3"
+end
+
+pub def postgres_url?(url : String) : Bool
+  url.starts_with?("postgres://") || url.starts_with?("postgresql://")
+end
+
+# Rewrites the `?` placeholders a statement was built with into PostgreSQL's
+# `$1, $2, ...`. A `?` inside a quoted literal is left alone.
+pub def numbered_placeholders(sql : String) : String
+  out = ""
+  n = 0
+  quoted = false
+  sql.each_char do |c|
+    if c == '\''
+      quoted = !quoted
+      out += c.to_s
+    elsif c == '?' && !quoted
+      n += 1
+      out += "$" + n.to_s
+    else
+      out += c.to_s
+    end
+  end
+  out
+end
+
+# The secret that encrypts the session cookie: SESSION_SECRET, or in
+# development and test the one `kurt new` wrote into config/application.iyi.
+# Production refuses to start without its own, 32 bytes or more: the
+# development one is in the repository, and anyone who has read it could
+# forge a session.
+pub def session_secret(development_secret : String) : String
+  secret = Program.env("SESSION_SECRET") || ""
+  if production?
+    problem = session_secret_problem(secret)
+    if problem
+      STDERR.puts "kurt: " + problem
+      exit 1
+    end
+    return secret
+  end
+  secret.empty? ? development_secret : secret
+end
+
+# What is wrong with *secret* for production, or nil.
+pub def session_secret_problem(secret : String) : String?
+  return "SESSION_SECRET is not set; production needs its own (openssl rand -hex 32)" if secret.empty?
+  return "SESSION_SECRET is " + secret.bytesize.to_s + " bytes; it needs 32 or more (openssl rand -hex 32)" if secret.bytesize < 32
+  nil
+end

@@ -1,0 +1,512 @@
+module test/model_test
+
+import std/text
+import db/db/errors::{DBError}
+import datasource::{database, postgres?}
+import std/regex::{Regex}
+import model::*
+
+class User
+  property name : String
+  property email : String
+  property admin : Bool
+
+  has_many posts : Post
+
+  derive model
+
+  def validate(errors : Errors) : Nil
+    errors.add("name", "can't be blank") if name.empty?
+    errors.add("email", "is invalid") unless email.includes?("@")
+  end
+end
+
+@[Table("posts")]
+class Post
+  property title : String
+  property body : String
+  property published : Bool = true
+  property comments_count : Int64
+  property user_id : Int64
+
+  belongs_to user : User
+  has_many comments : Comment, dependent: :destroy
+  has_one pin : Pin, dependent: :delete_all       # a second dependent
+
+  derive model
+
+  def self.feed : Query(Post)
+    query.where(published: true).order_desc(:id)
+  end
+end
+
+class Comment
+  property body : String
+  property post_id : Int64
+
+  belongs_to post : Post
+  has_many likes : Like, dependent: :delete_all
+
+  after_destroy :note_gone
+
+  derive model
+
+  def note_gone
+    CALLS << "comment destroyed"
+  end
+end
+
+class Like
+  property comment_id : Int64
+
+  derive model
+end
+
+class Pin
+  property post_id : Int64
+
+  derive model
+end
+
+# has_secure_password over password_digest.
+class Person
+  property email_address : String
+  property password_digest : String
+
+  has_secure_password
+  validates :password, length: {minimum: 8}
+
+  derive model
+end
+
+# A callback that writes in the save's own transaction.
+class Account
+  property name : String
+
+  validates :name, presence: true
+  after_create :open_ledger
+
+  derive model
+
+  def open_ledger
+    Like.create(comment_id: id, on: current_transaction)!
+  end
+end
+
+CALLS = [] of String
+
+# Rails-style validations and callbacks.
+class Member
+  property name : String
+  property email : String
+  property role : String
+  property nickname : String?
+  property user_id : Int64
+
+  validates :name, :email, presence: true
+  validates :name, length: {maximum: 10}
+  validates :nickname, length: {in: 2..8}
+  validates :email, format: /\A[^@\s]+@[^@\s]+\z/, uniqueness: true
+  validates :role, inclusion: {in: ["admin", "member"]}, message: "must be admin or member"
+  validates :user_id, presence: true
+
+  before_validation :normalize
+  before_save :note_save
+  before_create :note_create
+  after_create :note_created
+  before_update :note_update
+  after_save :note_saved
+  before_destroy :note_destroy
+  after_destroy :note_destroyed
+
+  derive model
+
+  def normalize
+    @email = email.strip.downcase
+    CALLS << "before_validation"
+  end
+
+  def note_save
+    CALLS << "before_save"
+  end
+
+  def note_create
+    CALLS << "before_create"
+  end
+
+  def note_created
+    CALLS << "after_create"
+  end
+
+  def note_update
+    CALLS << "before_update"
+  end
+
+  def note_saved
+    CALLS << "after_save"
+  end
+
+  def note_destroy
+    CALLS << "before_destroy"
+  end
+
+  def note_destroyed
+    CALLS << "after_destroy"
+  end
+
+  def validate(errors : Errors) : Nil
+    errors.add("name", "can't be root") if name == "root"
+  end
+end
+
+def setup : Nil | DBError
+  db = database
+  id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres? ? "BIGINT" : "INTEGER"
+  bool = postgres? ? "BOOLEAN NOT NULL DEFAULT FALSE" : "INTEGER NOT NULL DEFAULT 0"
+  ["comments", "posts", "users", "members", "likes", "accounts", "people", "pins"].each { |t| db.exec("DROP TABLE IF EXISTS " + t)! }
+  db.exec("CREATE TABLE people (id " + id + ", email_address TEXT NOT NULL, password_digest TEXT NOT NULL DEFAULT '')")!
+  db.exec("CREATE TABLE pins (id " + id + ", post_id " + int + " NOT NULL)")!
+  db.exec("CREATE TABLE likes (id " + id + ", comment_id " + int + " NOT NULL)")!
+  db.exec("CREATE TABLE accounts (id " + id + ", name TEXT NOT NULL)")!
+  db.exec("CREATE TABLE members (id " + id + ", name TEXT NOT NULL, email TEXT NOT NULL, role TEXT NOT NULL, nickname TEXT, user_id " + int + " NOT NULL)")!
+  db.exec("CREATE TABLE users (id " + id + ", name TEXT NOT NULL, email TEXT NOT NULL, admin " + bool + ")")!
+  db.exec("CREATE TABLE posts (id " + id + ", title TEXT NOT NULL, body TEXT NOT NULL, published " + bool + ", comments_count " + int + " NOT NULL DEFAULT 0, user_id " + int + " NOT NULL)")!
+  db.exec("CREATE TABLE comments (id " + id + ", body TEXT NOT NULL, post_id " + int + " NOT NULL)")!
+  nil
+end
+
+def run_all : Nil | DBError | NotFound | Invalid
+  setup!
+
+  assert User.table_name == "users"
+  assert Post.table_name == "posts"
+  assert Comment.column_names == ["body", "post_id"]
+
+  # validation
+  case bad = User.create(name: "", email: "nope")
+  in Invalid
+    assert bad.errors.on("name") == ["can't be blank"]
+    assert bad.errors.size == 2
+  in User, DBError
+    assert false
+  end
+  assert User.count! == 0
+
+
+  ali = User.create(name: "Ali", email: "ali@example.com")!
+  assert ali.id == 1
+  assert ali.persisted?
+  ayse = User.create(name: "Ayse", email: "ayse@example.com", admin: true)!
+
+  # save answers a Bool and keeps the reasons on the record, as in Rails
+  draft = User.new(name: "", email: "x@example.com")
+  assert draft.errors.empty?                    # nothing has run yet
+  assert draft.save! == false
+  assert draft.errors.full_messages == ["name can't be blank"]
+  assert draft.new_record?
+  draft.name = "Draft"
+  assert draft.save!
+  assert draft.errors.empty?
+  assert draft.persisted?
+  draft.destroy!
+
+  p1 = Post.create(title: "One", body: "first", user_id: ali.id)!
+  p2 = Post.create(title: "Two", body: "second", user_id: ali.id, published: false)!
+  p3 = Post.create(title: "Three", body: "third", user_id: ayse.id)!
+  assert p1.published # the declared default is kept
+
+  # finders
+  assert Post.count! == 3
+  assert Post.find(p2.id)!.title == "Two"
+  case missing = Post.find(99_i64)
+  in NotFound      then assert missing.message == "Post not found"
+  in Post, DBError then assert false
+  end
+  assert Post.find?(99_i64)!.nil?
+  # ids and pages as a request sends them
+  assert Post.find(p2.id.to_s)!.title == "Two"
+  assert Post.find("abc").is_a?(NotFound)
+  assert Post.find?(" " + p3.id.to_s)!.as(Post).title == "Three"
+  assert Post.find?("x")!.nil?
+  assert Post.order(:id).paginate("2", per: 2).all!.map(&.id) == [p3.id]
+  assert Post.order(:id).paginate(nil, per: 2).all!.size == 2
+  assert Post.order(:id).paginate("nope", per: 2).all!.size == 2
+  assert Post.title("Three").first!.id == p3.id
+  assert Post.user_id(1).count! == 2             # an Int32 for an Int64 field
+  assert Post.new(user_id: 7).user_id == 7_i64
+  assert Post.where(published: true).count! == 2
+  assert Post.feed.all!.map(&.title) == ["Three", "One"]
+  assert Post.order(:title).all!.map(&.title) == ["One", "Three", "Two"]
+  assert Post.paginate(2, per: 2).order(:id).all!.map(&.id) == [p3.id]
+  assert Post.first!.id == p1.id
+
+  # from a form's fields: each converted to its type; id is never assigned
+  formed = Post.new({"title" => "Form", "body" => "b", "published" => "0", "user_id" => "2", "id" => "99", "nope" => "x"})
+  assert formed.title == "Form"
+  assert formed.published == false
+  assert formed.user_id == 2_i64
+  assert formed.new_record?
+  assert formed.save!
+  assert formed.id != 99_i64
+  # a value that does not convert is a validation error, and is not written
+  assert formed.update({"user_id" => "abc", "title" => "Changed"})! == false
+  assert formed.errors.on("user_id") == ["is not a number"]
+  assert Post.find(formed.id)!.title == "Form"
+  # the next assign starts over
+  assert formed.update({"user_id" => "1"})!
+  assert formed.errors.empty?
+  assert Post.find(formed.id)!.user_id == 1_i64
+  case made = User.create({"name" => "", "email" => "e@example.com"})
+  in Invalid       then assert made.errors.on("name") == ["can't be blank"]
+  in User, DBError then assert false
+  end
+  formed.destroy!
+
+  # relations
+  assert p1.user!.name == "Ali"
+  assert ali.posts.count! == 2
+  assert ali.posts.where(published: true).all!.size == 1
+  c = Comment.create(body: "nice", post_id: p1.id)!
+  assert c.post!.title == "One"
+  assert p1.comments.all!.size == 1
+
+  # update, increment, destroy
+  p1.title = "One (edited)"
+  assert p1.save!
+  assert Post.find(p1.id)!.title == "One (edited)"
+  assert p1.update(body: "first, edited", user_id: 2)!
+  reloaded = Post.find(p1.id)!
+  assert reloaded.body == "first, edited"
+  assert reloaded.user_id == 2_i64
+  assert reloaded.title == "One (edited)"       # untouched
+  ali.update(name: "")!
+  assert ali.errors.on("name") == ["can't be blank"]
+  assert User.find(ali.id)!.name == "Ali"       # not written
+  p1.increment(:comments_count)!
+  assert p1.comments_count == 1
+  assert Post.find(p1.id)!.comments_count == 1
+  p2.destroy!
+  assert Post.count! == 2
+  case gone = p2.destroy
+  in NotFound      then nil
+  in Post, DBError then assert false
+  end
+  assert Post.where(user_id: ali.id).delete_all! == 0
+  assert Post.where(user_id: 2).delete_all! == 2
+
+  # validates: every rule, with Rails' messages
+  bad = Member.new(name: "", email: "nope", role: "guest", nickname: "x")
+  assert !bad.valid?
+  assert bad.errors.on("name") == ["can't be blank"]
+  assert bad.errors.on("email") == ["is invalid"]
+  assert bad.errors.on("role") == ["must be admin or member"]
+  assert bad.errors.on("nickname") == ["is too short (minimum is 2 characters)"]
+  assert bad.errors.on("user_id") == ["can't be blank"]
+  long = Member.new(name: "abcdefghijk", email: "a@b.co", role: "admin", user_id: 1)
+  assert !long.valid?
+  assert long.errors.on("name") == ["is too long (maximum is 10 characters)"]
+  assert Member.new(name: "root", email: "r@b.co", role: "admin", user_id: 1).valid? == false   # validate still runs
+  CALLS.clear
+
+  # callbacks, in Rails' order; before_validation normalises before the checks
+  ayse = Member.new(name: "Ayse", email: "  AYSE@Example.COM ", role: "member", user_id: 1)
+  assert ayse.save!
+  assert ayse.email == "ayse@example.com"
+  assert CALLS == ["before_validation", "before_save", "before_create", "after_create", "after_save"]
+  CALLS.clear
+  ayse.update(role: "admin")!
+  assert CALLS == ["before_validation", "before_save", "before_update", "after_save"]
+
+  # uniqueness asks the database, and leaves the record itself out
+  twin = Member.new(name: "Twin", email: "Ayse@example.com", role: "member", user_id: 1)
+  assert !twin.save!
+  assert twin.errors.on("email") == ["has already been taken"]
+  assert ayse.valid?                              # its own row is not a clash
+  assert Member.new(name: "Okan", email: "okan@example.com", role: "member", nickname: nil, user_id: 1).save!   # nil nickname passes length
+  CALLS.clear
+  ayse.destroy!
+  assert CALLS == ["before_destroy", "after_destroy"]
+  assert Member.count! == 1
+
+  # transactions: commit
+  committed = Member.transaction do |tx|
+    Member.create(name: "Tx", email: "tx@example.com", role: "member", user_id: 1, on: tx)!
+    Member.on(tx).count!
+  end
+  assert committed == 2
+  assert Member.count! == 2
+
+  # the block's error rolls back and is answered
+  rolled = Member.transaction do |tx|
+    Member.create(name: "Gone", email: "gone@example.com", role: "member", user_id: 1, on: tx)!
+    NotFound.new("Member")
+  end
+  assert rolled.is_a?(NotFound)
+  assert Member.email("gone@example.com").count! == 0
+
+  # an invalid record inside: Invalid rolls back the rows before it
+  invalid = Member.transaction do |tx|
+    Member.create(name: "First", email: "first@example.com", role: "member", user_id: 1, on: tx)!
+    Member.create(name: "", email: "bad", role: "member", user_id: 1, on: tx)
+  end
+  assert invalid.is_a?(Invalid)
+  assert Member.email("first@example.com").count! == 0
+
+  # nested: a savepoint whose error rolls back only itself
+  outer = Member.transaction do |tx|
+    Member.create(name: "Outer", email: "outer@example.com", role: "member", user_id: 1, on: tx)!
+    inner = Member.transaction(on: tx) do |sp|
+      Member.create(name: "Inner", email: "inner@example.com", role: "member", user_id: 1, on: sp)!
+      NotFound.new("Member")
+    end
+    assert inner.is_a?(NotFound)
+    Member.on(tx).count!
+  end
+  assert outer == 3
+  assert Member.email("outer@example.com").count! == 1
+  assert Member.email("inner@example.com").count! == 0
+
+  # a callback writes in the save's transaction through current_transaction
+  case made = Account.transaction { |tx| Account.create(name: "Main", on: tx) }
+  in Account then assert Like.comment_id(made.id).count! == 1
+  in Invalid, DBError, Nil then assert false
+  end
+
+  # dependent: destroy goes down the tree, callbacks and all
+  Like.delete_all!
+  Comment.delete_all!
+  host = Post.create(title: "Host", body: "b", user_id: 9)!
+  c1 = Comment.create(body: "a", post_id: host.id)!
+  c2 = Comment.create(body: "b", post_id: host.id)!
+  Like.create(comment_id: c1.id)!
+  Like.create(comment_id: c1.id)!
+  Like.create(comment_id: c2.id)!
+  keep = Comment.create(body: "other", post_id: host.id + 1000)!
+  CALLS.clear
+  host.destroy!
+  assert Comment.post_id(host.id).count! == 0
+  assert Like.count! == 0                         # delete_all under each comment
+  assert CALLS == ["comment destroyed", "comment destroyed"]
+  assert Comment.find(keep.id)!.body == "other"   # another post's comment stays
+
+  # has_secure_password
+  nopass = Person.new(email_address: "p@example.com")
+  assert !nopass.valid?
+  assert nopass.errors.on("password") == ["can't be blank"]
+  short = Person.new(email_address: "p@example.com", password: "short")
+  assert !short.valid?
+  assert short.errors.on("password") == ["is too short (minimum is 8 characters)"]
+  mismatch = Person.new(email_address: "p@example.com", password: "long enough", password_confirmation: "different")
+  assert !mismatch.valid?
+  assert mismatch.errors.on("password_confirmation") == ["doesn't match Password"]
+  huge = Person.new(email_address: "p@example.com", password: "x" * 73)
+  assert !huge.valid?
+  assert huge.errors.on("password").includes?("is too long (maximum is 72 bytes)")
+
+  pat = Person.create(email_address: "pat@example.com", password: "correct horse", password_confirmation: "correct horse")!
+  assert pat.password_digest.starts_with?("$2b$")
+  assert !pat.password_digest.includes?("correct horse")
+  assert pat.password.nil?                        # not kept once saved
+  assert pat.authenticate("correct horse")
+  assert !pat.authenticate("wrong horse")
+  case found = Person.authenticate_by("email_address", "pat@example.com", "correct horse")
+  in Person then assert found.id == pat.id
+  in Nil, DBError then assert false
+  end
+  assert Person.authenticate_by("email_address", "pat@example.com", "wrong horse")!.nil?
+  assert Person.authenticate_by("email_address", "nobody@example.com", "correct horse")!.nil?
+
+  # an edit form's empty password keeps the old one; a new one replaces it
+  digest = pat.password_digest
+  pat.update({"email_address" => "pat@example.com", "password" => "", "password_confirmation" => ""})!
+  assert pat.errors.empty?
+  assert Person.find(pat.id)!.password_digest == digest
+  pat.update(password: "battery staple", password_confirmation: "battery staple")!
+  assert Person.find(pat.id)!.authenticate("battery staple")
+  assert !Person.find(pat.id)!.authenticate("correct horse")
+  from_form = Person.new({"email_address" => "form@example.com", "password" => "from a form", "password_confirmation" => "from a form"})
+  assert from_form.save!
+  assert from_form.authenticate("from a form")
+
+  # includes: associations load with the rows, one query each
+  Comment.delete_all!
+  Post.delete_all!
+  User.delete_all!
+  ada = User.create(name: "Ada", email: "ada@example.com", admin: false)!
+  bob = User.create(name: "Bob", email: "bob@example.com", admin: false)!
+  first = Post.create(title: "First", body: "b", comments_count: 0, user_id: ada.id)!
+  Post.create(title: "Second", body: "b", comments_count: 0, user_id: ada.id)!
+  Post.create(title: "Third", body: "b", comments_count: 0, user_id: bob.id)!
+  Comment.create(body: "one", post_id: first.id)!
+  Comment.create(body: "two", post_id: first.id)!
+
+  posts = Post.includes(:user, :comments).order(:id).all!
+  assert posts.map(&.title) == ["First", "Second", "Third"]
+  # what was loaded answers without asking: rows changed since stay as loaded
+  User.find(ada.id)!.update(name: "Changed")!
+  Comment.delete_all!
+  assert posts[0].user!.name == "Ada"
+  second_user = posts[1].user?!
+  assert (second_user ? second_user.name : "") == "Ada"
+  assert posts[2].user!.name == "Bob"
+  assert posts[0].comments.all!.map(&.body) == ["one", "two"]
+  assert posts[0].comments.count! == 2
+  assert posts[0].comments.first!.body == "one"
+  assert posts[1].comments.all!.empty?
+  # narrowing a loaded has_many asks the database again
+  assert posts[0].comments.where(body: "one").count! == 0
+  # without includes, each access asks
+  assert Post.find(first.id)!.user!.name == "Changed"
+
+  users = User.includes(:posts).order(:id).all!
+  assert users[0].posts.count! == 2
+  assert users[1].posts.all!.map(&.title) == ["Third"]
+  # a missing parent is nil, an empty list of ids asks nothing
+  orphan = Post.create(title: "Orphan", body: "b", comments_count: 0, user_id: 999999)!
+  assert Post.includes(:user).where(id: orphan.id).first!.user?!.nil?
+  assert Post.includes(:user).where(id: -1).all!.empty?
+  case bad = Post.includes(:nothing).all
+  in DBError then assert bad.message.to_s.includes?("no association nothing")
+  in Array(Post) then assert false
+  end
+  # has_one
+  Pin.create(post_id: first.id)!
+  pinned = Post.includes(:pin).order(:id).all!
+  assert pinned[0].pin!.post_id == first.id
+  assert pinned[1].pin?!.nil?
+  # both dependents of a post go with it
+  Comment.create(body: "three", post_id: first.id)!
+  first.destroy!
+  assert Pin.count! == 0
+  assert Comment.count! == 0
+  # in a transaction, the preload queries run in it too
+  Post.transaction do |tx|
+    inside = Post.on(tx).includes(:user).order(:id).all!
+    assert inside[0].user!.name == "Changed"
+    nil
+  end!
+
+  # find_or_create_by: the first match, or a new one; the block only for a new one
+  made = User.find_or_create_by(email: "eve@example.com") { |u| u.name = "Eve" }!
+  again = User.find_or_create_by(email: "eve@example.com") { |u| u.name = "Not Eve" }!
+  assert again.id == made.id
+  assert again.name == "Eve"
+  assert User.email("eve@example.com").count! == 1
+  plain = User.find_or_create_by(name: "Zed", email: "zed@example.com", admin: false)!
+  assert User.find_or_create_by(name: "Zed", email: "zed@example.com", admin: false)!.id == plain.id
+  case invalid = User.find_or_create_by(email: "no-at-sign") { |u| u.name = "X" }
+  in Invalid then assert invalid.errors.on("email") == ["is invalid"]
+  in User, DBError then assert false
+  end
+
+  puts "model: all assertions passed" + (postgres? ? " (postgres)" : " (sqlite)")
+  nil
+end
+
+case result = run_all
+in Nil then nil
+in DBError, NotFound, Invalid
+  STDERR.puts "FAILED: " + result.message
+  exit 1
+end
