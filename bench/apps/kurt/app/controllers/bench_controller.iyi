@@ -1,0 +1,112 @@
+import std/json::{serializable}
+# The benchmark's endpoints. bench/apps/rails has the same six, answering
+# the same bodies; bench/check.sh compares them before any load runs.
+struct CommentJSON
+  getter id : Int64
+  getter author : String
+  getter body : String
+  derive serializable
+
+  def initialize(@id : Int64, @author : String, @body : String)
+  end
+end
+
+struct PostJSON
+  getter id : Int64
+  getter user_id : Int64
+  getter title : String
+  getter body : String
+  getter published : Bool
+  derive serializable
+
+  def initialize(@id : Int64, @user_id : Int64, @title : String, @body : String, @published : Bool)
+  end
+end
+
+struct FeedPostJSON
+  getter id : Int64
+  getter title : String
+  getter comments : Array(CommentJSON)
+  derive serializable
+
+  def initialize(@id : Int64, @title : String, @comments : Array(CommentJSON))
+  end
+end
+
+struct MessageJSON
+  getter message : String
+  derive serializable
+
+  def initialize(@message : String)
+  end
+end
+
+struct CreatedJSON
+  getter id : Int64
+  getter title : String
+  derive serializable
+
+  def initialize(@id : Int64, @title : String)
+  end
+end
+
+class BenchController < ApplicationController
+  # GET /bench/plaintext
+  def plaintext
+    env.text("Hello, World!")
+  end
+
+  # GET /bench/json
+  def json_hello
+    json(MessageJSON.new("Hello, World!"))
+  end
+
+  # GET /bench/posts/:id - one row by primary key
+  def show
+    post = Post.find(params[:id])!
+    json(PostJSON.new(post.id, post.user_id, post.title, post.body, post.published))
+  end
+
+  # GET /bench/feed - 20 posts and their comments, two queries
+  def feed
+    posts = Post.where(published: true).order_desc(:id).limit(20).includes(:comments).all!
+    items = [] of FeedPostJSON
+    posts.each do |post|
+      comments = post.comments.all!.map { |c| CommentJSON.new(c.id, c.author, c.body) }
+      items << FeedPostJSON.new(post.id, post.title, comments)
+    end
+    json(items)
+  end
+
+  # GET /bench/posts/:id/page - layout, view, a partial per comment
+  def page
+    @post = Post.find(params[:id])!
+    @comments = @post.comments.order(:id).all!
+    render "bench/page"
+  end
+
+  # POST /bench/posts - strong params, validation, a transaction of two rows
+  def create
+    attrs = params.require(:post).permit(:title, :body, :user_id)
+    result = Post.transaction do |tx|
+      post = Post.create(attrs, on: tx)!
+      Comment.create(on: tx, post_id: post.id, author: "bench", body: "first")!
+      post
+    end
+    case result
+    when Post
+      status(201)
+      json(CreatedJSON.new(result.id, result.title))
+    when Invalid
+      status(422)
+      json(MessageJSON.new("invalid"))
+    else
+      result!
+    end
+  end
+
+  # GET /bench/csrf - the session cookie and token the POST scenario sends
+  def csrf
+    env.text(csrf_token)
+  end
+end

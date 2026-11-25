@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title><%= yield_content "title" %> · Kurt</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/">Kurt</a>
+    <nav></nav>
+  </header>
+  <main class="container">
+    <% if notice = flash?("notice") %><p class="flash notice"><%= notice %></p><% end %>
+    <% if alert = flash?("alert") %><p class="flash alert"><%= alert %></p><% end %>
+    <%= content %>
+  </main>
+  <%= raw(live_reload_tag) %>
+</body>
+</html>

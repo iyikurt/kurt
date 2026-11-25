@@ -656,7 +656,7 @@ bir şey dönerse çalışır: `Unauthorized.new unless session["user_id"]?`.
 
 ## Planla karşılaştırma
 
-[Plan](plan.pdf) Faz 0 ile başlıyor; sonuçlar:
+Geliştirme planı Faz 0 ile başlıyordu; sonuçlar:
 
 - **Kapı 1, derive ilişkileri kurabiliyor mu: hayır.** Bir derive'a tipin
   adı ve alanlarının ad/tip bilgisi verilir, annotation verilmez
@@ -668,7 +668,7 @@ bir şey dönerse çalışır: `Unauthorized.new unless session["user_id"]?`.
   ve PostgreSQL 16'da aynen geçiyor (`make test`, `make test-pg`).
 - **Kapı 3, boş dizinden new ve migrate: geçti.**
 - **Kapı 4, scaffold'la blog (kullanıcı, yazı, yorum): geçti.**
-  [`examples/blog`](examples/blog) üç scaffold komutuyla üretildi; testleri
+  Örnek blog üç scaffold komutuyla üretildi; testleri
   geçiyor ve tarayıcıda oluştur, düzenle, sil, 422, 404 ve CSRF
   denendi.
 

@@ -1,0 +1,12 @@
+# Columns of comments (db/schema.json, kept up to date by `kurt db:migrate`):
+#   id          Int64
+#   post_id     Int64
+#   author      String
+#   body        String
+#   created_at  Time
+#   updated_at  Time
+class Comment < ApplicationRecord
+  belongs_to post : Post
+
+  validates :post_id, :author, presence: true
+end

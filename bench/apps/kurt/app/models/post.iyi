@@ -1,0 +1,15 @@
+# Columns of posts (db/schema.json, kept up to date by `kurt db:migrate`):
+#   id          Int64
+#   user_id     Int64
+#   title       String
+#   body        String
+#   published   Bool
+#   created_at  Time
+#   updated_at  Time
+class Post < ApplicationRecord
+  belongs_to user : User
+  has_many comments : Comment
+
+  validates :user_id, :title, presence: true
+  validates :title, length: {maximum: 120}
+end

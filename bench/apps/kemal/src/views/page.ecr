@@ -1,0 +1,8 @@
+<article>
+  <h1><%= h(post.title) %></h1>
+  <p><%= h(post.body) %></p>
+  <h2><%= comments.size %> comments</h2>
+  <ul>
+    <% comments.each do |comment| %><%= render "src/views/_comment.ecr" %><% end %>
+  </ul>
+</article>

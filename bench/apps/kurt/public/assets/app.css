@@ -1,0 +1,36 @@
+/* The application's styles. Plain CSS, no build step: edit freely. */
+:root {
+  --fg: #1f2328; --muted: #59636e; --line: #d1d9e0; --bg: #ffffff; --soft: #f6f8fa;
+  --accent: #0969da; --danger: #cf222e; --ok: #1a7f37; --radius: 6px;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--fg); background: var(--bg);
+}
+* { box-sizing: border-box; }
+body { margin: 0; line-height: 1.5; }
+a { color: var(--accent); }
+.topbar { display: flex; gap: 1.5rem; align-items: center; padding: .75rem 1.5rem; border-bottom: 1px solid var(--line); }
+.topbar nav { display: flex; gap: 1rem; }
+.brand { font-weight: 700; color: var(--fg); text-decoration: none; }
+.container { max-width: 56rem; margin: 2rem auto; padding: 0 1.5rem; }
+.page-header { display: flex; justify-content: space-between; align-items: center; gap: 1rem; }
+.button { display: inline-block; padding: .45rem .9rem; border: 1px solid var(--accent); border-radius: var(--radius);
+          background: var(--accent); color: #fff; text-decoration: none; font: inherit; cursor: pointer; }
+.link { background: none; border: 0; padding: 0; font: inherit; color: var(--accent); cursor: pointer; }
+.danger { color: var(--danger); }
+.inline { display: inline; }
+.table { width: 100%; border-collapse: collapse; }
+.table th, .table td { text-align: left; padding: .5rem; border-bottom: 1px solid var(--line); }
+.row-actions { white-space: nowrap; display: flex; gap: .75rem; justify-content: flex-end; }
+.form .field { display: flex; flex-direction: column; gap: .25rem; margin-bottom: 1rem; }
+.form input[type=text], .form input[type=number], .form input[type=datetime-local], .form textarea, .form select {
+  font: inherit; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--radius); }
+.form .check { flex-direction: row; align-items: center; gap: .5rem; display: flex; }
+.field-error input, .field-error textarea, .field-error select { border-color: var(--danger); }
+.errors { border: 1px solid var(--danger); background: #ffebe9; border-radius: var(--radius); padding: .5rem 1rem; margin-bottom: 1rem; }
+.flash { padding: .5rem 1rem; border-radius: var(--radius); }
+.flash.notice { background: #dafbe1; color: var(--ok); }
+.flash.alert { background: #ffebe9; color: var(--danger); }
+.details dt { font-weight: 600; margin-top: .75rem; }
+.details dd { margin: 0; }
+.prose { white-space: pre-wrap; }
+.empty { color: var(--muted); }
+.hero pre { background: var(--soft); padding: 1rem; border-radius: var(--radius); overflow-x: auto; }

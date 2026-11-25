@@ -1,0 +1,9 @@
+<% content_for "title" do %>Kurt<% end -%>
+<section class="hero">
+  <img src="/icon.svg" alt="Kurt" width="96" height="109">
+  <h1>Kurt is running</h1>
+  <p>A Kurt application on iyi. Next:</p>
+  <pre><code>kurt generate scaffold Post title:string body:text published:bool
+kurt db:migrate</code></pre>
+  <p>then open <a href="/posts">/posts</a>. This page is <code>app/views/home/index.eiy</code>.</p>
+</section>

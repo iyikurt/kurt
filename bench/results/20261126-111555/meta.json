@@ -1,0 +1,37 @@
+{
+  "options": {
+    "command": "run",
+    "dir": null,
+    "frameworks": "kurt,rails,kemal",
+    "scenarios": "",
+    "workers": 4,
+    "threads": 3,
+    "connections": 64,
+    "duration": 10,
+    "warmup": 5,
+    "runs": 3,
+    "rate": 0
+  },
+  "machine": "Apple M2 Pro, 12 \u00e7ekirdek, 16 GB, darwin",
+  "git": "98a5b4f+de\u011fi\u015fiklik",
+  "frameworks": {
+    "kurt": {
+      "startup_s": 0.06947741699999999,
+      "idle_rss_kb": 11216,
+      "artifact": "bin/kurt 5.3 MB (tek dosya)",
+      "version": "Kurt (checkout), iyi 0.22.0"
+    },
+    "rails": {
+      "startup_s": 0.9336820830000001,
+      "idle_rss_kb": 222768,
+      "artifact": "uygulama + Ruby + gem'ler",
+      "version": "Rails 8.1.4.1, Ruby 4.0.7 + YJIT"
+    },
+    "kemal": {
+      "startup_s": 0.058787459000000375,
+      "idle_rss_kb": 6880,
+      "artifact": "bin/bench 2.4 MB (tek dosya)",
+      "version": "Kemal 1.15.0, Crystal 1.22.3"
+    }
+  }
+}

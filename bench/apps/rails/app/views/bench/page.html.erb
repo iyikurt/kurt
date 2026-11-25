@@ -1,0 +1,9 @@
+<% content_for :title, @post.title %>
+<article>
+  <h1><%= @post.title %></h1>
+  <p><%= @post.body %></p>
+  <h2><%= @comments.size %> comments</h2>
+  <ul>
+    <%= render partial: "comment", collection: @comments %>
+  </ul>
+</article>

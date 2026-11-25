@@ -1,0 +1,11 @@
+# Columns of users (db/schema.json, kept up to date by `kurt db:migrate`):
+#   id          Int64
+#   name        String
+#   email       String
+#   created_at  Time
+#   updated_at  Time
+class User < ApplicationRecord
+  has_many posts : Post
+
+  validates :name, :email, presence: true
+end

@@ -1,0 +1,20 @@
+# Every route of the application.
+#
+#   resources "posts", PostsController       the REST routes of a resource
+#   get "/about", PagesController, :about    one route (post, put, patch, delete too)
+#   resources "posts", PostsController do    nested: /posts/:post_id/comments
+#     resources "comments", CommentsController
+#   end
+#   namespace "admin" do ... end             routes under /admin
+#
+# `kurt routes` lists them all.
+
+root HomeController, :index
+
+get "/bench/plaintext", BenchController, :plaintext
+get "/bench/json", BenchController, :json_hello
+get "/bench/feed", BenchController, :feed
+get "/bench/csrf", BenchController, :csrf
+get "/bench/posts/:id", BenchController, :show
+get "/bench/posts/:id/page", BenchController, :page
+post "/bench/posts", BenchController, :create

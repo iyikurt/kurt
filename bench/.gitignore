@@ -1,0 +1,2 @@
+# Server logs of a run are large; summary.md, meta.json and oha's JSON stay.
+results/*/*.log

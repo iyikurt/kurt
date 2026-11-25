@@ -1,0 +1,26 @@
+{
+  "comments": [
+    {"name": "id", "sql": "bigint", "type": "Int64"},
+    {"name": "post_id", "sql": "bigint", "type": "Int64"},
+    {"name": "author", "sql": "character varying", "type": "String"},
+    {"name": "body", "sql": "text", "type": "String"},
+    {"name": "created_at", "sql": "timestamp with time zone", "type": "Time"},
+    {"name": "updated_at", "sql": "timestamp with time zone", "type": "Time"}
+  ],
+  "posts": [
+    {"name": "id", "sql": "bigint", "type": "Int64"},
+    {"name": "user_id", "sql": "bigint", "type": "Int64"},
+    {"name": "title", "sql": "character varying", "type": "String"},
+    {"name": "body", "sql": "text", "type": "String"},
+    {"name": "published", "sql": "boolean", "type": "Bool"},
+    {"name": "created_at", "sql": "timestamp with time zone", "type": "Time"},
+    {"name": "updated_at", "sql": "timestamp with time zone", "type": "Time"}
+  ],
+  "users": [
+    {"name": "id", "sql": "bigint", "type": "Int64"},
+    {"name": "name", "sql": "character varying", "type": "String"},
+    {"name": "email", "sql": "character varying", "type": "String"},
+    {"name": "created_at", "sql": "timestamp with time zone", "type": "Time"},
+    {"name": "updated_at", "sql": "timestamp with time zone", "type": "Time"}
+  ]
+}

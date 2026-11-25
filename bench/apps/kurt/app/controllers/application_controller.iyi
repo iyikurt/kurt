@@ -1,0 +1,10 @@
+# The parent of every controller: filters and helpers the whole
+# application shares.
+#
+#   before_action :require_login, except: [:index, :show]
+#
+#   def require_login
+#     Unauthorized.new unless session["user_id"]?
+#   end
+class ApplicationController < Controller
+end
