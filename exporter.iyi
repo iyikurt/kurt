@@ -1,0 +1,76 @@
+# What `kurt export` needs to know about paths and pages, apart from
+# running the application: which routes it can fetch, where each page goes
+# on disk, and which local links a page leads to.
+#
+#   /            dist/index.html
+#   /guide       dist/guide/index.html     (served as /guide by static hosts)
+#   /llms.txt    dist/llms.txt
+module exporter
+
+import std/text
+
+# A path `kurt export` can fetch on its own: local, with no parameter
+# (`/posts/:id` needs a value), and not the health check or `kurt dev`'s
+# reload stream.
+pub def exportable?(path : String) : Bool
+  return false unless path.starts_with?("/")
+  return false if path.starts_with?("//")
+  return false if path.includes?(":") || path.includes?("*")
+  return false if path == "/up" || path.starts_with?("/__kurt/")
+  true
+end
+
+# The GET paths in `routes_table`'s output that `exportable?` allows, in
+# their order, each once.
+pub def get_paths(table : String) : Array(String)
+  paths = [] of String
+  table.lines.each do |line|
+    words = line.strip.split(" ").reject { |word| word.empty? }
+    next unless words.size >= 2 && words[0] == "GET"
+    path = words[1]
+    paths << path if exportable?(path) && !paths.includes?(path)
+  end
+  paths
+end
+
+# Where the page at *path* is written, relative to the export directory. A
+# path whose last part has an extension keeps it; any other becomes a
+# directory with an index.html, which static hosts serve at the same URL.
+pub def output_file(path : String) : String
+  trimmed = path
+  while trimmed.starts_with?("/")
+    trimmed = trimmed[1, trimmed.size - 1]
+  end
+  while trimmed.ends_with?("/")
+    trimmed = trimmed[0, trimmed.size - 1]
+  end
+  return "index.html" if trimmed.empty?
+  last = trimmed.split("/").last
+  last.includes?(".") ? trimmed : trimmed + "/index.html"
+end
+
+# The local paths a page links to through `href` and `src`, without their
+# `#fragment` and `?query`, each once. Other sites (`https://...`, `//...`)
+# and `mailto:` are left out.
+pub def local_links(html : String) : Array(String)
+  found = [] of String
+  ["href=\"", "src=\"", "href='", "src='"].each do |marker|
+    quote = marker[marker.size - 1, 1]
+    from = 0
+    while start = html.index(marker, from)
+      value_start = start + marker.size
+      finish = html.index(quote, value_start)
+      break if finish.nil?
+      from = finish + 1
+      link = html[value_start, finish - value_start]
+      if cut = link.index('#')
+        link = link[0, cut]
+      end
+      if cut = link.index('?')
+        link = link[0, cut]
+      end
+      found << link if exportable?(link) && !found.includes?(link)
+    end
+  end
+  found
+end

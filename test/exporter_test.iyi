@@ -1,0 +1,42 @@
+module test/exporter_test
+
+import std/text
+import exporter::*
+
+assert exportable?("/")
+assert exportable?("/guide")
+assert !exportable?("/posts/:id")
+assert !exportable?("/up")
+assert !exportable?("/__kurt/live")
+assert !exportable?("//cdn.example.com/x.js")
+assert !exportable?("https://iyi.dev")
+assert !exportable?("mailto:ada@example.com")
+assert !exportable?("guide")
+
+table = <<-TXT
+  Verb    Path            Controller#Action
+  GET     /               HomeController#index
+  GET     /guide          HomeController#guide
+  POST    /posts          PostsController#create
+  GET     /posts/:id      PostsController#show
+  GET     /up
+  GET     /guide          HomeController#guide
+TXT
+assert get_paths(table) == ["/", "/guide"]
+assert get_paths("No routes: config/routes.iyi adds them.\n").empty?
+
+assert output_file("/") == "index.html"
+assert output_file("/guide") == "guide/index.html"
+assert output_file("/guide/") == "guide/index.html"
+assert output_file("/tr/models") == "tr/models/index.html"
+assert output_file("/llms.txt") == "llms.txt"
+assert output_file("/feeds/posts.xml") == "feeds/posts.xml"
+
+html = <<-HTML
+<link rel="icon" href="/icon.svg">
+<a href="/guide">Guide</a> <a href="/guide#install">Install</a>
+<a href='/tr'>Türkçe</a> <a href="/posts?page=2">More</a>
+<a href="https://iyi.dev">iyi</a> <a href="mailto:ada@example.com">Mail</a>
+<script src="/assets/app.js"></script> <a href="#top">Top</a>
+HTML
+assert local_links(html) == ["/icon.svg", "/guide", "/posts", "/assets/app.js", "/tr"]

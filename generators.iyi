@@ -1152,7 +1152,7 @@ end
 # With Tailwind, public/assets/app.css is built from app/assets/tailwind/app.css
 # (`kurt dev` and `kurt build` build it), so it stays out of git.
 pub def gitignore(daisy : Bool = false) : String
-  "/.kurt/\n/db/*.sqlite3\n/db/*.sqlite3-*\n/bin/\n/lib/\n.env\n" + (daisy ? "/public/assets/app.css\n" : "")
+  "/.kurt/\n/db/*.sqlite3\n/db/*.sqlite3-*\n/bin/\n/lib/\n/dist/\n.env\n" + (daisy ? "/public/assets/app.css\n" : "")
 end
 
 # A test of a scaffold, through the routes, without a socket. `kurt test`
@@ -1249,6 +1249,9 @@ pub def agents_md(app : String) : String
     `KURT_ENV=production DATABASE_URL=... SESSION_SECRET=... ./bin/#{app} db:migrate`, then
     `./bin/#{app} -p 8080`. Production refuses to start without a SESSION_SECRET of 32+ bytes;
     GET /up is the health check.
+  - `kurt export [-o DIR] [PATH...]`: the application as static files in dist/ (or DIR): every
+    GET route without parameters, the local pages they link to, each PATH, and public/. For a
+    site with no server: GitHub Pages, Netlify, any web server.
 
   Field types: string, text, int, float, bool, time, references.
 

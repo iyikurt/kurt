@@ -13,7 +13,7 @@ import std/text
 import std/dir::{Dir}
 import std/time::{Time}
 import std/random::{Random}
-import std/process::{Process, ProcessResult, ProcessError, ChildProcess}
+import std/process::{Process, ProcessResult, ProcessError, ChildProcess, Redirect}
 import std/file
 import std/signal::{Signal}
 import std/regex::{Regex}
@@ -29,12 +29,13 @@ import generators::*
 import autoload::*
 import schema::{Table, introspect, to_json, parse, find}
 import fixtures::{FixtureSet, read_fixture_sets}
+import exporter::{get_paths, output_file, local_links}
 import inflector::{pluralize}
 
 VERSION = "0.1.0"
 
 USAGE = <<-TEXT
-kurt #{VERSION}: a Rails-like framework for iyi
+kurt #{VERSION}: an MVC web framework for iyi
 
 Usage:
   kurt new NAME [--css none]             a new application in ./NAME, with Tailwind CSS
@@ -54,6 +55,9 @@ Usage:
   kurt test                              run every test/*_test.iyi on a fresh test database,
                                          with test/fixtures/*.yml loaded
   kurt build                             a release binary in bin/NAME
+  kurt export [-o DIR] [PATH...]         the application as static files in DIR (dist):
+                                         every GET page without parameters, the pages
+                                         they link to, each PATH, and public/
   kurt css:build [--minify]              compile app/assets/tailwind/app.css
   kurt css:install                       download the Tailwind CLI and daisyUI
   kurt version
@@ -1019,6 +1023,138 @@ def cmd_test(args : Array(String)) : Nil
 end
 
 # ---------------------------------------------------------------------------
+# export: the application as static files
+# ---------------------------------------------------------------------------
+
+# The file `kurt export` leaves in its directory, so that a later export
+# may empty that directory and no other.
+EXPORT_MARK = ".kurt-export"
+
+# Runs a tool and says whether it succeeded.
+def run_tool(command : String, args : Array(String)) : Bool
+  case result = Process.run(command, args)
+  in ProcessResult
+    STDERR.puts "kurt: " + command + " failed: " + result.stderr.strip unless result.success?
+    result.success?
+  in ProcessError
+    STDERR.puts "kurt: could not run " + command + ": " + result.message
+    false
+  in Cancelled
+    false
+  end
+end
+
+# Fetches *url* into *path* with curl: the status code ("000" when nothing
+# answered) and the content type.
+def fetch_page(url : String, path : String) : Tuple(String, String)
+  case result = Process.run("curl", ["-s", "-o", path, "-w", "%{http_code} %{content_type}", url])
+  in ProcessResult
+    words = result.stdout.strip.split(" ")
+    {words[0]? || "000", words[1]? || ""}
+  in ProcessError
+    fail("could not run curl: " + result.message)
+  in Cancelled
+    {"000", ""}
+  end
+end
+
+# Builds the application, runs it on a local port, and writes what it
+# serves to *dir*: every GET route without parameters, the local pages
+# those link to, the paths given, and public/. A static host (GitHub Pages,
+# Netlify, any web server) then serves *dir* as the site.
+def cmd_export(args : Array(String)) : Nil
+  name = require_app
+  dir = "dist"
+  extra = [] of String
+  i = 0
+  while i < args.size
+    arg = args[i]
+    if arg == "-o" || arg == "--output"
+      dir = args[i + 1]? || fail("-o needs a directory")
+      i += 2
+    elsif arg.starts_with?("/")
+      extra << arg
+      i += 1
+    else
+      fail("kurt export [-o DIR] [PATH...]: a PATH starts with / (" + arg + ")")
+    end
+  end
+  if Dir.exists?(dir) && !Dir.children(dir).empty? && !File.exists?(dir + "/" + EXPORT_MARK)
+    fail(dir + " is not empty and kurt export did not write it; name another directory")
+  end
+  fail("the CSS did not build") unless build_css(minify: true)
+  binary = ".kurt/bin/" + name + "-export"
+  fail("the application does not build") unless compile(name, binary)
+
+  routes = case listed = Process.run(binary, [] of String, env: {"KURT_PRINT_ROUTES" => "1"})
+           in ProcessResult then listed.stdout
+           in ProcessError  then fail("could not run " + binary + ": " + listed.message)
+           in Cancelled     then ""
+           end
+
+  run_tool("rm", ["-rf", dir]) if Dir.exists?(dir)
+  Dir.mkdir_p(dir)
+  File.write(dir + "/" + EXPORT_MARK, "Written by kurt export; the next export empties this directory.\n")
+  if Dir.exists?("public")
+    fail("could not copy public/") unless run_tool("cp", ["-R", "public/.", dir + "/"])
+  end
+
+  port = 20000 + Random.rand(20000)
+  base = "http://127.0.0.1:" + port.to_s
+  server = case started = Process.spawn(binary, ["-b", "127.0.0.1", "-p", port.to_s], output: Redirect::Null, error: Redirect::Null)
+           in ChildProcess then started
+           in ProcessError then fail("could not start " + binary + ": " + started.message)
+           end
+  up = false
+  100.times do
+    break if up
+    up = fetch_page(base + "/", "/dev/null")[0] != "000"
+    sleep(100) unless up
+  end
+  unless up
+    stop_server(server)
+    fail("the application did not start on " + base + " (try `kurt dev` to see why)")
+  end
+
+  queue = get_paths(routes)
+  extra.each { |path| queue << path unless queue.includes?(path) }
+  seen = queue.dup
+  part = dir + "/" + EXPORT_MARK + ".part"
+  pages = 0
+  skipped = 0
+  i = 0
+  while i < queue.size
+    path = queue[i]
+    i += 1
+    status, type = fetch_page(base + path, part)
+    unless status == "200"
+      say("skip", path + " (" + status + ")")
+      skipped += 1
+      next
+    end
+    file = dir + "/" + output_file(path)
+    Dir.mkdir_p(File.dirname(file)) unless Dir.exists?(File.dirname(file))
+    File.rename(part, file)
+    say("export", file)
+    pages += 1
+    next unless type.starts_with?("text/html")
+    local_links(File.read(file)).each do |link|
+      next if seen.includes?(link)
+      seen << link
+      # public/ is copied as it is.
+      next if File.file?("public" + link)
+      queue << link
+    end
+  end
+  File.delete(part) if File.exists?(part)
+  stop_server(server)
+  File.delete(binary) if File.exists?(binary)
+  File.delete(binary + ".dwarf") if File.exists?(binary + ".dwarf")
+  puts "kurt: " + pages.to_s + " pages in " + dir + "/" + (skipped > 0 ? ", " + skipped.to_s + " skipped" : "") +
+       (Dir.exists?("public") ? ", with public/" : "")
+end
+
+# ---------------------------------------------------------------------------
 
 args = Program.args
 command = args.empty? ? "help" : args[0]
@@ -1035,6 +1171,7 @@ when "db:seed"                   then cmd_seed
 when "dev", "server", "s"        then cmd_dev(rest)
 when "test"                      then cmd_test(rest)
 when "build"                     then cmd_build(rest)
+when "export"                    then cmd_export(rest)
 when "css:install", "css:build"  then cmd_css(command, rest)
 when "routes"                    then cmd_routes
 when "version", "--version", "-v" then puts "kurt " + VERSION
