@@ -41,6 +41,7 @@ import strong_parameters::{Parameters}
 import std/html::{HTML}
 import web/iyi_web/templates::{SafeHTML}
 import helpers::{attributes_html}
+import json_writer
 
 pub import web/iyi_web/context
 pub import web/iyi_web/templates
@@ -154,9 +155,10 @@ pub class Controller
     accept.includes?("application/json") || type.includes?("application/json") || @env.request.path.ends_with?(".json")
   end
 
-  # Writes *data* as JSON.
+  # Writes *data* as JSON: the text `JSON.to_json` writes, built without
+  # its per-key bookkeeping (json_writer.iyi).
   def json(data : T) : Nil forall T
-    @env.json(data)
+    @env.json(::Kurt::JsonWriter.generate(data))
     nil
   end
 

@@ -1,0 +1,65 @@
+module test/json_writer_test
+
+import std/json::{JSON, serializable}
+import json_writer::{generate}
+
+# Every value below is written by `generate` as `JSON.to_json` writes it,
+# byte for byte: the FastBuilder only skips the duplicate-key bookkeeping.
+
+pub struct Point
+  getter x : Int32
+  getter y : Float64
+  derive serializable
+
+  def initialize(@x : Int32, @y : Float64)
+  end
+end
+
+pub struct Tagged
+  @[JSON::Field(key: "label")]
+  getter name : String
+  @[JSON::Field(ignore: true)]
+  getter secret : String
+  getter note : String?
+  @[JSON::Field(emit_null: false)]
+  getter hidden : String?
+  getter points : Array(Point)
+  getter scores : Hash(String, Int64)
+  derive serializable
+
+  def initialize(@name : String, @secret : String, @note : String?, @hidden : String?,
+                 @points : Array(Point), @scores : Hash(String, Int64))
+  end
+end
+
+def same(value : T) : Nil forall T
+  expected = JSON.to_json(value)
+  got = generate(value)
+  unless got == expected
+    STDERR.puts "expected: " + expected
+    STDERR.puts "got:      " + got
+  end
+  assert got == expected
+end
+
+same("Hello, World!")
+same("quotes \" backslash \\ newline \n tab \t bell \u0007 del \u007f")
+same("ünïcödé ğüşıöç — 日本語 😀")
+same(42)
+same(-7_i64)
+same(3.25)
+same(1.0e21)
+same(true)
+same(nil.as(String?))
+same([1, 2, 3])
+same([] of Int32)
+same({"b" => 2, "a" => 1})
+same(Point.new(1, 2.5))
+same([Point.new(1, 2.5), Point.new(-3, 0.1)])
+same(Tagged.new("a <b> & \"c\"", "s3cret", nil, nil, [Point.new(0, 0.0)], {"x" => 1_i64}))
+same(Tagged.new("n", "s", "a note", "shown", [] of Point, {} of String => Int64))
+same([{"author" => "Reader 1", "body" => "Comment \"quoted\""}])
+
+# A key written twice is not refused here, and is not written by anything
+# a controller hands over: derive serializable refuses it at compile time.
+puts "json_writer: all assertions passed"

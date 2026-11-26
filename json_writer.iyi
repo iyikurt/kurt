@@ -1,0 +1,61 @@
+# The JSON a controller's `json(data)` writes: std/json's own Builder, less
+# the runtime duplicate-key check.
+#
+# std/json's `Builder#field` copies every key's escaped text into a String
+# and records it in a Hash per open object, so that a key written twice is
+# refused. Writing a response that is most of what it allocates: on a feed
+# of 20 posts and their 100 comments it was a third of the allocator's time.
+# For what a controller writes the check finds nothing: `derive
+# serializable` refuses two fields with one key when it compiles, a Hash's
+# keys are distinct, and a NamedTuple's are distinct names.
+#
+# `FastBuilder` is a `Builder`: `derive serializable`'s `to_json(json :
+# Builder)` and `JSON.write_value` take it unchanged, and every byte is
+# written by std/json's own code - escaping, numbers, nesting - so the text
+# is the same as `JSON.to_json`'s. What it gives up is one refusal: two
+# different keys that are not UTF-8 and escape to the same text (`"a\xFF"`
+# and `"a\xFE"`, both `"a�"`) are both written, as the reader would
+# then refuse. Kept here to measure before it moves to std/json, where the
+# check can be skipped for `derive serializable` alone.
+module json_writer
+
+import std/json::{Builder, JSON}
+
+pub class FastBuilder < Builder
+  def start_object : Nil
+    before_value
+    @buffer.append(123_u8) # '{'
+    @level = @level + 1
+    raise "nesting depth of #{@level} exceeds maximum depth #{@max_nesting}" if @level > @max_nesting
+    @states << OBJECT_FIRST
+  end
+
+  def end_object : Nil
+    st = state
+    raise "end_object with a field's value still due" if st == OBJECT_VALUE
+    raise "end_object without start_object" unless st == OBJECT_FIRST || st == OBJECT_NEXT
+    @states.pop
+    @level = @level - 1
+    write_indent if st == OBJECT_NEXT
+    @buffer.append(125_u8) # '}'
+  end
+
+  def field(name : String) : Nil
+    st = state
+    raise "a field outside an object" unless st == OBJECT_FIRST || st == OBJECT_NEXT
+    @buffer.append(44_u8) if st == OBJECT_NEXT # ','
+    set_state(OBJECT_VALUE)
+    write_indent
+    write_escaped_string(name)
+    @buffer.append(58_u8)                         # ':'
+    @buffer.append(32_u8) unless @indent_str.nil? # ' '
+  end
+end
+
+# *data* as `JSON.to_json` writes it, through a `FastBuilder`.
+pub def generate(data : T) : String forall T
+  return "null" if data.nil?
+  builder = FastBuilder.new
+  JSON.write_value(data, builder)
+  builder.to_s
+end

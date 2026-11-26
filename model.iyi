@@ -182,21 +182,23 @@ end
 pub class Query(T)
   @wheres : Array(String)
   @args : Array(DBValue)
-  @orders : Array(String)
+  @orders : Array(String)?
   @limit : Int32?
   @offset : Int32?
   @on : Transaction?
-  @includes : Array(String)
+  @includes : Array(String)?
   @preloaded : Array(T)?
 
   def initialize
     @wheres = [] of String
     @args = [] of DBValue
-    @orders = [] of String
+    # Made on first use: most queries never order or include, and a
+    # has_many accessor builds a query per record (`post.comments`).
+    @orders = nil
     @limit = nil
     @offset = nil
     @on = nil
-    @includes = [] of String
+    @includes = nil
     @preloaded = nil
   end
 
@@ -204,7 +206,9 @@ pub class Query(T)
   # ask once per row (N+1): `Post.includes(:user, :comments).all!`, then
   # `post.user?` and `post.comments.all!` ask nothing more.
   def includes(*names : Symbol) : Query(T)
-    names.each { |name| @includes << name.to_s }
+    list = @includes || [] of String
+    names.each { |name| list << name.to_s }
+    @includes = list
     self
   end
 
@@ -283,7 +287,7 @@ pub class Query(T)
 
   def order(column : String) : Query(T)
     @preloaded = nil
-    @orders << column + " ASC"
+    (@orders ||= [] of String) << column + " ASC"
     self
   end
 
@@ -293,7 +297,7 @@ pub class Query(T)
 
   def order_desc(column : String) : Query(T)
     @preloaded = nil
-    @orders << column + " DESC"
+    (@orders ||= [] of String) << column + " DESC"
     self
   end
 
@@ -332,7 +336,9 @@ pub class Query(T)
 
   def to_sql : String
     sql = "SELECT * FROM " + T.table_name + where_clause
-    sql += " ORDER BY " + @orders.join(", ") unless @orders.empty?
+    if (orders = @orders) && !orders.empty?
+      sql += " ORDER BY " + orders.join(", ")
+    end
     if n = @limit
       sql += " LIMIT " + n.to_s
     end
@@ -357,9 +363,11 @@ pub class Query(T)
            else
              database.query_all(placeholders(to_sql), args: @args, as: T)!
            end
-    @includes.each do |name|
-      if failure = T.__kurt_preload(rows, name, @on)
-        return failure
+    if names = @includes
+      names.each do |name|
+        if failure = T.__kurt_preload(rows, name, @on)
+          return failure
+        end
       end
     end
     rows
