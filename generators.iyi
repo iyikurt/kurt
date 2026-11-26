@@ -14,7 +14,8 @@
 #   test/<name>_test.iyi
 #   public/assets/app.css
 #   iyi.mod
-#   llms.txt                          the conventions, for coding agents
+#   AGENTS.md                         the conventions, for coding agents
+#   CLAUDE.md                         points Claude Code at AGENTS.md
 module generators
 
 import std/text
@@ -306,7 +307,7 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
       @#{names.singular} = #{names.model}.find(params[:id])!
     end
 
-  #{list_methods}  # The fields the form may set: strong parameters, as in Rails.
+  #{list_methods}  # The fields the form may set: strong parameters.
     private def #{names.singular}_params : Hash(String, String)
       params.require(:#{names.singular}).permit(#{permitted})
     end
@@ -1201,12 +1202,14 @@ pub def scaffold_test(app : String, names : Names, fields : Array(Field), sign_i
   IYI
 end
 
-pub def llms_txt(app : String) : String
+# AGENTS.md is the file coding agents (Codex, Cursor, Copilot, Gemini CLI
+# and others) read from a project's root on their own.
+pub def agents_md(app : String) : String
   <<-TXT
   # #{app}
 
-  > A Kurt application: a Rails-like layer on iyi (https://iyi.dev), over
-  > iyi-web (HTTP, routing, templates, sessions, CSRF) and db (SQL, pools).
+  A Kurt application: an MVC web framework on iyi (https://iyi.dev), over
+  iyi-web (HTTP, routing, templates, sessions, CSRF) and db (SQL, pools).
 
   ## Layout
 
@@ -1281,11 +1284,11 @@ pub def llms_txt(app : String) : String
     (`layout: "admin"`, `layout: false`). A template renders a partial with `render "_form.eiy"`.
   - An action calls models with `!`. The framework answers NotFound with 404, Invalid with 422,
     Unauthorized with a redirect to /login (401 for JSON), Forbidden with 403, DBError with 503.
-  - Strong parameters, as in Rails: forms send `post[title]`, and
+  - Strong parameters: forms send `post[title]`, and
     `params.require(:post).permit(:title, :body)` is the only way to the Hash a model takes
     (`Post.new(h)`, `post.update(h)`, `Post.create(h)`); values are converted to the field types,
     and one that does not convert ("abc" for a number) is a validation error.
-  - Saving, as in Rails: `if post.save! ... else render "posts/edit", status: 422 end`. `save`
+  - Saving: `if post.save! ... else render "posts/edit", status: 422 end`. `save`
     answers false when validation fails and keeps the reasons in `post.errors`; its `!` hands a
     DBError up. `post.update(title: "New")` sets fields and saves. `Post.create(...)!` answers the
     record, or hands Invalid up (422).
@@ -1295,7 +1298,7 @@ pub def llms_txt(app : String) : String
     `wants_json?`, `session`.
   - `before_action :require_login, except: [:index, :show]`; a filter stops the action by
     answering Unauthorized, Forbidden, NotFound or DBError (a Halt); any other answer runs it.
-  - Scaffolds load the record in a filter, as Rails does:
+  - Scaffolds load the record in a filter:
     `before_action :set_post, only: [:show, :edit, :update, :destroy]` with
     `private def set_post; @post = Post.find(params[:id])!; end`.
   - `@post` and `@posts` need no declaration: in a controller, a variable named after a model
@@ -1305,4 +1308,9 @@ pub def llms_txt(app : String) : String
   - Views see the action's locals and the controller's methods; forms print `<%= raw(csrf_field) %>`.
 
   TXT
+end
+
+# Claude Code reads CLAUDE.md, not AGENTS.md; this line imports it.
+pub def claude_md : String
+  "@AGENTS.md\n"
 end

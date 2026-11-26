@@ -333,7 +333,8 @@ def cmd_new(args : Array(String)) : Nil
     write("test/fixtures/.keep", "")
     write("db/seeds.iyi", seeds_file)
     write(".gitignore", gitignore(daisy))
-    write("llms.txt", llms_txt(name))
+    write("AGENTS.md", agents_md(name))
+    write("CLAUDE.md", claude_md)
     if daisy
       if build_css
         say("build", CSS_OUTPUT)
