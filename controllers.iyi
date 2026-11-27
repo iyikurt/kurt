@@ -474,7 +474,7 @@ pub def sign_in_as(id : Int64) : Nil
   force_test_user(":" + id.to_s)
 end
 
-# Devise's test helper's name for `sign_in_as`.
+# `sign_in_as`, by the name controllers use for it.
 pub def sign_in(user : T) : Nil forall T
   sign_in_as(user)
 end
@@ -568,11 +568,11 @@ pub macro render_file(view, layout = nil, status = nil)
 end
 
 # ---------------------------------------------------------------------------
-# Authentication, as Devise's controller helpers. ApplicationController
+# Authentication: the controller helpers. ApplicationController
 # says which model signs in:
 #
 #   class ApplicationController < Controller
-#     devise_helpers User
+#     authentication_helpers User
 #   end
 #
 # and every controller and view then has, for that model:
@@ -589,12 +589,12 @@ end
 # `authenticate_user!` is `authenticate_user` with iyi's `!`: it answers
 # Unauthorized when nobody is signed in, and `!` hands that up, which stops
 # the action. The session keeps the user's id under "user_id", renewing the
-# session's id on sign-in. With rememberable, `remember: true` sets a
+# session's id on sign-in. With remember_me, `remember: true` sets a
 # remember_user_token cookie that signs the user in again after the session
-# is gone; with timeoutable, a session idle for longer than the model's
-# `timeout_in` ends; with trackable, each sign-in is counted.
+# is gone; with timeout, a session idle for longer than the model's
+# `timeout_in` ends; with tracking, each sign-in is counted.
 # ---------------------------------------------------------------------------
-pub macro devise_helpers(model, path = nil)
+pub macro authentication_helpers(model, path = nil)
   {% scope = model.id.stringify.split("::").last.underscore %}
   {% base = path ? path : "/" + (scope.ends_with?("y") ? scope[0...-1] + "ies" : (scope.ends_with?("s") ? scope + "es" : scope + "s")) %}
   @__kurt_current_{{ scope.id }} : {{ model }}? = nil
@@ -664,7 +664,7 @@ pub macro devise_helpers(model, path = nil)
 
   # Signs *record* in: a new session id first, so an id someone planted
   # before is worth nothing after; then the remember cookie when asked for,
-  # and the sign-in counted (trackable).
+  # and the sign-in counted (tracking).
   def sign_in(record : {{ model }}, remember : Bool = false) : Nil | ::Db::Errors::DBError
     store = session
     store.regenerate
@@ -722,15 +722,15 @@ pub def secure_cookies? : Bool
   production?
 end
 
-# The routes of an authentication scope: `devise_for "users"` in
-# config/routes.iyi, as Devise's. They lead to the controllers `kurt`
+# The routes of an authentication scope: `authentication_for "users"` in
+# config/routes.iyi. They lead to the controllers `kurt`
 # writes for the scope (`UserSessionsController` and the rest), or to the
 # application's own copies of them; `kurt routes` lists them. `path: "auth"`
-# puts them under /auth instead of /users (then `devise_helpers User,
+# puts them under /auth instead of /users (then `authentication_helpers User,
 # path: "/auth"` too), for an application whose `resources "users"` has
 # POST /users already.
-pub macro devise_for(name, path = nil)
-  __kurt_devise_routes_{{ name.id }}(router)
+pub macro authentication_for(name, path = nil)
+  __kurt_auth_routes_{{ name.id }}(router)
 end
 
 # The routing macros below are written inside a function that has a local

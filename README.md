@@ -70,8 +70,8 @@ published version.
 | `kurt generate attachments` | The migration of `kurt_attachments`, the table `has_one_attached` keeps files in |
 | `kurt generate job NAME` | A background job, its test, and the queue's migration (`kurt_jobs`) when there is none |
 | `kurt generate mailer NAME METHOD...` | A mailer, a text and an HTML view per method, the mail layouts and a test |
-| `kurt generate authentication [MODULE...]` | Devise-like users: sign-in, sign-up, password reset, remember me; `confirmable`, `lockable`, `trackable`, `timeoutable` on request |
-| `kurt generate devise:views` / `devise:controllers` | Copies Kurt's authentication pages, mails and controllers into the application, to change them |
+| `kurt generate authentication [MODULE...]` | users: sign-in, sign-up, password reset, remember me; `confirmation`, `lock`, `tracking`, `timeout` on request |
+| `kurt generate authentication:views` / `authentication:controllers` | Copies Kurt's authentication pages, mails and controllers into the application, to change them |
 | `kurt db:migrate` / `db:rollback [N]` / `db:status` / `db:reset` | Manage the schema (`db:reset` also runs the seeds) |
 | `kurt db:seed` | Runs `db/seeds.iyi` |
 | `kurt routes` | Lists every route with its path and `Controller#action` |
@@ -949,28 +949,27 @@ makes waiting jobs due now.
 
 ## Authentication
 
-Authentication is shaped like Ruby's [Devise](https://github.com/heartcombo/devise):
-the model names the modules it uses, one routes line draws their pages,
+The model names the modules it uses, one routes line draws their pages,
 and Kurt ships the controllers, views and mails.
 
 ```sh
-kurt generate authentication                       # Devise's default modules
-kurt generate authentication confirmable lockable  # and others
+kurt generate authentication                       # the default modules
+kurt generate authentication confirmation lock    # and others
 kurt db:migrate
 ```
 
 ```iyi
 # app/models/user.iyi
 class User < ApplicationRecord
-  devise :database_authenticatable, :registerable, :recoverable, :rememberable, :validatable
+  authentication :password, :registration, :recovery, :remember_me, :validation
 end
 
 # config/routes.iyi
-devise_for "users"
+authentication_for "users"
 
 # app/controllers/application_controller.iyi
 class ApplicationController < Controller
-  devise_helpers User
+  authentication_helpers User
 end
 
 # a controller whose pages need a signed-in user
@@ -981,25 +980,25 @@ end
 
 | Module | What it does | Columns |
 |---|---|---|
-| `database_authenticatable` | Signs in with an address and a bcrypt password; `password=`, `valid_password?`, `User.authenticate(email, password)` | `email`, `encrypted_password` |
-| `registerable` | Sign-up, the account page (changes need the current password), deleting the account | |
-| `recoverable` | "Forgot your password?": a mail with a link good for 6 hours and until the password changes | |
-| `rememberable` | "Remember me": a cookie that signs the user in again for two weeks, void after signing out | `remember_created_at` |
-| `validatable` | Address present, well formed and unique; password 8 to 72 bytes and confirmed | |
-| `confirmable` | No sign-in until the link in the confirmation mail is followed (3 days) | `confirmed_at`, `confirmation_sent_at` |
-| `lockable` | 5 wrong passwords lock the account for an hour, or until the unlock mail's link | `failed_attempts`, `locked_at` |
-| `trackable` | Counts sign-ins, with their times and addresses | `sign_in_count`, `current_sign_in_at`, `last_sign_in_at`, `current_sign_in_ip`, `last_sign_in_ip` |
-| `timeoutable` | A session idle for 30 minutes ends (not one remembered by the cookie) | |
+| `password` | Signs in with an address and a bcrypt password; `password=`, `valid_password?`, `User.authenticate(email, password)` | `email`, `encrypted_password` |
+| `registration` | Sign-up, the account page (changes need the current password), deleting the account | |
+| `recovery` | "Forgot your password?": a mail with a link good for 6 hours and until the password changes | |
+| `remember_me` | "Remember me": a cookie that signs the user in again for two weeks, void after signing out | `remember_created_at` |
+| `validation` | Address present, well formed and unique; password 8 to 72 bytes and confirmed | |
+| `confirmation` | No sign-in until the link in the confirmation mail is followed (3 days) | `confirmed_at`, `confirmation_sent_at` |
+| `lock` | 5 wrong passwords lock the account for an hour, or until the unlock mail's link | `failed_attempts`, `locked_at` |
+| `tracking` | Counts sign-ins, with their times and addresses | `sign_in_count`, `current_sign_in_at`, `last_sign_in_at`, `current_sign_in_ip`, `last_sign_in_ip` |
+| `timeout` | A session idle for 30 minutes ends (not one remembered by the cookie) | |
 
-`kurt generate authentication` writes the model (or adds `devise` to a
+`kurt generate authentication` writes the model (or adds `authentication` to a
 `User` that exists), a migration with every module's columns (turning a
-module on later needs no migration), `devise_for "users"`,
-`devise_helpers User`, the layout's links, `ApplicationMailer` and the mail
+module on later needs no migration), `authentication_for "users"`,
+`authentication_helpers User`, the layout's links, `ApplicationMailer` and the mail
 layouts, and `test/authentication_test.iyi`. A `User` scaffold already has
 `POST /users`, so then the scope's pages go under `/auth`
-(`devise_for "users", path: "auth"`).
+(`authentication_for "users", path: "auth"`).
 
-The pages, as Devise has them:
+The pages:
 
 | Path | |
 |---|---|
@@ -1010,12 +1009,12 @@ The pages, as Devise has them:
 | `/users/confirmation/new`, `/users/confirmation?confirmation_token=` | confirming the address |
 | `/users/unlock/new`, `/users/unlock?unlock_token=` | unlocking |
 
-Options go on the `devise` line: `authentication_key: :username`,
+Options go on the `authentication` line: `authentication_key: :username`,
 `password_length: 12`, `maximum_attempts: 3`, `unlock_in: 7200`,
 `remember_for: 2592000`, `timeout_in: 900`, `reset_password_within:`,
 `confirm_within:` (times in seconds).
 
-In controllers and views (from `devise_helpers User`):
+In controllers and views (from `authentication_helpers User`):
 
 - `current_user` (a `User?`) and `user_signed_in?`.
 - `before_action :authenticate_user!`: a visitor who is not signed in goes
@@ -1040,33 +1039,32 @@ Security:
   out.
 - The forms for signing in, resetting a password and resending
   instructions are rate limited: ten requests a minute from one address,
-  then 429. Lockable limits one account; this limits one client across
+  then 429. `lock` limits one account; this limits one client across
   accounts. The limit is off under `KURT_ENV=test`.
 - "Forgot your password?" answers the same whether or not the address has
   an account.
 
-Mail goes through the mailer (see Mailers): `UserDeviseMailer` sends the
+Mail goes through the mailer (see Mailers): `UserAuthenticationMailer` sends the
 reset, confirmation and unlock instructions. Links start with `APP_URL`
 (`kurt dev` sets it to its own address; production sets it).
 
-To change the pages, copy them into the application, as
-`rails g devise:views` does:
+To change the pages, copy them into the application:
 
 ```sh
-kurt generate devise:views         # app/views/devise/: the pages and the mails
-kurt generate devise:controllers   # app/controllers/user_sessions_controller.iyi and the rest,
-                                   # app/mailers/user_devise_mailer.iyi, and the views
+kurt generate authentication:views        # app/views/authentication/: the pages and the mails
+kurt generate authentication:controllers  # app/controllers/user_sessions_controller.iyi and the rest,
+                                          # app/mailers/user_authentication_mailer.iyi, and the views
 ```
 
 A copy in the application is used instead of Kurt's; delete it to go back.
-Kurt's own are written into `.kurt/build/devise/` at every build.
+Kurt's own are written into `.kurt/build/authentication/` at every build.
 
 In tests, `sign_in(users(:ada))` (or `sign_in_as`) makes the following
 requests as that user, and `sign_out` undoes it. It works only with
 `KURT_ENV=test`, which `kurt test` sets. A fixture's `password:` becomes
 its `encrypted_password`.
 
-Not yet: OmniAuth, Devise's reconfirmable (confirming a changed address),
+Not yet: signing in with another service (OAuth), confirming a changed address,
 more than one model signing in from the same session at once, and sessions
 stored in the database so they can be ended remotely.
 
@@ -1267,7 +1265,7 @@ make test       # the tests, on SQLite in memory
 make test-pg PG_URL=postgres://user@127.0.0.1:5432/kurt_test
 ```
 
-The model, fixture, devise, jobs and storage tests pass on both SQLite and PostgreSQL 16.
+The model, fixture, authentication, jobs and storage tests pass on both SQLite and PostgreSQL 16.
 
 | File | |
 |---|---|
@@ -1276,8 +1274,8 @@ The model, fixture, devise, jobs and storage tests pass on both SQLite and Postg
 | `strong_parameters.iyi` | `params.require(...).permit(...)` |
 | `helpers.iyi` | view helpers |
 | `forms.iyi` | `form_with`'s form builder |
-| `devise.iyi` | `devise :...` in a model: passwords, signed tokens, lockable, trackable; the sign-in rate limit |
-| `devise_generators.iyi` | `kurt generate authentication`, and the controllers, views, mails and routes Kurt ships |
+| `authentication.iyi` | `authentication :...` in a model: passwords, signed tokens, lock, tracking; the sign-in rate limit |
+| `authentication_generators.iyi` | `kurt generate authentication`, and the controllers, views, mails and routes Kurt ships |
 | `storage.iyi` | `has_one_attached`, `has_many_attached`, disk storage, `/files/...` |
 | `jobs.iyi` | `Job`, `perform_later`, the `kurt_jobs` queue, the worker loop |
 | `mailers.iyi`, `mail_views.iyi` | mailers, `deliveries`, SMTP; the program that finds a mail's views at compile time |

@@ -46,7 +46,7 @@ def run : Nil | DBError
   assert authors[0].columns.includes?("created_at")        # timestamps filled in
   assert rows[0].values[4].is_a?(Time)                      # a column that allows NULL converts too
   members = fixture_rows(parse_fixtures("members", "members.yml", "ada:\n  email: a@b.c\n  password: secret123\n").as(FixtureSet), tables).as(Array(FixtureRow))
-  assert members[0].columns == ["id", "email", "encrypted_password"]   # Devise's column
+  assert members[0].columns == ["id", "email", "encrypted_password"]   # kurt generate authentication's column
 
   # what is wrong is said, with the file and the label
   bad = parse_fixtures("books", "books.yml", "x:\n  nope: 1\n").as(FixtureSet)

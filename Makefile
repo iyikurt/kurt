@@ -41,7 +41,7 @@ test:
 test-pg:
 	DATABASE_URL="$(PG_URL)" $(IYI) run test/model_test.iyi
 	DATABASE_URL="$(PG_URL)" $(IYI) run test/fixtures_test.iyi
-	DATABASE_URL="$(PG_URL)" $(IYI) run test/devise_test.iyi
+	DATABASE_URL="$(PG_URL)" $(IYI) run test/authentication_test.iyi
 	DATABASE_URL="$(PG_URL)" $(IYI) run test/app/jobs/jobs_test.iyi
 	DATABASE_URL="$(PG_URL)" $(IYI) run test/app/controllers/storage_test.iyi
 

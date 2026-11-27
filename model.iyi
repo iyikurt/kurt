@@ -1160,7 +1160,7 @@ end
 #
 # Each line is a method of its own, named for its fields and the line it is
 # on; `derive model` calls every one, in the order they were written. (A
-# chain through `previous_def` lost the lines a macro wrote, `devise`'s, to
+# chain through `previous_def` lost the lines a macro wrote, `authentication`'s, to
 # the lines written after it: a macro's methods are not among the type's
 # yet when the next line's macro looks.)
 pub macro validates(*fields, presence = nil, length = nil, format = nil, inclusion = nil, uniqueness = nil, message = nil)

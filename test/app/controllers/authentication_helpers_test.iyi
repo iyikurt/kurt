@@ -1,4 +1,4 @@
-module test/app/controllers/devise_helpers_test
+module test/app/controllers/authentication_helpers_test
 
 import std/text
 import std/time::{Time}
@@ -9,7 +9,7 @@ import web/iyi_web/handler::{chain}
 import web/iyi_web/session::{SessionHandler}
 import datasource::{database}
 import model::*
-import devise::*
+import authentication::*
 import controllers::*
 
 class User
@@ -22,13 +22,13 @@ class User
   property current_sign_in_ip : String?
   property last_sign_in_ip : String?
 
-  devise :database_authenticatable, :rememberable, :trackable, :timeoutable
+  authentication :password, :remember_me, :tracking, :timeout
 
   derive model
 end
 
 class ApplicationController < Controller
-  devise_helpers User
+  authentication_helpers User
 end
 
 class SecretsController < ApplicationController
@@ -138,4 +138,4 @@ assert res.status_code == 303
 assert dispatch(app, with_cookies(http_request("GET", "/whoami"), only_remember)).response.body == "nobody"
 assert User.find(ada.id).as(User).remember_created_at.nil?
 
-puts "devise helpers: all assertions passed"
+puts "authentication helpers: all assertions passed"

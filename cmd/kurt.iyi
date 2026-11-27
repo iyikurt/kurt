@@ -27,7 +27,7 @@ import environment::{database_url, postgres_url?}
 import migrator::{migrate, rollback, status, MigrationError, Migration}
 import inflector::{underscore, camelize}
 import generators::*
-import devise_generators::*
+import authentication_generators::*
 import autoload::*
 import schema::{Table, introspect, to_json, parse, find}
 import fixtures::{FixtureSet, read_fixture_sets}
@@ -65,11 +65,12 @@ Usage:
   kurt generate job NAME                 a background job, a test, the queue's table
   kurt generate attachments              the table has_one_attached keeps files in
   kurt generate authentication [MODULE...]
-                                         Devise-like users: sign-in, sign-up, password
-                                         reset, remember me; MODULE adds confirmable,
-                                         lockable, trackable or timeoutable
-  kurt generate devise:views             the sign-in and other views, to change them
-  kurt generate devise:controllers       the authentication controllers, to change them
+                                         users: sign-in, sign-up, password reset,
+                                         remember me; MODULE adds confirmation,
+                                         lock, tracking or timeout
+  kurt generate authentication:views     the sign-in and other views, to change them
+  kurt generate authentication:controllers
+                                         the authentication controllers, to change them
   kurt db:migrate                        run pending migrations
   kurt db:rollback [STEPS]               undo the last migration(s)
   kurt db:status                         which migrations have run
@@ -630,11 +631,11 @@ def insert_before_last_end(path : String, text : String) : Bool
   true
 end
 
-# Devise-shaped authentication for User: `devise :...` in the model, the
-# columns, `devise_for "users"`, `devise_helpers User`, the layout's links,
-# the mail layouts and a test. *extra* names modules beyond Devise's
-# defaults (confirmable, lockable, trackable, timeoutable). Kurt ships the
-# controllers and views; `devise:views` and `devise:controllers` copy them.
+# Authentication for User: `authentication :...` in the model, the
+# columns, `authentication_for "users"`, `authentication_helpers User`, the layout's links,
+# the mail layouts and a test. *extra* names modules beyond the
+# defaults (confirmation, lock, tracking, timeout). Kurt ships the
+# controllers and views; `authentication:views` and `authentication:controllers` copy them.
 def gen_authentication(app : String, extra : Array(String)) : Nil
   extra.each do |name|
     fail("`" + name + "` is not one of " + OPTIONAL_MODULES.join(", ")) unless OPTIONAL_MODULES.includes?(name)
@@ -644,21 +645,21 @@ def gen_authentication(app : String, extra : Array(String)) : Nil
   model_file = "app/models/user.iyi"
   if File.exists?(model_file)
     model = File.read(model_file)
-    fail(model_file + " has `devise` already") if devise_modules_of(model)
+    fail(model_file + " has `authentication` already") if auth_modules_of(model)
     fail(model_file + " uses has_secure_password, the authentication Kurt generated before; take it out (and SessionsController, RegistrationsController, their views and routes) first") if model.includes?("has_secure_password")
-    insert_after_line(model_file, "class User", devise_model_line(modules))
+    insert_after_line(model_file, "class User", auth_model_line(modules))
     existing = [] of String
     if table = find(read_schema, "users")
       existing = table.columns.map(&.name)
     else
       fail("migrate first: the users table is not in " + SCHEMA)
     end
-    write(migration_path("add_devise_to_users"), devise_columns_migration("email", existing, postgres_url?(database_url)))
+    write(migration_path("add_authentication_to_users"), auth_columns_migration("email", existing, postgres_url?(database_url)))
     users_scaffold_takes_passwords(daisy)
     users_test_takes_passwords
   else
-    write(model_file, devise_model(modules))
-    write(migration_path("create_users"), devise_users_migration("email", postgres_url?(database_url)))
+    write(model_file, auth_model(modules))
+    write(migration_path("create_users"), auth_users_migration("email", postgres_url?(database_url)))
   end
   # A users scaffold has POST /users already, which signing up would be.
   routes = File.read("config/routes.iyi")
@@ -666,24 +667,24 @@ def gen_authentication(app : String, extra : Array(String)) : Nil
   # What sign-up asks for besides the address: the other text columns.
   fields = [] of String
   if table = find(read_schema, "users")
-    skip = DEVISE_COLUMNS + ["id", "email", "created_at", "updated_at"]
+    skip = AUTH_COLUMNS + ["id", "email", "created_at", "updated_at"]
     table.columns.each { |c| fields << c.name if c.type == "String" && !skip.includes?(c.name) }
   end
-  scope = DeviseScope.new("users", modules, "email", fields, base)
-  add_route(devise_for_line(scope))
+  scope = AuthScope.new("users", modules, "email", fields, base)
+  add_route(auth_for_line(scope))
   controller = "app/controllers/application_controller.iyi"
-  unless File.read(controller).includes?("devise_helpers")
-    insert_after_line(controller, "class ApplicationController", "  # current_user, user_signed_in?, authenticate_user!, sign_in, sign_out\n" + devise_helpers_line(scope))
+  unless File.read(controller).includes?("authentication_helpers")
+    insert_after_line(controller, "class ApplicationController", "  # current_user, user_signed_in?, authenticate_user!, sign_in, sign_out\n" + auth_helpers_line(scope))
   end
   write("app/mailers/application_mailer.iyi", application_mailer) unless File.exists?("app/mailers/application_mailer.iyi")
   write("app/views/layouts/mailer.html.eiy", mailer_layout_html) unless File.exists?("app/views/layouts/mailer.html.eiy")
   write("app/views/layouts/mailer.text.eiy", mailer_layout_text) unless File.exists?("app/views/layouts/mailer.text.eiy")
   layout = "app/views/layouts/application.eiy"
   if File.exists?(layout) && !File.read(layout).includes?("user_signed_in?")
-    update(layout, File.read(layout).sub("<!-- kurt:nav -->", "<!-- kurt:nav -->" + devise_nav(scope, daisy)))
+    update(layout, File.read(layout).sub("<!-- kurt:nav -->", "<!-- kurt:nav -->" + auth_nav(scope, daisy)))
   end
-  write("test/authentication_test.iyi", devise_test(scope))
-  if daisy && (css = with_devise_classes(File.read(CSS_INPUT)))
+  write("test/authentication_test.iyi", auth_test(scope))
+  if daisy && (css = with_auth_classes(File.read(CSS_INPUT)))
     update(CSS_INPUT, css)
   end
 
@@ -694,35 +695,35 @@ def gen_authentication(app : String, extra : Array(String)) : Nil
   puts ""
   puts "A page that needs a signed-in user: `before_action :authenticate_user!` in its controller"
   puts "(or in ApplicationController, for every page). To change the pages:"
-  puts "  kurt generate devise:views          # app/views/devise/"
-  puts "  kurt generate devise:controllers    # app/controllers/user_*_controller.iyi"
+  puts "  kurt generate authentication:views          # app/views/authentication/"
+  puts "  kurt generate authentication:controllers    # app/controllers/user_*_controller.iyi"
 end
 
-# `kurt generate devise:views`: Kurt's sign-in, sign-up, password and mail
-# views into app/views/devise/, where the build uses them instead.
-def gen_devise_views : Nil
-  scopes = devise_scopes(read_schema)
-  fail("no devise_for in config/routes.iyi: run `kurt generate authentication` first") if scopes.empty?
+# `kurt generate authentication:views`: Kurt's sign-in, sign-up, password and mail
+# views into app/views/authentication/, where the build uses them instead.
+def gen_auth_views : Nil
+  scopes = auth_scopes(read_schema)
+  fail("no authentication_for in config/routes.iyi: run `kurt generate authentication` first") if scopes.empty?
   key = scopes[0].key
   daisy = tailwind_app?
-  devise_view_names.each { |name| write("app/views/devise/" + name + ".eiy", devise_view(name, key, daisy)) }
-  devise_mail_names.each do |name|
-    write("app/views/devise/mailer/" + name + ".text.eiy", devise_mail_view(name, key, false))
-    write("app/views/devise/mailer/" + name + ".html.eiy", devise_mail_view(name, key, true))
+  auth_view_names.each { |name| write("app/views/authentication/" + name + ".eiy", auth_view(name, key, daisy)) }
+  auth_mail_names.each do |name|
+    write("app/views/authentication/mailer/" + name + ".text.eiy", auth_mail_view(name, key, false))
+    write("app/views/authentication/mailer/" + name + ".html.eiy", auth_mail_view(name, key, true))
   end
 end
 
-# `kurt generate devise:controllers [users]`: the scope's controllers and
-# mailer into the application, rendering app/views/devise/ (copied too).
-def gen_devise_controllers(plural : String?) : Nil
-  scopes = devise_scopes(read_schema)
-  fail("no devise_for in config/routes.iyi: run `kurt generate authentication` first") if scopes.empty?
-  scope = plural ? (scopes.find { |s| s.plural == plural } || fail("no devise_for \"" + plural + "\" in config/routes.iyi")) : scopes[0]
-  gen_devise_views
-  scope.kinds.each { |kind| write("app/controllers/" + scope.controller_file(kind), devise_controller(kind, scope)) }
+# `kurt generate authentication:controllers [users]`: the scope's controllers and
+# mailer into the application, rendering app/views/authentication/ (copied too).
+def gen_auth_controllers(plural : String?) : Nil
+  scopes = auth_scopes(read_schema)
+  fail("no authentication_for in config/routes.iyi: run `kurt generate authentication` first") if scopes.empty?
+  scope = plural ? (scopes.find { |s| s.plural == plural } || fail("no authentication_for \"" + plural + "\" in config/routes.iyi")) : scopes[0]
+  gen_auth_views
+  scope.kinds.each { |kind| write("app/controllers/" + scope.controller_file(kind), auth_controller(kind, scope)) }
   if scope.mails?
     parent = File.exists?("app/mailers/application_mailer.iyi") ? "ApplicationMailer" : "Mailer"
-    write("app/mailers/" + scope.mailer_file, devise_mailer(scope, parent))
+    write("app/mailers/" + scope.mailer_file, auth_mailer(scope, parent))
   end
 end
 
@@ -757,7 +758,7 @@ def users_test_takes_passwords : Nil
   return unless File.exists?(path)
   source = File.read(path)
   return if source.includes?("user%5Bpassword%5D")
-  source = source.gsub(/form_request\("POST", "\/users", "([^"]*)"\)/) { |m| m[0, m.size - 2] + "&user%5Bpassword%5D=" + DEVISE_TEST_PASSWORD + "&user%5Bpassword_confirmation%5D=" + DEVISE_TEST_PASSWORD + "\")" }
+  source = source.gsub(/form_request\("POST", "\/users", "([^"]*)"\)/) { |m| m[0, m.size - 2] + "&user%5Bpassword%5D=" + AUTH_TEST_PASSWORD + "&user%5Bpassword_confirmation%5D=" + AUTH_TEST_PASSWORD + "\")" }
   update(path, source)
 end
 
@@ -772,11 +773,11 @@ def cmd_generate(args : Array(String)) : Nil
   when "authentication"
     gen_authentication(app, args[1, args.size - 1])
     return
-  when "devise:views"
-    gen_devise_views
+  when "authentication:views"
+    gen_auth_views
     return
-  when "devise:controllers"
-    gen_devise_controllers(args[1]?)
+  when "authentication:controllers"
+    gen_auth_controllers(args[1]?)
     return
   end
   fail("usage: kurt generate (scaffold|model|controller|migration) NAME ...") if args.size < 2
@@ -972,10 +973,10 @@ def build_app(name : String, tests : Bool = false) : String
   emit(BUILD + "/app/models.iyi", models_module(models, tables, root + "/" + SCHEMA))
   model_names = [] of String
   models.each { |source| model_tables(source.text).each { |pair| model_names << pair[0] } }
-  devise_controllers, devise_mailers = devise_sources(tables)
-  emit(BUILD + "/app/mailers.iyi", mailers_module(sources("app/mailers") + devise_mailers, model_names))
+  auth_controllers, auth_mailers = auth_sources(tables)
+  emit(BUILD + "/app/mailers.iyi", mailers_module(sources("app/mailers") + auth_mailers, model_names))
   emit(BUILD + "/app/jobs.iyi", jobs_module(sources("app/jobs"), model_names))
-  emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers") + devise_controllers, model_names))
+  emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers") + auth_controllers, model_names))
   routes = source?("config/routes.iyi") || fail("no config/routes.iyi")
   emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi", migration_makes?("kurt_attachments")))
   entry = BUILD + "/" + name + ".iyi"
@@ -1004,47 +1005,47 @@ def build_app(name : String, tests : Bool = false) : String
 end
 
 # ---------------------------------------------------------------------------
-# Authentication: what Kurt ships for each `devise_for` scope
+# Authentication: what Kurt ships for each `authentication_for` scope
 # ---------------------------------------------------------------------------
 
-# Each `devise_for "users"` scope in config/routes.iyi, with its model's
+# Each `authentication_for "users"` scope in config/routes.iyi, with its model's
 # modules, its sign-in column and the text columns sign-up asks for.
-def devise_scopes(tables : Array(Table)) : Array(DeviseScope)
-  return [] of DeviseScope unless File.exists?("config/routes.iyi")
-  found = [] of DeviseScope
-  devise_for_scopes(File.read("config/routes.iyi")).each do |pair|
+def auth_scopes(tables : Array(Table)) : Array(AuthScope)
+  return [] of AuthScope unless File.exists?("config/routes.iyi")
+  found = [] of AuthScope
+  auth_for_scopes(File.read("config/routes.iyi")).each do |pair|
     plural, base = pair
     model = model_path(camelize(singularize(plural)))
-    fail("devise_for \"" + plural + "\": no " + model) unless File.exists?(model)
+    fail("authentication_for \"" + plural + "\": no " + model) unless File.exists?(model)
     text = File.read(model)
-    modules = devise_modules_of(text) || fail("devise_for \"" + plural + "\": " + model + " has no `devise :database_authenticatable, ...` line")
-    key = devise_key_of(text)
+    modules = auth_modules_of(text) || fail("authentication_for \"" + plural + "\": " + model + " has no `authentication :password, ...` line")
+    key = auth_key_of(text)
     fields = [] of String
     if table = find(tables, plural)
-      skip = DEVISE_COLUMNS + ["id", key, "created_at", "updated_at"]
+      skip = AUTH_COLUMNS + ["id", key, "created_at", "updated_at"]
       table.columns.each { |c| fields << c.name if c.type == "String" && !skip.includes?(c.name) }
     end
-    found << DeviseScope.new(plural, modules, key, fields, base)
+    found << AuthScope.new(plural, modules, key, fields, base)
   end
   found
 end
 
-DEVISE_BUILD = BUILD + "/devise"
+AUTH_BUILD = BUILD + "/authentication"
 
 # The controllers, routes and mailer of every scope, as sources for the
 # controllers and mailers modules: the application's own copies where it
 # has them (app/controllers/user_sessions_controller.iyi...), Kurt's
-# otherwise. Kurt's are written into .kurt/build/devise/, with their views
-# there too unless app/views/devise/ has the application's.
-def devise_sources(tables : Array(Table)) : Tuple(Array(Source), Array(Source))
+# otherwise. Kurt's are written into .kurt/build/authentication/, with their views
+# there too unless app/views/authentication/ has the application's.
+def auth_sources(tables : Array(Table)) : Tuple(Array(Source), Array(Source))
   controllers = [] of Source
   mailers = [] of Source
-  scopes = devise_scopes(tables)
+  scopes = auth_scopes(tables)
   # Controllers written for a build before, which the application now has
   # its own copy of (or no scope needs), go.
-  if Dir.exists?(DEVISE_BUILD)
-    Dir.entries(DEVISE_BUILD).each do |file|
-      File.delete(DEVISE_BUILD + "/" + file) if file.ends_with?(".iyi")
+  if Dir.exists?(AUTH_BUILD)
+    Dir.entries(AUTH_BUILD).each do |file|
+      File.delete(AUTH_BUILD + "/" + file) if file.ends_with?(".iyi")
     end
   end
   return {controllers, mailers} if scopes.empty?
@@ -1052,43 +1053,43 @@ def devise_sources(tables : Array(Table)) : Tuple(Array(Source), Array(Source))
   daisy = tailwind_app?
   scopes.each do |scope|
     paths = {"layout" => root + "/app/views/layouts/application.eiy"}
-    devise_view_names.each do |name|
-      own = "app/views/devise/" + name + ".eiy"
+    auth_view_names.each do |name|
+      own = "app/views/authentication/" + name + ".eiy"
       if File.exists?(own)
         paths[name] = root + "/" + own
       else
-        shipped = DEVISE_BUILD + "/views/" + daisy.to_s + "/" + scope.key + "/" + name + ".eiy"
-        emit(shipped, devise_view(name, scope.key, daisy))
+        shipped = AUTH_BUILD + "/views/" + daisy.to_s + "/" + scope.key + "/" + name + ".eiy"
+        emit(shipped, auth_view(name, scope.key, daisy))
         paths[name] = root + "/" + shipped
       end
     end
     scope.kinds.each do |kind|
       next if File.exists?("app/controllers/" + scope.controller_file(kind))
-      file = DEVISE_BUILD + "/" + scope.controller_file(kind)
-      text = devise_controller(kind, scope, paths)
+      file = AUTH_BUILD + "/" + scope.controller_file(kind)
+      text = auth_controller(kind, scope, paths)
       emit(file, text)
       controllers << Source.new(root + "/" + file, text)
     end
-    routes = DEVISE_BUILD + "/" + scope.plural + "_routes.iyi"
-    text = devise_routes_source(scope)
+    routes = AUTH_BUILD + "/" + scope.plural + "_routes.iyi"
+    text = auth_routes_source(scope)
     emit(routes, text)
     controllers << Source.new(root + "/" + routes, text)
     next unless scope.mails? && !File.exists?("app/mailers/" + scope.mailer_file)
     mail_paths = {"layout" => File.exists?("app/views/layouts/mailer.text.eiy") || File.exists?("app/views/layouts/mailer.html.eiy") ? root + "/app/views/layouts/mailer" : ""}
-    devise_mail_names.each do |name|
-      own = "app/views/devise/mailer/" + name
+    auth_mail_names.each do |name|
+      own = "app/views/authentication/mailer/" + name
       if File.exists?(own + ".text.eiy") || File.exists?(own + ".html.eiy")
         mail_paths["mailer/" + name] = root + "/" + own
       else
-        shipped = DEVISE_BUILD + "/views/mail/" + scope.key + "/" + name
-        emit(shipped + ".text.eiy", devise_mail_view(name, scope.key, false))
-        emit(shipped + ".html.eiy", devise_mail_view(name, scope.key, true))
+        shipped = AUTH_BUILD + "/views/mail/" + scope.key + "/" + name
+        emit(shipped + ".text.eiy", auth_mail_view(name, scope.key, false))
+        emit(shipped + ".html.eiy", auth_mail_view(name, scope.key, true))
         mail_paths["mailer/" + name] = root + "/" + shipped
       end
     end
     parent = File.exists?("app/mailers/application_mailer.iyi") ? "ApplicationMailer" : "Mailer"
-    file = DEVISE_BUILD + "/" + scope.mailer_file
-    text = devise_mailer(scope, parent, mail_paths)
+    file = AUTH_BUILD + "/" + scope.mailer_file
+    text = auth_mailer(scope, parent, mail_paths)
     emit(file, text)
     mailers << Source.new(root + "/" + file, text)
   end

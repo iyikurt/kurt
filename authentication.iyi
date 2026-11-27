@@ -1,22 +1,22 @@
-# Authentication shaped like Ruby's Devise: a model names the modules it
+# Authentication: a model names the modules it
 # uses, and gets what each one needs.
 #
 #   class User < ApplicationRecord
-#     devise :database_authenticatable, :registerable, :recoverable, :rememberable,
-#            :validatable, :confirmable, :lockable, :trackable, :timeoutable
+#     authentication :password, :registration, :recovery, :remember_me,
+#            :validation, :confirmation, :lock, :tracking, :timeout
 #   end
 #
 # | Module | Columns | What the model gets |
 # |---|---|---|
-# | database_authenticatable | email, encrypted_password | `password=`, `valid_password?`, `User.authenticate(email, password)` |
-# | registerable | | (the sign-up and account controllers) |
-# | recoverable | | `reset_password_token`, `User.with_reset_password_token`, `reset_password` |
-# | rememberable | remember_created_at | `remember_me`, `forget_me`, `remember_token`, `User.from_remember_token` |
-# | validatable | | email present, an address, unique; password 8 to 72 bytes, confirmed |
-# | confirmable | confirmed_at, confirmation_sent_at | `confirmed?`, `confirm`, `confirmation_token`, `User.confirm_by_token`, `skip_confirmation` |
-# | lockable | failed_attempts, locked_at | locked after 5 wrong passwords for an hour; `unlock_token`, `User.unlock_by_token` |
-# | trackable | sign_in_count, current_sign_in_at, last_sign_in_at, current_sign_in_ip, last_sign_in_ip | `track_sign_in(ip)` |
-# | timeoutable | | a session idle for `timeout_in` seconds (30 minutes) ends |
+# | password | email, encrypted_password | `password=`, `valid_password?`, `User.authenticate(email, password)` |
+# | registration | | (the sign-up and account controllers) |
+# | recovery | | `reset_password_token`, `User.with_reset_password_token`, `reset_password` |
+# | remember_me | remember_created_at | `remember_me`, `forget_me`, `remember_token`, `User.from_remember_token` |
+# | validation | | email present, an address, unique; password 8 to 72 bytes, confirmed |
+# | confirmation | confirmed_at, confirmation_sent_at | `confirmed?`, `confirm`, `confirmation_token`, `User.confirm_by_token`, `skip_confirmation` |
+# | lock | failed_attempts, locked_at | locked after 5 wrong passwords for an hour; `unlock_token`, `User.unlock_by_token` |
+# | tracking | sign_in_count, current_sign_in_at, last_sign_in_at, current_sign_in_ip, last_sign_in_ip | `track_sign_in(ip)` |
+# | timeout | | a session idle for `timeout_in` seconds (30 minutes) ends |
 #
 # Tokens (password reset, confirmation, unlock, remember me) are not kept
 # in the database: each is signed with HMAC-SHA256 under SESSION_SECRET and
@@ -27,8 +27,8 @@
 # digest and the time "remember me" was set.
 #
 # The controllers, views, routes and mails are the application's
-# (`kurt generate authentication`, `devise_for "users"`, `devise_helpers User`).
-module devise
+# (`kurt generate authentication`, `authentication_for "users"`, `authentication_helpers User`).
+module authentication
 
 import std/text
 import std/time::{Time}
@@ -48,7 +48,7 @@ pub class AuthFailure
   def initialize(@reason : String)
   end
 
-  # Devise's own words for it.
+  # The words the sign-in page shows.
   def message : String
     case @reason
     when "locked"       then "Your account is locked."
@@ -76,7 +76,7 @@ pub def sign_token(purpose : String, id : Int64, expires_at : Int64, fingerprint
 end
 
 def signature(purpose : String, id : Int64, expires_at : Int64, fingerprint : String) : String
-  HMAC.hexdigest(SHA256, token_secret, "kurt-devise|" + purpose + "|" + id.to_s + "|" + expires_at.to_s + "|" + fingerprint)
+  HMAC.hexdigest(SHA256, token_secret, "kurt-auth|" + purpose + "|" + id.to_s + "|" + expires_at.to_s + "|" + fingerprint)
 end
 
 # The id a token names, when it is well formed and not expired; whether it
@@ -107,15 +107,15 @@ pub def time_fingerprint(time : Time?) : String
   time ? time.to_unix.to_s : ""
 end
 
-# Devise's rules for a password: there when the record has none yet, 8 to
+# The rules for a password: there when the record has none yet, 8 to
 # 72 bytes (bcrypt reads no more), and the same as its confirmation when
 # one was given.
-pub def check_password(errors : Errors, password : String?, confirmation : String?, digest : String, minimum : Int32, validatable : Bool) : Nil
+pub def check_password(errors : Errors, password : String?, confirmation : String?, digest : String, minimum : Int32, validation : Bool) : Nil
   if password.nil? || password.empty?
     errors.add("password", "can't be blank") if digest.empty?
     return
   end
-  if validatable && password.size < minimum
+  if validation && password.size < minimum
     errors.add("password", "is too short (minimum is " + minimum.to_s + " characters)")
   end
   errors.add("password", "is too long (maximum is 72 bytes)") if password.bytesize > 72
@@ -140,7 +140,7 @@ end
 
 # Sign-in attempts counted per client and action, in fixed windows: what
 # keeps one address from trying passwords across many accounts, which
-# lockable (per account) does not. Off in test, as Rails' rate_limit is.
+# lock (per account) does not. Off in test, as Rails' rate_limit is.
 WINDOWS = Mutex.new { {} of String => Tuple(Int64, Int32) }
 
 # True when *key* (an address and an action) has made more than *limit*
@@ -172,35 +172,35 @@ pub def reset_rate_limits : Nil
   nil
 end
 
-# `devise :database_authenticatable, :registerable, ...` in a model: see
+# `authentication :password, :registration, ...` in a model: see
 # the module's comment. Options: `authentication_key: :email_address` for
 # another column, `password_length: 12` for a longer minimum,
-# `maximum_attempts:` and `unlock_in:` (seconds) for lockable,
-# `remember_for:` (seconds) for rememberable, `timeout_in:` (seconds) for
-# timeoutable, `reset_password_within:` and `confirm_within:` (seconds).
-pub macro devise(*modules, authentication_key = :email, password_length = 8, maximum_attempts = 5, unlock_in = 3600,
+# `maximum_attempts:` and `unlock_in:` (seconds) for lock,
+# `remember_for:` (seconds) for remember_me, `timeout_in:` (seconds) for
+# timeout, `reset_password_within:` and `confirm_within:` (seconds).
+pub macro authentication(*modules, authentication_key = :email, password_length = 8, maximum_attempts = 5, unlock_in = 3600,
                  remember_for = 1209600, timeout_in = 1800, reset_password_within = 21600, confirm_within = 259200)
   {% names = modules.map(&.id.stringify) %}
   {% for name in names %}
-    {% unless ["database_authenticatable", "registerable", "recoverable", "rememberable", "validatable", "confirmable", "lockable", "trackable", "timeoutable"].includes?(name) %}
-      {% raise "devise: unknown module :" + name + " (database_authenticatable, registerable, recoverable, rememberable, validatable, confirmable, lockable, trackable, timeoutable)" %}
+    {% unless ["password", "registration", "recovery", "remember_me", "validation", "confirmation", "lock", "tracking", "timeout"].includes?(name) %}
+      {% raise "authentication: unknown module :" + name + " (password, registration, recovery, remember_me, validation, confirmation, lock, tracking, timeout)" %}
     {% end %}
   {% end %}
-  {% unless names.includes?("database_authenticatable") %}
-    {% raise "devise: :database_authenticatable is the module the others build on" %}
+  {% unless names.includes?("password") %}
+    {% raise "authentication: :password is the module the others build on" %}
   {% end %}
   {% key = authentication_key.id %}
 
-  # The modules, for the controllers to ask: `User.devise?("confirmable")`.
-  def self.devise_modules : Array(String)
+  # The modules, for the controllers to ask: `User.authentication?("confirmation")`.
+  def self.authentication_modules : Array(String)
     [{% for name in names %}{{ name }}, {% end %}] of String
   end
 
-  def self.devise?(name : String) : Bool
-    devise_modules.includes?(name)
+  def self.authentication?(name : String) : Bool
+    authentication_modules.includes?(name)
   end
 
-  # ---- database_authenticatable --------------------------------------
+  # ---- password --------------------------------------
 
   @[::Db::Serializable::DBField(ignore: true)]
   @__kurt_password : String? = nil
@@ -243,10 +243,10 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
   end
 
   def __kurt_password_checks(errors : ::Kurt::Model::Errors) : Nil
-    \{% if @type.has_method?("__kurt_devise_checks") %}
-      __kurt_devise_checks(errors)
+    \{% if @type.has_method?("__kurt_auth_checks") %}
+      __kurt_auth_checks(errors)
     \{% end %}
-    ::Kurt::Devise.check_password(errors, @__kurt_password, @__kurt_password_confirmation, encrypted_password, {{ password_length }}, {{ names.includes?("validatable") }})
+    ::Kurt::Authentication.check_password(errors, @__kurt_password, @__kurt_password_confirmation, encrypted_password, {{ password_length }}, {{ names.includes?("validation") }})
   end
 
   def __kurt_digest_password : Nil
@@ -277,11 +277,11 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
   end
 
   # Addresses are kept trimmed and lowercase, so "Ada@Example.com " signs in.
-  def __kurt_devise_normalize
+  def __kurt_auth_normalize
     @{{ key }} = {{ key }}.strip.downcase
   end
 
-  ::Kurt::Model.before_validation :__kurt_devise_normalize
+  ::Kurt::Model.before_validation :__kurt_auth_normalize
 
   # The record an address signs in as, or nil.
   def self.find_for_authentication(value : String) : self | Nil | ::Db::Errors::DBError
@@ -291,31 +291,31 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
   # The record whose address and password these are, or why not
   # (AuthFailure). When there is no such address a password is checked
   # anyway, so the time it takes does not tell which addresses exist.
-  # Lockable counts the wrong passwords and locks; confirmable refuses an
+  # Lockable counts the wrong passwords and locks; confirmation refuses an
   # address not confirmed yet.
-  def self.authenticate(value : String, password : String) : self | ::Kurt::Devise::AuthFailure | ::Db::Errors::DBError
+  def self.authenticate(value : String, password : String) : self | ::Kurt::Authentication::AuthFailure | ::Db::Errors::DBError
     record = find_for_authentication(value)!
     if record.nil?
       ::Kurt::Model.verify_password(password, ::Kurt::Model.dummy_digest)
-      return ::Kurt::Devise::AuthFailure.new("invalid")
+      return ::Kurt::Authentication::AuthFailure.new("invalid")
     end
-    {% if names.includes?("lockable") %}
+    {% if names.includes?("lock") %}
       if record.access_locked?
-        return ::Kurt::Devise::AuthFailure.new("locked")
+        return ::Kurt::Authentication::AuthFailure.new("locked")
       end
     {% end %}
     unless record.valid_password?(password)
-      {% if names.includes?("lockable") %}
+      {% if names.includes?("lock") %}
         return record.__kurt_failed_attempt!
       {% else %}
-        return ::Kurt::Devise::AuthFailure.new("invalid")
+        return ::Kurt::Authentication::AuthFailure.new("invalid")
       {% end %}
     end
-    {% if names.includes?("lockable") %}
+    {% if names.includes?("lock") %}
       record.__kurt_reset_attempts!
     {% end %}
-    {% if names.includes?("confirmable") %}
-      return ::Kurt::Devise::AuthFailure.new("unconfirmed") unless record.confirmed?
+    {% if names.includes?("confirmation") %}
+      return ::Kurt::Authentication::AuthFailure.new("unconfirmed") unless record.confirmed?
     {% end %}
     record
   end
@@ -329,32 +329,32 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     nil
   end
 
-  {% if names.includes?("validatable") %}
-    # ---- validatable --------------------------------------------------
+  {% if names.includes?("validation") %}
+    # ---- validation --------------------------------------------------
     ::Kurt::Model.validates {{ authentication_key }}, presence: true, uniqueness: true
 
-    def __kurt_devise_checks(errors : ::Kurt::Model::Errors) : Nil
-      ::Kurt::Devise.check_email(errors, {{ key.stringify }}, {{ key }})
+    def __kurt_auth_checks(errors : ::Kurt::Model::Errors) : Nil
+      ::Kurt::Authentication.check_email(errors, {{ key.stringify }}, {{ key }})
     end
   {% end %}
 
-  {% if names.includes?("recoverable") %}
-    # ---- recoverable ------------------------------------------------------
+  {% if names.includes?("recovery") %}
+    # ---- recovery ------------------------------------------------------
 
     # A link's token for setting a new password, good for six hours and
     # until the password changes.
     def reset_password_token : String
-      ::Kurt::Devise.sign_token("reset", @id, ::Kurt::Devise.now_unix + {{ reset_password_within }}, encrypted_password)
+      ::Kurt::Authentication.sign_token("reset", @id, ::Kurt::Authentication.now_unix + {{ reset_password_within }}, encrypted_password)
     end
 
     # The record a reset token is for, or nil when it is not genuine, has
     # expired or was used.
     def self.with_reset_password_token(token : String) : self | Nil | ::Db::Errors::DBError
-      id = ::Kurt::Devise.token_id(token)
+      id = ::Kurt::Authentication.token_id(token)
       return nil if id.nil?
       record = find?(id)!
       return nil if record.nil?
-      ::Kurt::Devise.token_valid?(token, "reset", record.id, record.encrypted_password) ? record : nil
+      ::Kurt::Authentication.token_valid?(token, "reset", record.id, record.encrypted_password) ? record : nil
     end
 
     # Sets a new password from a reset form: false, with the reasons in
@@ -367,7 +367,7 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
       end
       self.password = new_password
       @__kurt_password_confirmation = confirmation
-      {% if names.includes?("lockable") %}
+      {% if names.includes?("lock") %}
         @failed_attempts = 0_i64
         @locked_at = nil
       {% end %}
@@ -375,8 +375,8 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     end
   {% end %}
 
-  {% if names.includes?("rememberable") %}
-    # ---- rememberable -------------------------------------------------
+  {% if names.includes?("remember_me") %}
+    # ---- remember_me -------------------------------------------------
 
     # Marks the record remembered: the remember cookie is good until
     # `forget_me` (signing out) or two weeks.
@@ -392,7 +392,7 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     end
 
     def remember_token : String
-      ::Kurt::Devise.sign_token("remember", @id, ::Kurt::Devise.now_unix + {{ remember_for }}, encrypted_password + "|" + ::Kurt::Devise.time_fingerprint(@remember_created_at))
+      ::Kurt::Authentication.sign_token("remember", @id, ::Kurt::Authentication.now_unix + {{ remember_for }}, encrypted_password + "|" + ::Kurt::Authentication.time_fingerprint(@remember_created_at))
     end
 
     def self.remember_for : Int32
@@ -404,17 +404,17 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     end
 
     def self.from_remember_token(token : String) : self | Nil | ::Db::Errors::DBError
-      id = ::Kurt::Devise.token_id(token)
+      id = ::Kurt::Authentication.token_id(token)
       return nil if id.nil?
       record = find?(id)!
       return nil if record.nil? || record.remember_created_at.nil?
-      fingerprint = record.encrypted_password + "|" + ::Kurt::Devise.time_fingerprint(record.remember_created_at)
-      ::Kurt::Devise.token_valid?(token, "remember", record.id, fingerprint) ? record : nil
+      fingerprint = record.encrypted_password + "|" + ::Kurt::Authentication.time_fingerprint(record.remember_created_at)
+      ::Kurt::Authentication.token_valid?(token, "remember", record.id, fingerprint) ? record : nil
     end
   {% end %}
 
-  {% if names.includes?("confirmable") %}
-    # ---- confirmable ----------------------------------------------------
+  {% if names.includes?("confirmation") %}
+    # ---- confirmation ----------------------------------------------------
 
     def confirmed? : Bool
       !@confirmed_at.nil?
@@ -437,24 +437,24 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     # only for this address.
     def confirmation_token : String
       @confirmation_sent_at = Time.utc
-      ::Kurt::Devise.sign_token("confirm", @id, ::Kurt::Devise.now_unix + {{ confirm_within }}, {{ key }})
+      ::Kurt::Authentication.sign_token("confirm", @id, ::Kurt::Authentication.now_unix + {{ confirm_within }}, {{ key }})
     end
 
     # Confirms the record a token is for: the record, or nil when the token
     # is not genuine or has expired.
     def self.confirm_by_token(token : String) : self | Nil | ::Db::Errors::DBError
-      id = ::Kurt::Devise.token_id(token)
+      id = ::Kurt::Authentication.token_id(token)
       return nil if id.nil?
       record = find?(id)!
       return nil if record.nil?
-      return nil unless ::Kurt::Devise.token_valid?(token, "confirm", record.id, record.{{ key }})
+      return nil unless ::Kurt::Authentication.token_valid?(token, "confirm", record.id, record.{{ key }})
       record.confirm! unless record.confirmed?
       record
     end
   {% end %}
 
-  {% if names.includes?("lockable") %}
-    # ---- lockable -------------------------------------------------------
+  {% if names.includes?("lock") %}
+    # ---- lock -------------------------------------------------------
 
     def self.maximum_attempts : Int32
       {{ maximum_attempts }}
@@ -481,7 +481,7 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     end
 
     # A wrong password: counted, and the account locked at the maximum.
-    def __kurt_failed_attempt : ::Kurt::Devise::AuthFailure | ::Db::Errors::DBError
+    def __kurt_failed_attempt : ::Kurt::Authentication::AuthFailure | ::Db::Errors::DBError
       # A lock that has run out starts the count again.
       unless @locked_at.nil? || access_locked?
         @locked_at = nil
@@ -492,9 +492,9 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
         @locked_at = Time.utc
       end
       ::Kurt::Model.update_row(self.class.table_name, ["failed_attempts", "locked_at"], [@failed_attempts.as(::Db::Value::DBValue), @locked_at.as(::Db::Value::DBValue)], @id)!
-      return ::Kurt::Devise::AuthFailure.new("locked") if access_locked?
-      return ::Kurt::Devise::AuthFailure.new("last_attempt") if @failed_attempts == {{ maximum_attempts }} - 1
-      ::Kurt::Devise::AuthFailure.new("invalid")
+      return ::Kurt::Authentication::AuthFailure.new("locked") if access_locked?
+      return ::Kurt::Authentication::AuthFailure.new("last_attempt") if @failed_attempts == {{ maximum_attempts }} - 1
+      ::Kurt::Authentication::AuthFailure.new("invalid")
     end
 
     def __kurt_reset_attempts : Nil | ::Db::Errors::DBError
@@ -507,22 +507,22 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
 
     # The token of the unlock mail's link, good while this lock lasts.
     def unlock_token : String
-      ::Kurt::Devise.sign_token("unlock", @id, ::Kurt::Devise.now_unix + {{ unlock_in }}, ::Kurt::Devise.time_fingerprint(@locked_at))
+      ::Kurt::Authentication.sign_token("unlock", @id, ::Kurt::Authentication.now_unix + {{ unlock_in }}, ::Kurt::Authentication.time_fingerprint(@locked_at))
     end
 
     def self.unlock_by_token(token : String) : self | Nil | ::Db::Errors::DBError
-      id = ::Kurt::Devise.token_id(token)
+      id = ::Kurt::Authentication.token_id(token)
       return nil if id.nil?
       record = find?(id)!
       return nil if record.nil? || record.locked_at.nil?
-      return nil unless ::Kurt::Devise.token_valid?(token, "unlock", record.id, ::Kurt::Devise.time_fingerprint(record.locked_at))
+      return nil unless ::Kurt::Authentication.token_valid?(token, "unlock", record.id, ::Kurt::Authentication.time_fingerprint(record.locked_at))
       record.unlock_access!
       record
     end
   {% end %}
 
-  {% if names.includes?("trackable") %}
-    # ---- trackable ------------------------------------------------------
+  {% if names.includes?("tracking") %}
+    # ---- tracking ------------------------------------------------------
 
     # Counts a sign-in from *ip*, keeping the one before it as the last.
     def track_sign_in(ip : String?) : Nil | ::Db::Errors::DBError
@@ -540,8 +540,8 @@ pub macro devise(*modules, authentication_key = :email, password_length = 8, max
     end
   {% end %}
 
-  {% if names.includes?("timeoutable") %}
-    # ---- timeoutable ----------------------------------------------------
+  {% if names.includes?("timeout") %}
+    # ---- timeout ----------------------------------------------------
 
     # Seconds a signed-in session may sit idle.
     def self.timeout_in : Int32

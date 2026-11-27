@@ -164,7 +164,7 @@ pub def fixture_rows(set : FixtureSet, tables : Array(Table), now : Time = Time.
         values << converted
       elsif key == "password" && (names.includes?("encrypted_password") || names.includes?("password_digest"))
         password = value.as_s? || value.to_s
-        # Devise's column, or has_secure_password's.
+        # kurt generate authentication's column, or has_secure_password's.
         columns << (names.includes?("encrypted_password") ? "encrypted_password" : "password_digest")
         values << Bcrypt.hash(password, 4)
       elsif names.includes?(key + "_id")

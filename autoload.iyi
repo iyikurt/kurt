@@ -47,7 +47,7 @@ pub class Source
 end
 
 pub def models_imports : Array(String)
-  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*", "import kurt/devise::*", "import kurt/storage::*"]
+  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*", "import kurt/authentication::*", "import kurt/storage::*"]
 end
 
 pub def mailers_imports : Array(String)
@@ -59,7 +59,7 @@ end
 pub def controllers_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
    "import web/iyi_web/templates::{raw, content_for, yield_content}",
-   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import kurt/devise::*",
+   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import kurt/authentication::*",
    "import kurt/storage::*", "import app/models::*", "import app/mailers::*", "import app/jobs::*"]
 end
 

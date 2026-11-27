@@ -1,11 +1,11 @@
-module test/devise_test
+module test/authentication_test
 
 import std/text
 import std/time::{Time}
 import db/db/errors::{DBError}
 import datasource::{database, postgres?}
 import model::*
-import devise::*
+import authentication::*
 
 class Account
   property email : String
@@ -22,8 +22,8 @@ class Account
   property current_sign_in_ip : String?
   property last_sign_in_ip : String?
 
-  devise :database_authenticatable, :registerable, :recoverable, :rememberable, :validatable,
-    :confirmable, :lockable, :trackable, :timeoutable, maximum_attempts: 3
+  authentication :password, :registration, :recovery, :remember_me, :validation,
+    :confirmation, :lock, :tracking, :timeout, maximum_attempts: 3
 
   derive model
 end
@@ -33,21 +33,21 @@ class Member
   property email : String
   property encrypted_password : String
 
-  devise :database_authenticatable
+  authentication :password
 
   derive model
 end
 
 NOTES = [] of String
 
-# Lines of the class's own after `devise`: every one runs, and so do the
-# ones `devise` wrote (normalizing the address, validatable's checks).
+# Lines of the class's own after `authentication`: every one runs, and so do the
+# ones `authentication` wrote (normalizing the address, validation's checks).
 class Writer
   property email : String
   property encrypted_password : String
   property name : String
 
-  devise :database_authenticatable, :validatable
+  authentication :password, :validation
   before_validation :note
   validates :name, presence: true
   validates :name, length: {maximum: 5}
@@ -75,10 +75,10 @@ end
 
 def run_all : Nil | DBError | NotFound | Invalid
   setup!
-  assert Account.devise?("lockable")
-  assert !Member.devise?("lockable")
+  assert Account.authentication?("lock")
+  assert !Member.authentication?("lock")
 
-  # validatable: an address, unique; a password of 8 or more, confirmed
+  # validation: an address, unique; a password of 8 or more, confirmed
   bad = Account.new(email: "nope", password: "short", password_confirmation: "other")
   assert !bad.save!
   assert bad.errors.on("email") == ["is invalid"]
@@ -104,7 +104,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert ada.save!
   assert ada.valid_password?("password123")
 
-  # confirmable: not until the address is confirmed
+  # confirmation: not until the address is confirmed
   case result = Account.authenticate("ada@example.com", "password123")!
   in AuthFailure then assert result.reason == "unconfirmed"
   in Account then assert false
@@ -124,7 +124,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   in Account then assert false
   end
 
-  # lockable: three wrong passwords lock the account, the second warns
+  # lock: three wrong passwords lock the account, the second warns
   assert Account.authenticate("ada@example.com", "wrong-one")!.as(AuthFailure).reason == "invalid"
   assert Account.authenticate("ada@example.com", "wrong-two")!.as(AuthFailure).reason == "last_attempt"
   assert Account.authenticate("ada@example.com", "wrong-three")!.as(AuthFailure).reason == "locked"
@@ -138,7 +138,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert Account.authenticate("ada@example.com", "password123")!.is_a?(Account)
   assert Account.find(ada.id)!.failed_attempts == 0
 
-  # recoverable: a token good until the password changes
+  # recovery: a token good until the password changes
   ada = Account.find(ada.id)!
   reset = ada.reset_password_token
   found = Account.with_reset_password_token(reset)!.as(Account)
@@ -149,7 +149,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert Account.with_reset_password_token(reset)!.nil?
   assert Account.authenticate("ada@example.com", "new-password-1")!.is_a?(Account)
 
-  # rememberable: a cookie's token, void once forgotten
+  # remember_me: a cookie's token, void once forgotten
   ada = Account.find(ada.id)!
   assert ada.remember_me!
   remember = ada.remember_token
@@ -157,7 +157,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert ada.forget_me!
   assert Account.from_remember_token(remember)!.nil?
 
-  # trackable
+  # tracking
   ada.track_sign_in("10.0.0.1")!
   ada.track_sign_in("10.0.0.2")!
   tracked = Account.find(ada.id)!
@@ -177,7 +177,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   bob = Member.create(email: "bob", password: "x")!
   assert Member.authenticate("bob", "x")!.as(Member).id == bob.id
 
-  # devise's own callbacks and validations, with the class's after them
+  # authentication's own callbacks and validations, with the class's after them
   w = Writer.new(email: " W@Example.com ", name: "far too long", password: "short")
   assert !w.save!
   assert w.email == "w@example.com"
@@ -198,7 +198,7 @@ def run_all : Nil | DBError | NotFound | Invalid
 end
 
 case failure = run_all
-in Nil then puts "devise: all assertions passed" + (postgres? ? " (postgres)" : "")
+in Nil then puts "authentication: all assertions passed" + (postgres? ? " (postgres)" : "")
 in DBError, NotFound, Invalid
   STDERR.puts failure.message
   exit 1

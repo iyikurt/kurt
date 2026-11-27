@@ -659,7 +659,7 @@ end
 
 # ---------------------------------------------------------------------------
 # Authentication: what is left of the generator Kurt had before the
-# Devise-shaped one (devise_generators.iyi): the password fields a users
+# one in authentication_generators.iyi: the password fields a users
 # scaffold gets, and the sign-in line of tests in applications made with it.
 # ---------------------------------------------------------------------------
 
@@ -1217,14 +1217,14 @@ pub def agents_md(app : String) : String
 
   ## Authentication (after `kurt generate authentication`)
 
-  - Devise's shape: `devise :database_authenticatable, :registerable, :recoverable, :rememberable,
-    :validatable` in app/models/user.iyi (also :confirmable, :lockable, :trackable, :timeoutable;
-    their columns are in the users table), `devise_for "users"` in config/routes.iyi,
-    `devise_helpers User` in ApplicationController.
+  - `authentication :password, :registration, :recovery, :remember_me,
+    :validation` in app/models/user.iyi (also :confirmation, :lock, :tracking, :timeout;
+    their columns are in the users table), `authentication_for "users"` in config/routes.iyi,
+    `authentication_helpers User` in ApplicationController.
   - `before_action :authenticate_user!` on a controller whose pages need a signed-in user;
     `current_user` (User?), `user_signed_in?`, `sign_in(user)`, `sign_out(user)` in controllers and views.
   - Pages: /users/sign_in, /users/sign_up, /users/edit, /users/password/new (`kurt routes` lists them).
-    Kurt ships their controllers and views; `kurt generate devise:views` / `devise:controllers` copy
+    Kurt ships their controllers and views; `kurt generate authentication:views` / `authentication:controllers` copy
     them into app/ to change them.
   - Tests: `sign_in(users(:ada))`; a fixture's `password:` becomes encrypted_password.
 

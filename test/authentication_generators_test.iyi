@@ -1,0 +1,83 @@
+module test/authentication_generators_test
+
+import std/text
+import authentication_generators::*
+
+# the scopes of config/routes.iyi, with a path when given
+assert auth_for_scopes("root HomeController, :index\nauthentication_for \"users\"\n  authentication_for \"admins\", path: \"staff\"\n") == [{"users", nil}, {"admins", "staff"}]
+
+# a model's modules, over more than one line, and its key
+model = "class User < ApplicationRecord\n  authentication :password, :registration,\n         :lock, authentication_key: :email_address\nend\n"
+assert auth_modules_of(model) == ["password", "registration", "lock"]
+assert auth_key_of(model) == "email_address"
+assert auth_key_of("authentication :password\n") == "email"
+assert auth_modules_of("class User < ApplicationRecord\nend\n").nil?
+
+scope = AuthScope.new("users", DEFAULT_MODULES + ["confirmation"], "email", ["name"])
+assert scope.model == "User"
+assert scope.controller("sessions") == "UserSessionsController"
+assert scope.kinds == ["sessions", "registrations", "passwords", "confirmations"]
+assert scope.mails?
+assert scope.path == "/users"
+assert AuthScope.new("users", ["password"], "email", [] of String, "auth").path == "/auth"
+assert auth_for_line(AuthScope.new("users", DEFAULT_MODULES, "email", [] of String, "auth")) == "authentication_for \"users\", path: \"auth\""
+assert auth_helpers_line(scope) == "  authentication_helpers User\n"
+
+# the model and its columns
+assert auth_model(DEFAULT_MODULES).includes?("  authentication :password, :registration, :recovery, :remember_me, :validation\n")
+assert auth_model(DEFAULT_MODULES).includes?(":confirmation, :lock, :tracking, :timeout")
+created = auth_users_migration("email", false)
+assert created.includes?("  encrypted_password TEXT NOT NULL DEFAULT ''")
+assert created.includes?("  locked_at DATETIME")
+assert created.includes?("CREATE UNIQUE INDEX users_email ON users (email);")
+assert auth_users_migration("email", true).includes?("  failed_attempts BIGINT NOT NULL DEFAULT 0")
+added = auth_columns_migration("email", ["id", "name", "email", "remember_created_at"], false)
+assert added.includes?("ALTER TABLE users ADD COLUMN encrypted_password TEXT NOT NULL DEFAULT '';")
+assert !added.includes?("ADD COLUMN email ")
+assert !added.includes?("remember_created_at")
+
+# routes: the modules' routes, to the scope's controllers
+routes = auth_routes_source(scope)
+assert routes.includes?("pub def __kurt_auth_routes_users(router : Router) : Nil\n")
+assert routes.includes?("  post \"/users/sign_in\", UserSessionsController, :create\n")
+assert routes.includes?("  patch \"/users/password\", UserPasswordsController, :update\n")
+assert routes.includes?("  get \"/users/confirmation\", UserConfirmationsController, :show\n")
+assert !routes.includes?("unlock")
+
+# controllers: Kurt's render the paths the build chose, a copy renders app/views/authentication
+paths = {"layout" => "/app/views/layouts/application.eiy", "sessions/new" => "/kurt/views/sessions/new.eiy"}
+shipped = auth_controller("sessions", scope, paths)
+assert shipped.includes?("class UserSessionsController < ApplicationController\n  skip_before_action :authenticate_user!\n")
+assert shipped.includes?("render_file \"/kurt/views/sessions/new.eiy\", \"/app/views/layouts/application.eiy\", status: 422")
+assert shipped.includes?("case found = User.authenticate(form[:email], form[:password])!")
+assert shipped.includes?("sign_in(found, remember: form[:remember_me] == \"1\")!")
+assert shipped.includes?("rate_limited?(")
+copied = auth_controller("sessions", scope)
+assert copied.includes?("render \"authentication/sessions/new\", status: 422")
+assert auth_controller("registrations", scope).includes?("UserAuthenticationMailer.confirmation_instructions(@user, token).deliver_now!")
+assert auth_controller("registrations", AuthScope.new("users", DEFAULT_MODULES)).includes?("sign_in(@user)!")
+assert auth_controller("registrations", scope).includes?("[\"name\"] of String")
+assert auth_controller("passwords", scope).includes?("UserAuthenticationMailer.reset_password_instructions(found, found.reset_password_token).deliver_now!")
+
+# the mailer: only the mails its modules send
+mailer = auth_mailer(scope, "ApplicationMailer")
+assert mailer.includes?("class UserAuthenticationMailer < ApplicationMailer\n")
+assert mailer.includes?("views: \"../views/authentication/mailer/reset_password_instructions\"")
+assert !mailer.includes?("unlock_instructions")
+
+# views, with daisyUI or plain
+assert auth_view("sessions/new", "email", true).includes?("<% form_with model: resource, url: scope_path + \"/sign_in\", scope: resource_name, method: :post, class: \"card bg-base-100 shadow-sm\" do |f| %>")
+assert auth_view("sessions/new", "email", false).includes?("class: \"form\" do |f| %>")
+assert auth_view("registrations/new", "email", true).includes?("<% sign_up_fields.each do |field| %>")
+assert auth_view("passwords/edit", "email", true).includes?("f.hidden_field :reset_password_token, value: @reset_password_token")
+assert auth_view("shared/_links", "email", true).includes?("authentication_module?(\"recovery\")")
+assert auth_mail_view("reset_password_instructions", "email", false).includes?("<%= app_url %><%= scope_path %>/password/edit?reset_password_token=<%= @token %>")
+assert auth_mail_view("confirmation_instructions", "email", true).includes?("<a href=")
+
+# the test: confirmation followed when confirmation
+assert auth_test(scope).includes?("confirmation_token=")
+assert auth_test(scope).includes?("user%5Bname%5D=New")
+assert !auth_test(AuthScope.new("users", DEFAULT_MODULES)).includes?("confirmation_token=")
+assert with_auth_classes("@source \"../../views/**/*.eiy\";\n").as(String).includes?("max-w-sm")
+
+puts "authentication generators: all assertions passed"
