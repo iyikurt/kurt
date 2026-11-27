@@ -2,6 +2,7 @@ module test/model_test
 
 import std/text
 import db/db/errors::{DBError}
+import db/db/value::{DBValue}
 import datasource::{database, postgres?}
 import std/regex::{Regex}
 import model::*
@@ -157,6 +158,149 @@ class Member
   def validate(errors : Errors) : Nil
     errors.add("name", "can't be root") if name == "root"
   end
+end
+
+# has_many :through, both ways: across a join table (taggings), and across
+# a has_many whose rows the target belongs to (writers -> notes -> remarks).
+pub class Writer
+  property name : String
+
+  has_many notes : Note
+  has_many remarks : Remark, through: :notes
+  has_many taggings : Tagging, foreign_key: note_id
+
+  derive model
+end
+
+pub class Note
+  property title : String
+  property writer_id : Int64
+  property views : Int64
+  property score : Float64
+
+  belongs_to writer : Writer
+  has_many remarks : Remark
+  has_many taggings : Tagging
+  has_many tags : Tag, through: :taggings
+
+  derive model
+end
+
+pub class Remark
+  property body : String
+  property note_id : Int64
+
+  derive model
+end
+
+pub class Tag
+  property name : String
+
+  derive model
+end
+
+pub class Tagging
+  property note_id : Int64
+  property tag_id : Int64
+
+  derive model
+end
+
+def setup_queries : Nil | DBError
+  db = database
+  id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres? ? "BIGINT" : "INTEGER"
+  float = postgres? ? "DOUBLE PRECISION" : "REAL"
+  ["taggings", "tags", "remarks", "notes", "writers"].each { |t| db.exec("DROP TABLE IF EXISTS " + t)! }
+  db.exec("CREATE TABLE writers (id " + id + ", name TEXT NOT NULL)")!
+  db.exec("CREATE TABLE notes (id " + id + ", title TEXT NOT NULL, writer_id " + int + " NOT NULL, views " + int + " NOT NULL DEFAULT 0, score " + float + " NOT NULL DEFAULT 0)")!
+  db.exec("CREATE TABLE remarks (id " + id + ", body TEXT NOT NULL, note_id " + int + " NOT NULL)")!
+  db.exec("CREATE TABLE tags (id " + id + ", name TEXT NOT NULL)")!
+  db.exec("CREATE TABLE taggings (id " + id + ", note_id " + int + " NOT NULL, tag_id " + int + " NOT NULL)")!
+  nil
+end
+
+def run_queries : Nil | DBError | NotFound | Invalid
+  setup_queries!
+  ada = Writer.create(name: "Ada")!
+  bob = Writer.create(name: "Bob")!
+  cy = Writer.create(name: "Cy")!
+  one = Note.create(title: "One", writer_id: ada.id, views: 10, score: 1.5)!
+  two = Note.create(title: "Two", writer_id: ada.id, views: 30, score: 2.5)!
+  three = Note.create(title: "Three", writer_id: bob.id, views: 5, score: 4.0)!
+  Remark.create(body: "first", note_id: one.id)!
+  Remark.create(body: "second", note_id: one.id)!
+  Remark.create(body: "third", note_id: three.id)!
+  red = Tag.create(name: "red")!
+  blue = Tag.create(name: "blue")!
+  Tagging.create(note_id: one.id, tag_id: red.id)!
+  Tagging.create(note_id: one.id, tag_id: blue.id)!
+  Tagging.create(note_id: two.id, tag_id: red.id)!
+
+  # has_many :through a join table, and through a has_many
+  assert one.tags.order(:name).all!.map(&.name) == ["blue", "red"]
+  assert two.tags.count! == 1
+  assert three.tags.all!.empty?
+  assert ada.remarks.order(:id).all!.map(&.body) == ["first", "second"]
+  assert bob.remarks.count! == 1
+  assert cy.remarks.all!.empty?
+
+  # joins: a belongs_to, a has_many (with distinct), a through; where on the joined table
+  assert Note.joins(:writer).where("writers.name", "Ada").order(:id).all!.map(&.title) == ["One", "Two"]
+  assert Note.joins(:remarks).count! == 3
+  assert Note.joins(:remarks).distinct.count! == 2
+  assert Note.joins(:remarks).distinct.order(:id).all!.map(&.title) == ["One", "Three"]
+  assert Note.joins(:tags).where("tags.name", "red").order(:id).pluck(:title, String)! == ["One", "Two"]
+  assert Writer.joins(:remarks).distinct.order(:name).pluck(:name, String)! == ["Ada", "Bob"]
+  # a column of the model's own is qualified once there are joins: `id` is not ambiguous
+  assert Note.joins(:writer).where(id: one.id).first!.title == "One"
+  # left_joins: writers with no notes too
+  assert Writer.left_joins(:notes).where_sql("notes.id IS NULL").pluck(:name, String)! == ["Cy"]
+  assert Note.joins(:nothing).all.is_a?(DBError)
+
+  # pluck, ids, select, distinct
+  assert Note.order(:id).pluck(:title, String)! == ["One", "Two", "Three"]
+  assert Note.order(:id).pluck(:views, Int64)! == [10_i64, 30_i64, 5_i64]
+  assert Note.order(:id).pluck(:title, :views)!.map { |row| row[0] } == ["One", "Two", "Three"] of DBValue
+  assert Note.where(writer_id: ada.id).ids! == [one.id, two.id]
+  assert Note.select(:writer_id).distinct.count! == 2
+  assert Note.distinct.order(:writer_id).pluck(:writer_id, Int64)! == [ada.id, bob.id]
+  assert Note.select("notes.*").joins(:writer).where("writers.name", "Bob").first!.title == "Three"
+
+  # calculations
+  assert Note.sum(:views)! == 45.0
+  assert Note.sum(:views, Int64)! == 45
+  assert Note.where(writer_id: ada.id).sum(:score)! == 4.0
+  assert Note.where(writer_id: cy.id).sum(:views)! == 0.0
+  assert Note.average(:views)! == 15.0
+  assert Note.where(writer_id: cy.id).average(:views)!.nil?
+  assert Note.minimum(:views, Int64)! == 5
+  assert Note.maximum(:score, Float64)! == 4.0
+  assert Note.maximum(:title, String)! == "Two"
+  assert Note.where(writer_id: cy.id).maximum(:views, Int64)!.nil?
+
+  # group_by and having
+  counts = Note.group_by(:writer_id).counts!
+  assert counts[ada.id] == 2
+  assert counts[bob.id] == 1
+  assert Note.group_by(:writer_id).having("COUNT(*) > ?", [1] of DBValue).counts!.keys == [ada.id] of DBValue
+  sums = Note.group_by(:writer_id).sums(:views)!
+  assert sums[ada.id] == 40.0
+  assert Note.group_by(:writer_id).averages(:score)![ada.id] == 2.0
+  assert Note.group_by(:writer_id).maximums(:views)![bob.id] == 5_i64
+  assert Note.group_by(:writer_id).count! == 2          # groups, counted
+  assert Note.query.counts.is_a?(DBError)           # counts needs group_by
+
+  # or_where: either side's conditions together
+  either = Note.where(writer_id: bob.id).or_where(Note.where(title: "Two")).order(:id)
+  assert either.pluck(:title, String)! == ["Two", "Three"]
+  assert Note.where(views: 10).where(writer_id: ada.id).or_where(Note.where(views: 5)).count! == 2
+  assert Note.joins(:writer).where("writers.name", "Ada").or_where(Note.joins(:writer).where("writers.name", "Bob")).count! == 3
+
+  # delete_all through a join
+  assert Remark.joins("INNER JOIN notes ON notes.id = remarks.note_id").where("notes.title", "One").delete_all! == 2
+  assert Remark.count! == 1
+  nil
 end
 
 def setup : Nil | DBError
@@ -500,6 +644,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   in User, DBError then assert false
   end
 
+  run_queries!
   puts "model: all assertions passed" + (postgres? ? " (postgres)" : " (sqlite)")
   nil
 end

@@ -1141,6 +1141,11 @@ pub def agents_md(app : String) : String
   - `Post.all`, `Post.find(id)` (NotFound when missing), `Post.find?(id)` (nil), `Post.first`, `Post.first?`, `Post.count`
   - `Post.where(published: true).order_desc(:id).paginate(page, per: 20).all`
   - one typed finder per field: `Post.title("Hello").first?`
+  - `Post.joins(:user).where("users.name", "Ada")`, `left_joins`, `distinct`, `select("posts.*, ...")`
+  - `Post.pluck(:title, String)`, `ids`, `sum(:views)`, `average`, `minimum(:at, Time)`, `maximum`
+  - `Post.group_by(:user_id).having("COUNT(*) > ?", [1]).counts` (also sums, averages...);
+    `group_by`, not `group`, and `or_where(other_query)`, not `.or`: both are iyi keywords
+  - `has_many tags : Tag, through: :taggings`
   - `Post.includes(:user, :comments).all` loads associations with the rows (no N+1);
     `post.user` and `post.comments` then ask nothing more
   - `Post.create(title: "Hi")`, `post.save`, `post.destroy`, `post.increment(:comments_count)`

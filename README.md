@@ -337,6 +337,75 @@ end
 `save` does not open a transaction by itself. If a record and its
 callbacks must be written together, save it in a `transaction` block.
 
+### Joins, calculations and other queries
+
+```iyi
+Post.joins(:user).where("users.name", "Ada").all!        # INNER JOIN users ON users.id = posts.user_id
+Post.joins(:comments).distinct.count!                    # posts with a comment, each once
+User.left_joins(:posts).where_sql("posts.id IS NULL").all!   # users without posts
+Post.joins("INNER JOIN tags ON tags.id = posts.tag_id")  # a join written out
+
+Post.pluck(:title, String)!                   # Array(String)
+Post.pluck(:id, :title)!                      # Array(Array(DBValue))
+Post.where(published: true).ids!              # Array(Int64)
+Post.select(:user_id).distinct.count!
+Post.select("posts.*, users.name AS author").joins(:user).all!
+
+Order.sum(:total)!                            # Float64; 0.0 when no row matches
+Order.sum(:quantity, Int64)!
+Order.average(:total)!                        # Float64?, nil when no row matches
+Order.minimum(:created_at, Time)!             # Time?
+Order.maximum(:total)!                        # DBValue
+
+Post.group_by(:user_id).counts!               # {1 => 3, 2 => 1}: Hash(DBValue, Int64)
+Post.group_by(:user_id).having("COUNT(*) > ?", [1]).counts!
+Order.group_by(:status).sums(:total)!         # also averages, minimums, maximums
+
+Post.where(published: true).or_where(Post.where(user_id: 5)).all!
+```
+
+- `joins(:name)` and `left_joins(:name)` follow the model's `belongs_to`,
+  `has_many` and `has_one` lines. An unknown name answers a `DBError` when
+  the query runs.
+- Once a query joins, a column of the model's own (`where(id: 5)`,
+  `order(:title)`) is written with its table's name, so it is not
+  ambiguous. Columns of other tables are written with theirs:
+  `where("users.name", "Ada")`.
+- A `has_many` join returns a row once per associated row; `distinct`
+  returns each once.
+- `select` changes the columns read. `all` still makes models, so a
+  selection has to give every field the model has (`posts.*, ...`). For
+  other values use `pluck`.
+- Two Rails names are reserved words in iyi: `group` (the task group) is
+  `group_by`, and `.or` (error recovery) is `or_where`.
+- Grouped `counts`, `sums`, `averages`, `minimums` and `maximums` answer a
+  hash keyed by the group's value. `group_by(:user_id).count` counts the
+  groups.
+
+### has_many :through
+
+```iyi
+class Post < ApplicationRecord
+  has_many taggings : Tagging
+  has_many tags : Tag, through: :taggings          # taggings.post_id and taggings.tag_id
+end
+
+class User < ApplicationRecord
+  has_many posts : Post
+  has_many comments : Comment, through: :posts     # posts.user_id and comments.post_id
+end
+
+post.tags.order(:name).all!
+user.comments.count!
+Post.joins(:tags).where("tags.name", "iyi").distinct.all!
+```
+
+The through table is the one its name says. Kurt reads from the target's
+columns which side holds the key: a `Comment` with `post_id` belongs to the
+through table, and a `Tag` without `tagging_id` is pointed at by
+`taggings.tag_id`. `source_key: :label_id` names that key when it is not
+`<target>_id`. `includes` does not preload a through association.
+
 ### Preloading (`includes`)
 
 A list that asks for each row's association separately makes 26 queries
@@ -1105,7 +1174,7 @@ The model, fixture, devise and jobs tests pass on both SQLite and PostgreSQL 16.
 
 | File | |
 |---|---|
-| `model.iyi` | `Query(T)`, `derive model`, association macros, `NotFound` / `Invalid` / `Errors` |
+| `model.iyi` | `Query(T)` (joins, pluck, calculations, group_by), `derive model`, association macros (through), `NotFound` / `Invalid` / `Errors` |
 | `controllers.iyi` | `Controller`, `render`, route macros, `before_action`, error pages |
 | `strong_parameters.iyi` | `params.require(...).permit(...)` |
 | `helpers.iyi` | view helpers |
