@@ -559,10 +559,64 @@ Templates have no `!` and no `.or`. An association is narrowed with
 <% if (user = @post.user?).is_a?(User) %><%= user.name %><% end %>
 ```
 
+### Forms
+
+`form_with` builds a form from a record, as in Rails. It is a `<% %>` tag,
+not `<%= %>`: the form is written as the template runs.
+
+```erb
+<% form_with model: @post, class: "card" do |f| %>
+  <%= f.label :title %>
+  <%= f.text_field :title, placeholder: "A title" %>
+  <%= f.text_area :body, rows: 8 %>
+  <label><%= f.check_box :published %> Published</label>
+  <%= f.select :user_id, @users.map { |u| {u.name, u.id} }, prompt: "Select a user" %>
+  <%= f.submit %>                                  <%# "Create Post", or "Update Post" %>
+<% end %>
+```
+
+- The fields are named in the model's scope (`post[title]`, id
+  `post_title`), which is what `params.require(:post)` reads. Each shows
+  the record's value.
+- A new record posts to `/posts`. A saved one posts to `/posts/7` with
+  `_method=patch`. `url:` and `method:` say otherwise.
+- The CSRF field is always in the form.
+- A field that did not validate (`@post.errors.on("title")`) gets
+  `aria-invalid="true"`. With `form_style :daisyui` it also gets daisyUI's
+  `input-error` (`select-error`, `textarea-error`...).
+- Without a model, `url:` is the path and the fields are bare, or in
+  `scope:`: `form_with url: "/search", method: :get do |f|`.
+- `multipart: true` lets a form send files. Other attributes go on the
+  `<form>` tag (`data_turbo: false`).
+
+| Builder method | Writes |
+|---|---|
+| `label :title, "Text"` | `<label for="post_title">`; the text defaults to the humanized field (`user_id` is "User") |
+| `text_field`, `email_field`, `password_field`, `number_field`, `url_field`, `search_field`, `telephone_field`, `date_field`, `datetime_field`, `hidden_field` | an `<input>` of that type; `password_field` never shows the value |
+| `text_area :body, rows: 8` | a `<textarea>` |
+| `check_box :published` | a hidden `0` and a checkbox `1`, as Rails does |
+| `select :role, ["admin", "member"]` or `select :user_id, [{"Ada", 1}]` | a `<select>`; `prompt:` or `include_blank: true` adds an empty first option |
+| `file_field :avatar` | a file input |
+| `submit "Save"` | a submit button |
+
+Every method takes other attributes too (`required: true`,
+`autocomplete: "email"`). `class:` replaces the style's class.
+
+`form_style :daisyui` in `ApplicationController` gives the fields daisyUI's
+classes (`input`, `select`, `textarea`, `checkbox`, `btn btn-primary`,
+labels `fieldset-legend`). `kurt new` writes it into Tailwind applications,
+and `app/assets/tailwind/app.css` names these classes with
+`@source inline(...)`, since no view contains them. Without `form_style`,
+the builder adds no classes.
+
+Scaffolds and `kurt generate authentication` write their forms with
+`form_with`.
+
 ### Associated records in forms
 
-In a scaffold, a field like `user:references` becomes a select box when a
-`User` model exists. The options show that table's first text column:
+In a scaffold, a field like `user:references` becomes a select box
+(`f.select :user_id, @users.map { |option| {option.name, option.id} }`) when
+a `User` model exists. The options show that table's first text column:
 `name`, or `title` for posts. If the schema does not have the table yet,
 the column is read from its `create_` migration. The controller loads the
 list in a filter:
@@ -717,8 +771,9 @@ Themes:
 
 In such an application, scaffolds use daisyUI components:
 - `navbar`, `btn`, `table`, `card`, `fieldset`, `alert`;
-- `input`, `select` and `textarea` (a field that fails validation turns red
-  with `input-error`).
+- `input`, `select` and `textarea`, through `form_with` and
+  `form_style :daisyui` (a field that fails validation turns red with
+  `input-error`).
 
 `kurt new blog --css none` installs none of this: the application comes
 with a plain `public/assets/app.css` and simple classes. For an application
@@ -835,6 +890,7 @@ The model and fixture tests pass on both SQLite and PostgreSQL 16.
 | `controllers.iyi` | `Controller`, `render`, route macros, `before_action`, error pages |
 | `strong_parameters.iyi` | `params.require(...).permit(...)` |
 | `helpers.iyi` | view helpers |
+| `forms.iyi` | `form_with`'s form builder |
 | `json_writer.iyi` | the JSON that `json(data)` writes |
 | `exporter.iyi` | `kurt export`'s routes, output files and links |
 | `migrator.iyi` | timestamped SQL migrations |

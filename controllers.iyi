@@ -41,6 +41,7 @@ import strong_parameters::{Parameters}
 import std/html::{HTML}
 import web/iyi_web/templates::{SafeHTML}
 import helpers::{attributes_html}
+import forms::{FormBuilder, form_values}
 import json_writer
 
 pub import web/iyi_web/context
@@ -48,6 +49,7 @@ pub import web/iyi_web/templates
 pub import model
 pub import strong_parameters
 pub import helpers
+pub import forms
 
 # The visitor must sign in first. A page sends them to the login page; a
 # JSON request gets 401.
@@ -271,6 +273,31 @@ pub class Controller
                  (form_method == "post" ? csrf_field : "") + hidden + "<button type=\"submit\"" + attributes_html(class: klass) + ">" + inner + "</button></form>")
   end
 
+  # The classes `form_with`'s fields get: "plain" (none) or "daisyui".
+  # `form_style :daisyui` in ApplicationController sets it.
+  def form_style : String
+    "plain"
+  end
+
+  # What `form_with` builds for a record: its scope (`post`), its path
+  # (`/posts`, or `/posts/7` with `_method=patch` once saved), its values
+  # and its errors.
+  def __kurt_form_builder(model : T, url : String?, method : Symbol | String | Nil, scope : Symbol | String | Nil, html_class : String?, multipart : Bool, attrs : String) : FormBuilder forall T
+    saved = model.persisted?
+    action = url || (saved ? path_to(model) : "/" + T.table_name)
+    verb = method ? method.to_s : (saved ? "patch" : "post")
+    name = scope ? scope.to_s : ::Kurt::Inflector.underscore(T.model_name)
+    FormBuilder.new(name.empty? ? nil : name, action, verb, form_style, form_values(model), model.errors, saved, T.model_name, csrf_field, html_class, multipart, attrs)
+  end
+
+  # A form with no record: `form_with url: "/login" do |f|`; fields are
+  # bare (`email`) unless `scope:` names one.
+  def __kurt_form_builder(model : Nil, url : String?, method : Symbol | String | Nil, scope : Symbol | String | Nil, html_class : String?, multipart : Bool, attrs : String) : FormBuilder
+    verb = method ? method.to_s : "post"
+    name = scope ? scope.to_s : nil
+    FormBuilder.new(name, url || env.request.path, verb, form_style, {} of String => ::Db::Value::DBValue, nil, false, "", csrf_field, html_class, multipart, attrs)
+  end
+
   # Whether the request is for *path*: a navbar marks its page with it.
   def current_page?(path : String) : Bool
     @env.request.path == path
@@ -284,6 +311,39 @@ pub class Controller
   # `/posts/7` for a Post with id 7.
   def path_to(record : T) : String forall T
     "/" + T.table_name + "/" + record.id.to_s
+  end
+end
+
+# A form, as Rails' `form_with`, in a template's `<% %>` tag:
+#
+#   <% form_with model: @post do |f| %>
+#     <%= f.label :title %>
+#     <%= f.text_field :title %>
+#     <%= f.submit %>
+#   <% end %>
+#
+# `model:` gives the fields their names (`post[title]`), values and errors,
+# and the form its path: `/posts` with POST for a new record, `/posts/7`
+# with `_method=patch` for a saved one. `url:` and `method:` say otherwise;
+# without a model, `url:` is the path and `scope:` the fields' prefix, if
+# any. `class:` is the form's class, `multipart: true` lets it send files,
+# and other attributes go on the tag (`data_turbo: false`). The CSRF field
+# is always in it.
+pub macro form_with(model = nil, url = nil, method = nil, scope = nil, multipart = false, **attrs, &block)
+  {% f = block.args.empty? ? "__kurt_form".id : block.args[0] %}
+  {% klass = attrs[:class] %}
+  {{ f }} = __kurt_form_builder({{ model }}, {{ url }}, {{ method }}, {{ scope }}, {{ klass }}, {{ multipart }}, ::Kurt::Helpers.attributes_html({% for key, value in attrs %}{% if key.stringify != "class" %}{{ key }}: {{ value }}, {% end %}{% end %}))
+  __iyi_web_io__.output({{ f }}.open_tag)
+  {{ block.body }}
+  __iyi_web_io__.output({{ f }}.close_tag)
+end
+
+# `form_style :daisyui` in ApplicationController: the classes `form_with`
+# gives fields (daisyUI's `input`, `select`, `btn`, and `input-error` on a
+# field that did not validate).
+pub macro form_style(style)
+  def form_style : String
+    {{ style.id.stringify }}
   end
 end
 

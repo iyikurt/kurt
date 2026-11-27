@@ -332,48 +332,51 @@ def reference_cell(record : String, field : Field, labels : Hash(String, String)
   "<% if (" + field.name + " = " + record + "." + field.name + "?).is_a?(" + camelize(field.name) + ") %><%= " + field.name + "." + label + " %><% end %>"
 end
 
-def input_for(names : Names, field : Field, labels : Hash(String, String) = {} of String => String) : String
-  value = "<%= @" + names.singular + "." + field.column + " %>"
-  id = names.singular + "_" + field.column
-  name = names.singular + "[" + field.column + "]"
-  label = "    <label for=\"" + id + "\">" + field.label + "</label>\n"
+# The builder call that draws *field*'s input: `f.text_field :title`, a
+# select of the referenced records, a checkbox for a bool.
+def field_input(names : Names, field : Field, labels : Hash(String, String)) : String
   if shown_by = reference_label(field, labels)
     target = camelize(field.name)
-    return label + "    <select id=\"" + id + "\" name=\"" + name + "\">\n" +
-      "      <option value=\"\">Select a " + humanize(field.name).downcase + "</option>\n" +
-      "      <% @" + pluralize(underscore(target)) + ".each do |option| %>\n" +
-      "      <option value=\"<%= option.id %>\"<%= option.id == @" + names.singular + "." + field.column + " ? \" selected\" : \"\" %>><%= option." + shown_by + " %></option>\n" +
-      "      <% end %>\n    </select>\n"
+    return "<%= f.select :" + field.column + ", @" + pluralize(underscore(target)) + ".map { |option| {option." + shown_by + ", option.id} }, prompt: \"Select a " + humanize(field.name).downcase + "\" %>"
   end
   case field.kind
-  when "text"
-    label + "    <textarea id=\"" + id + "\" name=\"" + name + "\" rows=\"8\">" + value + "</textarea>\n"
-  when "int", "references"
-    label + "    <input id=\"" + id + "\" type=\"number\" name=\"" + name + "\" value=\"" + value + "\">\n"
-  when "float"
-    label + "    <input id=\"" + id + "\" type=\"number\" step=\"any\" name=\"" + name + "\" value=\"" + value + "\">\n"
-  when "bool"
-    "    <label class=\"check\">\n      <input type=\"hidden\" name=\"" + name + "\" value=\"0\">\n      <input id=\"" + id + "\" type=\"checkbox\" name=\"" + name + "\" value=\"1\"<%= @" + names.singular + "." + field.column + " ? \" checked\" : \"\" %>>\n      " + field.label + "\n    </label>\n"
-  when "time"
-    label + "    <input id=\"" + id + "\" type=\"datetime-local\" name=\"" + name + "\" value=\"<%= @" + names.singular + "." + field.column + ".to_s(\"%Y-%m-%dT%H:%M\") %>\">\n"
+  when "text"              then "<%= f.text_area :" + field.column + ", rows: 8 %>"
+  when "int", "references" then "<%= f.number_field :" + field.column + " %>"
+  when "float"             then "<%= f.number_field :" + field.column + ", step: \"any\" %>"
+  when "bool"              then "<%= f.check_box :" + field.column + " %>"
+  when "time"              then "<%= f.datetime_field :" + field.column + " %>"
   else
-    label + "    <input id=\"" + id + "\" type=\"text\" name=\"" + name + "\" value=\"" + value + "\">\n"
+    field.column.includes?("email") ? "<%= f.email_field :" + field.column + " %>" : "<%= f.text_field :" + field.column + " %>"
   end
 end
 
+# What kept the record from being saved, above the form.
+def error_summary(names : Names, daisy : Bool) : String
+  record = "@" + names.singular
+  if daisy
+    "<% if " + record + ".errors.any? %>\n<div role=\"alert\" class=\"alert alert-error mb-6\">\n  <div>\n    <p class=\"font-semibold\"><%= pluralize(" + record + ".errors.size, \"problem\") %> kept this " + names.human.downcase + " from being saved:</p>\n    <ul class=\"list-disc ml-5\">\n    <% " + record + ".errors.full_messages.each do |message| %>\n      <li><%= message %></li>\n    <% end %>\n    </ul>\n  </div>\n</div>\n<% end %>\n\n"
+  else
+    "<% if " + record + ".errors.any? %>\n<div class=\"errors\" role=\"alert\">\n  <p><%= pluralize(" + record + ".errors.size, \"problem\") %> kept this " + names.human.downcase + " from being saved:</p>\n  <ul>\n  <% " + record + ".errors.full_messages.each do |message| %>\n    <li><%= message %></li>\n  <% end %>\n  </ul>\n</div>\n<% end %>\n\n"
+  end
+end
+
+# _form.eiy: `form_with model: @post`, one field per column. The builder
+# names the fields (`post[title]`), fills them from the record, marks the
+# ones that did not validate, and posts to /posts or, once saved, patches
+# /posts/:id.
 pub def form_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
   return daisy_form_view(names, fields, labels) if daisy
-  out = "<% if @" + names.singular + ".errors.any? %>\n<div class=\"errors\" role=\"alert\">\n  <p><%= @" + names.singular + ".errors.size %> problem(s) kept this " + names.human.downcase + " from being saved:</p>\n  <ul>\n  <% @" + names.singular + ".errors.full_messages.each do |message| %>\n    <li><%= message %></li>\n  <% end %>\n  </ul>\n</div>\n<% end %>\n\n"
-  out += "<form method=\"post\" action=\"<%= @" + names.singular + ".persisted? ? path_to(@" + names.singular + ") : \"/" + names.plural + "\" %>\" class=\"form\">\n"
-  out += "  <%= raw(csrf_field) %>\n"
-  out += "  <% if @" + names.singular + ".persisted? %><input type=\"hidden\" name=\"_method\" value=\"patch\"><% end %>\n"
+  html = error_summary(names, false)
+  html += "<% form_with model: @" + names.singular + ", class: \"form\" do |f| %>\n"
   fields.each do |field|
-    out += "  <div class=\"field" + "<%= @" + names.singular + ".errors.on(\"" + field.column + "\").empty? ? \"\" : \" field-error\" %>\">\n"
-    out += input_for(names, field, labels)
-    out += "  </div>\n"
+    if field.kind == "bool" && reference_label(field, labels).nil?
+      html += "  <div class=\"field\">\n    <label class=\"check\">" + field_input(names, field, labels) + " " + field.label + "</label>\n  </div>\n"
+    else
+      html += "  <div class=\"field\">\n    <%= f.label :" + field.column + " %>\n    " + field_input(names, field, labels) + "\n  </div>\n"
+    end
   end
-  out += "  <div class=\"actions\">\n    <button type=\"submit\" class=\"button\">Save " + names.human.downcase + "</button>\n  </div>\n</form>\n"
-  out
+  html += "  <div class=\"actions\">\n    <%= f.submit class: \"button\" %>\n  </div>\n<% end %>\n"
+  html
 end
 
 pub def index_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
@@ -446,6 +449,19 @@ end
 # Tailwind CSS and daisyUI (the default; `kurt new NAME --css none` skips it)
 # ---------------------------------------------------------------------------
 
+# The classes form_with's builder writes (forms.iyi): they are in no view,
+# so Tailwind is told about them.
+pub FORM_CLASSES_SOURCE = "@source inline(\"input input-error select select-error textarea textarea-error checkbox checkbox-error file-input file-input-error btn btn-primary fieldset-legend w-full\");"
+
+# app.css with the form builder's classes, for an application made before
+# them; nil when it has them.
+pub def with_form_classes(css : String) : String?
+  return nil if css.includes?(FORM_CLASSES_SOURCE)
+  anchor = "@source \"../../views/**/*.eiy\";"
+  return nil unless css.includes?(anchor)
+  css.sub(anchor, anchor + "\n" + FORM_CLASSES_SOURCE)
+end
+
 # app/assets/tailwind/app.css: what `kurt dev` and `kurt build` compile into
 # public/assets/app.css with the Tailwind CLI. The classes are read from the
 # views; daisyUI's two files sit next to this one.
@@ -456,6 +472,7 @@ pub def tailwind_css : String
      with the classes the views in app/views use. */
   @import "tailwindcss" source(none);
   @source "../../views/**/*.eiy";
+  #{FORM_CLASSES_SOURCE}
 
   /* Two themes: light, and dracula as the dark one. Dracula is used when the
      system is in dark mode; data-theme="light" or "dracula" on <html> picks one. */
@@ -474,56 +491,19 @@ pub def tailwind_css : String
   CSS
 end
 
-# " input-error" when the field did not validate, else "".
-def error_class(names : Names, field : Field, kind : String) : String
-  "<%= @" + names.singular + ".errors.on(\"" + field.column + "\").empty? ? \"\" : \" " + kind + "-error\" %>"
-end
-
-def daisy_input_for(names : Names, field : Field, labels : Hash(String, String)) : String
-  record = "@" + names.singular
-  value = "<%= " + record + "." + field.column + " %>"
-  id = names.singular + "_" + field.column
-  name = names.singular + "[" + field.column + "]"
-  # A label tied to its input, styled as daisyUI's legend: screen readers
-  # name the field by it.
-  legend = "      <label class=\"fieldset-legend\" for=\"" + id + "\">" + field.label + "</label>\n"
-  if shown_by = reference_label(field, labels)
-    target = camelize(field.name)
-    return "      <label class=\"fieldset-legend\" for=\"" + id + "\">" + humanize(field.name) + "</label>\n" +
-      "      <select id=\"" + id + "\" name=\"" + name + "\" class=\"select w-full" + error_class(names, field, "select") + "\">\n" +
-      "        <option value=\"\">Select a " + humanize(field.name).downcase + "</option>\n" +
-      "        <% @" + pluralize(underscore(target)) + ".each do |option| %>\n" +
-      "        <option value=\"<%= option.id %>\"<%= option.id == " + record + "." + field.column + " ? \" selected\" : \"\" %>><%= option." + shown_by + " %></option>\n" +
-      "        <% end %>\n      </select>\n"
-  end
-  case field.kind
-  when "text"
-    legend + "      <textarea id=\"" + id + "\" name=\"" + name + "\" rows=\"8\" class=\"textarea w-full" + error_class(names, field, "textarea") + "\">" + value + "</textarea>\n"
-  when "int", "references"
-    legend + "      <input id=\"" + id + "\" type=\"number\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  when "float"
-    legend + "      <input id=\"" + id + "\" type=\"number\" step=\"any\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  when "bool"
-    "      <label class=\"label\">\n        <input type=\"hidden\" name=\"" + name + "\" value=\"0\">\n        <input id=\"" + id + "\" type=\"checkbox\" name=\"" + name + "\" value=\"1\" class=\"checkbox\"<%= " + record + "." + field.column + " ? \" checked\" : \"\" %>>\n        " + field.label + "\n      </label>\n"
-  when "time"
-    legend + "      <input id=\"" + id + "\" type=\"datetime-local\" name=\"" + name + "\" value=\"<%= " + record + "." + field.column + ".to_s(\"%Y-%m-%dT%H:%M\") %>\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  else
-    legend + "      <input id=\"" + id + "\" type=\"text\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  end
-end
-
 def daisy_form_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
-  record = "@" + names.singular
-  out = "<% if " + record + ".errors.any? %>\n<div role=\"alert\" class=\"alert alert-error mb-6\">\n  <div>\n    <p class=\"font-semibold\"><%= " + record + ".errors.size %> problem(s) kept this " + names.human.downcase + " from being saved:</p>\n    <ul class=\"list-disc ml-5\">\n    <% " + record + ".errors.full_messages.each do |message| %>\n      <li><%= message %></li>\n    <% end %>\n    </ul>\n  </div>\n</div>\n<% end %>\n\n"
-  out += "<form method=\"post\" action=\"<%= " + record + ".persisted? ? path_to(" + record + ") : \"/" + names.plural + "\" %>\" class=\"card bg-base-100 shadow-sm\">\n"
-  out += "  <div class=\"card-body\">\n"
-  out += "    <%= raw(csrf_field) %>\n"
-  out += "    <% if " + record + ".persisted? %><input type=\"hidden\" name=\"_method\" value=\"patch\"><% end %>\n"
+  html = error_summary(names, true)
+  html += "<% form_with model: @" + names.singular + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n"
+  html += "  <div class=\"card-body\">\n"
   fields.each do |field|
-    out += "    <fieldset class=\"fieldset\">\n" + daisy_input_for(names, field, labels) + "    </fieldset>\n"
+    if field.kind == "bool" && reference_label(field, labels).nil?
+      html += "    <fieldset class=\"fieldset\">\n      <label class=\"label\">" + field_input(names, field, labels) + " " + field.label + "</label>\n    </fieldset>\n"
+    else
+      html += "    <fieldset class=\"fieldset\">\n      <%= f.label :" + field.column + " %>\n      " + field_input(names, field, labels) + "\n    </fieldset>\n"
+    end
   end
-  out += "    <div class=\"card-actions justify-end mt-4\">\n      <button type=\"submit\" class=\"btn btn-primary\">Save " + names.human.downcase + "</button>\n    </div>\n  </div>\n</form>\n"
-  out
+  html += "    <div class=\"card-actions justify-end mt-4\">\n      <%= f.submit %>\n    </div>\n  </div>\n<% end %>\n"
+  html
 end
 
 def daisy_index_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
@@ -826,48 +806,53 @@ pub def registrations_controller(fields : Array(String)) : String
   IYI
 end
 
-# One labelled input of a sign-in or sign-up form.
-pub def auth_input(id : String, name : String, label : String, type : String, value : String, extra : String, daisy : Bool) : String
+# One labelled field of a sign-in or sign-up form, through the form
+# builder: `<%= f.email_field :email_address, required: true %>`.
+pub def auth_input(field : String, label : String, kind : String, extra : String, daisy : Bool) : String
+  call = "<%= f." + kind + "_field :" + field + (extra.empty? ? "" : ", " + extra) + " %>"
   if daisy
-    "    <fieldset class=\"fieldset\">\n      <label class=\"fieldset-legend\" for=\"" + id + "\">" + label + "</label>\n      <input id=\"" + id + "\" type=\"" + type + "\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full\"" + extra + ">\n    </fieldset>\n"
+    "    <fieldset class=\"fieldset\">\n      <%= f.label :" + field + ", \"" + label + "\" %>\n      " + call + "\n    </fieldset>\n"
   else
-    "  <div class=\"field\">\n    <label for=\"" + id + "\">" + label + "</label>\n    <input id=\"" + id + "\" type=\"" + type + "\" name=\"" + name + "\" value=\"" + value + "\"" + extra + ">\n  </div>\n"
+    "  <div class=\"field\">\n    <%= f.label :" + field + ", \"" + label + "\" %>\n    " + call + "\n  </div>\n"
   end
 end
 
-def auth_form(title : String, action : String, inputs : String, button : String, after : String, errors : String, daisy : Bool) : String
+# *form*: what goes in `form_with`, its model and path (`url: "/login"`).
+def auth_form(title : String, form : String, inputs : String, button : String, after : String, errors : String, daisy : Bool) : String
   head = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
   if daisy
     head + "<div class=\"mx-auto max-w-sm\">\n  <h1 class=\"text-3xl font-bold mb-6\">" + title + "</h1>\n" + errors +
-      "  <form method=\"post\" action=\"" + action + "\" class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body\">\n    <%= raw(csrf_field) %>\n" + inputs +
-      "    <button type=\"submit\" class=\"btn btn-primary mt-4\">" + button + "</button>\n  </div>\n  </form>\n  <p class=\"mt-4 text-sm\">" + after + "</p>\n</div>\n"
+      "  <% form_with " + form + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n  <div class=\"card-body\">\n" + inputs +
+      "    <%= f.submit \"" + button + "\", class: \"btn btn-primary mt-4\" %>\n  </div>\n  <% end %>\n  <p class=\"mt-4 text-sm\">" + after + "</p>\n</div>\n"
   else
-    head + "<h1>" + title + "</h1>\n" + errors + "<form method=\"post\" action=\"" + action + "\" class=\"form\">\n  <%= raw(csrf_field) %>\n" + inputs +
-      "  <div class=\"actions\"><button type=\"submit\" class=\"button\">" + button + "</button></div>\n</form>\n<p>" + after + "</p>\n"
+    head + "<h1>" + title + "</h1>\n" + errors + "<% form_with " + form + ", class: \"form\" do |f| %>\n" + inputs +
+      "  <div class=\"actions\"><%= f.submit \"" + button + "\", class: \"button\" %></div>\n<% end %>\n<p>" + after + "</p>\n"
   end
 end
 
 pub def sessions_view(login : String, daisy : Bool) : String
   link = daisy ? "class=\"link link-primary\" " : ""
-  inputs = auth_input(login, login, auth_label(login), "email", "", " required autofocus autocomplete=\"username\"", daisy) +
-           auth_input("password", "password", "Password", "password", "", " required maxlength=\"72\" autocomplete=\"current-password\"", daisy)
-  auth_form("Sign in", "/login", inputs, "Sign in", "No account yet? <a " + link + "href=\"/signup\">Sign up</a>", "", daisy)
+  inputs = auth_input(login, auth_label(login), "email", "required: true, autofocus: true, autocomplete: \"username\"", daisy) +
+           auth_input("password", "Password", "password", "required: true, maxlength: 72, autocomplete: \"current-password\"", daisy)
+  auth_form("Sign in", "url: \"/login\"", inputs, "Sign in", "No account yet? <a " + link + "href=\"/signup\">Sign up</a>", "", daisy)
 end
 
 pub def registrations_view(login : String, fields : Array(String), daisy : Bool) : String
   link = daisy ? "class=\"link link-primary\" " : ""
   inputs = ""
   fields.each do |field|
-    type = field == login ? "email" : "text"
-    extra = field == login ? " required autocomplete=\"username\"" : ""
-    inputs += auth_input("user_" + field, "user[" + field + "]", auth_label(field), type, "<%= @user." + field + " %>", extra, daisy)
+    if field == login
+      inputs += auth_input(field, auth_label(field), "email", "required: true, autocomplete: \"username\"", daisy)
+    else
+      inputs += auth_input(field, auth_label(field), "text", "", daisy)
+    end
   end
-  inputs += auth_input("user_password", "user[password]", "Password", "password", "", " required minlength=\"8\" maxlength=\"72\" autocomplete=\"new-password\"", daisy)
-  inputs += auth_input("user_password_confirmation", "user[password_confirmation]", "Password confirmation", "password", "", " required autocomplete=\"new-password\"", daisy)
+  inputs += auth_input("password", "Password", "password", "required: true, minlength: 8, maxlength: 72, autocomplete: \"new-password\"", daisy)
+  inputs += auth_input("password_confirmation", "Password confirmation", "password", "required: true, autocomplete: \"new-password\"", daisy)
   box = daisy ? "  <div role=\"alert\" class=\"alert alert-error mb-6\">\n    <ul class=\"list-disc ml-5\">\n" : "<div class=\"errors\" role=\"alert\">\n  <ul>\n"
   close = daisy ? "    </ul>\n  </div>\n" : "  </ul>\n</div>\n"
   errors = "<% if @user.errors.any? %>\n" + box + "    <% @user.errors.full_messages.each do |message| %><li><%= message %></li><% end %>\n" + close + "<% end %>\n"
-  auth_form("Sign up", "/signup", inputs, "Create account", "Already have one? <a " + link + "href=\"/login\">Sign in</a>", errors, daisy)
+  auth_form("Sign up", "model: @user, url: \"/signup\"", inputs, "Create account", "Already have one? <a " + link + "href=\"/login\">Sign in</a>", errors, daisy)
 end
 
 # The layout's links: who is signed in and a sign-out button, or the way in.
@@ -1031,7 +1016,9 @@ pub def application_config(secret : String) : String
   IYI
 end
 
-pub def application_controller : String
+# *daisy*: `form_with`'s fields get daisyUI's classes.
+pub def application_controller(daisy : Bool = false) : String
+  style = daisy ? "  # The classes form_with gives fields: daisyUI's input, select, btn...\n  form_style :daisyui\n" : ""
   <<-IYI
   # The parent of every controller: filters and helpers the whole
   # application shares.
@@ -1042,8 +1029,14 @@ pub def application_controller : String
   #     Unauthorized.new unless session["user_id"]?
   #   end
   class ApplicationController < Controller
-  end
+  #{style}end
   IYI
+end
+
+# The line a Tailwind application's ApplicationController needs for
+# scaffolded forms to look right; nil when it has it already.
+pub def form_style_line(source : String) : String?
+  source.includes?("form_style") ? nil : "  form_style :daisyui\n"
 end
 
 pub def home_controller : String
@@ -1135,7 +1128,9 @@ pub def stylesheet : String
   .form input[type=text], .form input[type=number], .form input[type=datetime-local], .form textarea, .form select {
     font: inherit; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--radius); }
   .form .check { flex-direction: row; align-items: center; gap: .5rem; display: flex; }
-  .field-error input, .field-error textarea, .field-error select { border-color: var(--danger); }
+  .field-error input, .field-error textarea, .field-error select, .form [aria-invalid="true"] { border-color: var(--danger); }
+  .form input[type=email], .form input[type=password] {
+    font: inherit; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--radius); }
   .errors { border: 1px solid var(--danger); background: #ffebe9; border-radius: var(--radius); padding: .5rem 1rem; margin-bottom: 1rem; }
   .flash { padding: .5rem 1rem; border-radius: var(--radius); }
   .flash.notice { background: #dafbe1; color: var(--ok); }
@@ -1308,7 +1303,28 @@ pub def agents_md(app : String) : String
     holds that model (starting as a blank one) and its plural an Array of it (starting empty), so
     neither is ever nil. Any other instance variable is declared with its type:
     `@featured : Array(Post) = [] of Post`. Views read them as they are.
-  - Views see the action's locals and the controller's methods; forms print `<%= raw(csrf_field) %>`.
+  - Views see the action's locals and the controller's methods.
+
+  ## Forms
+
+  ```erb
+  <% form_with model: @post do |f| %>
+    <%= f.label :title %>
+    <%= f.text_field :title %>
+    <%= f.text_area :body, rows: 8 %>
+    <%= f.check_box :published %>
+    <%= f.select :user_id, @users.map { |u| {u.name, u.id} }, prompt: "Select a user" %>
+    <%= f.submit %>
+  <% end %>
+  ```
+
+  - `form_with` is a `<% %>` tag, not `<%= %>`. It writes the CSRF field, names the fields
+    `post[title]`, fills them from the record, posts to /posts (or patches /posts/:id once saved),
+    and marks a field that did not validate (`aria-invalid`, and daisyUI's `input-error` with
+    `form_style :daisyui` in ApplicationController).
+  - Without a model: `form_with url: "/search", method: :get do |f|`; `scope: :user` names the fields `user[...]`.
+  - Also: `email_field`, `password_field`, `number_field`, `date_field`, `datetime_field`,
+    `hidden_field`, `file_field` (with `multipart: true`). Each takes HTML attributes (`required: true`).
 
   TXT
 end

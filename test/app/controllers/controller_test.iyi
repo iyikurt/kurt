@@ -26,7 +26,7 @@ class ApplicationController < Controller
 end
 
 class PostsController < ApplicationController
-  before_action :require_login, except: [:index, :show, :hello, :helpers]
+  before_action :require_login, except: [:index, :show, :hello, :helpers, :form]
   before_action :set_post, only: [:show, :destroy]
 
   @post : Post = Post.new
@@ -62,6 +62,15 @@ class PostsController < ApplicationController
   def helpers
     @posts = Post.order(:id).all!
     render "posts/helpers", layout: false
+  end
+
+  # form_with: a new record, a saved one (?id=), one that did not validate (?bad=1)
+  def form
+    if params[:id]? 
+      @post = Post.find(params[:id])!
+    end
+    @post.valid? if params[:bad]?
+    render "posts/form", layout: false
   end
 
   private def set_post
@@ -111,6 +120,17 @@ class NotesController < ApplicationController
   end
 end
 
+class DaisyController < ApplicationController
+  form_style :daisyui
+
+  @post : Post = Post.new
+
+  def index
+    @post.valid?
+    render "posts/daisy_form", layout: false
+  end
+end
+
 class StatsController < ApplicationController
   def index
     "stats"
@@ -122,6 +142,8 @@ def routes : Router
   resources "posts", PostsController
   get "/hello/:name", PostsController, :hello
   get "/helpers", PostsController, :helpers
+  get "/form", PostsController, :form
+  get "/daisy", DaisyController, :index
   get "/open", OpenController, :open
   get "/closed", OpenController, :closed
   get "/public", PublicController, :index
@@ -214,6 +236,39 @@ assert body.includes?("&lt;Second&gt;</li>")
 assert body.includes?("<p>a note &amp; more</p>")
 assert body.includes?("true")
 Post.delete_all.as(Int64)
+
+# form_with: a new record posts to /posts, in the post scope
+body = dispatch(app, "GET", "/form").response.body
+assert body.includes?(%(<form action="/posts" method="post" accept-charset="UTF-8" class="card" data-turbo="false">))
+assert !body.includes?("_method")
+assert body.includes?(%(<label for="post_title">Title</label>))
+assert body.includes?(%(<input type="text" name="post[title]" id="post_title" value="" placeholder="A title">))
+assert body.includes?(%(<textarea name="post[title]" id="post_title" rows="3">\n</textarea>))
+assert body.includes?(%(<input type="hidden" name="post[title]" value="0" autocomplete="off"><input type="checkbox" name="post[title]" id="post_title" value="1">))
+assert body.includes?(%(<select name="post[title]" id="post_title"><option value="">Pick</option><option value="1">One</option><option value="Hello &lt;b&gt;">Hello &lt;b&gt;</option></select>))
+assert body.includes?(%(<button type="submit" name="commit">Create Post</button>\n</form>))
+# no record: the url, a scope, and the fields bare in it
+assert body.includes?(%(<form action="/login" method="post" accept-charset="UTF-8"><input type="email" name="session[email]" id="session_email" value="" required><button type="submit" name="commit">Sign in</button></form>))
+
+# a saved one: its path, _method=patch, its values escaped, the password not shown
+saved = Post.create(title: "Hello <b>").as(Post)
+body = dispatch(app, http_request("GET", "/form", query: "id=" + saved.id.to_s)).response.body
+assert body.includes?(%(<form action="/posts/) + saved.id.to_s + %(" method="post" accept-charset="UTF-8" class="card" data-turbo="false"><input type="hidden" name="_method" value="patch">))
+assert body.includes?(%(value="Hello &lt;b&gt;" placeholder="A title">))
+assert body.includes?(%(<option value="Hello &lt;b&gt;" selected>))
+assert body.includes?(%(<input type="password" name="post[title]" id="post_title" value="">))
+assert body.includes?("Update Post</button>")
+Post.delete_all.as(Int64)
+
+# a field that did not validate is marked invalid
+body = dispatch(app, http_request("GET", "/form", query: "bad=1")).response.body
+assert body.includes?(%(id="post_title" value="" aria-invalid="true" placeholder="A title">))
+
+# daisyUI's classes, and its error class on the field that did not validate
+body = dispatch(app, "GET", "/daisy").response.body
+assert body.includes?(%(<label for="post_title" class="fieldset-legend">Title</label>))
+assert body.includes?(%(class="input w-full input-error" aria-invalid="true">))
+assert body.includes?(%(<button type="submit" name="commit" class="btn btn-primary">Create Post</button>))
 
 # nested resources and a namespace
 assert dispatch(app, "GET", "/articles/5/notes").response.body == "notes of 5"

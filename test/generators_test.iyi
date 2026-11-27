@@ -98,20 +98,26 @@ assert !controller.includes?("Invalid")
 assert !controller.includes?("Halt")
 assert !controller.includes?("Errors.new")
 assert form_view(post, user_ref).includes?("<% if @post.errors.any? %>")
-assert form_view(post, user_ref).includes?("name=\"post[title]\"")
+assert form_view(post, user_ref).includes?("<% form_with model: @post, class: \"form\" do |f| %>")
+assert form_view(post, user_ref).includes?("<%= f.label :title %>\n    <%= f.text_field :title %>")
+assert form_view(post, user_ref).includes?("<%= f.submit class: \"button\" %>")
+assert !form_view(post, user_ref).includes?("csrf_field")          # form_with writes it
 
 # a reference to a model with a label is a select, and shown by its label
 labels = {"User" => "name"}
 form = form_view(post, user_ref, labels)
-assert form.includes?("<select id=\"post_user_id\" name=\"post[user_id]\">")
-assert form.includes?("<% @users.each do |option| %>")
+assert form.includes?("<%= f.select :user_id, @users.map { |option| {option.name, option.id} }, prompt: \"Select a user\" %>")
 with_list = scaffold_controller(post, user_ref, labels)
 assert with_list.includes?("  before_action :set_users, only: [:new, :create, :edit, :update]\n")
 assert with_list.includes?("  private def set_users\n    @users = User.order(:name).all!\n  end\n")
 assert with_list.includes?("@posts = Post.includes(:user).order_desc(:id).paginate(")   # names load with the rows
 assert controller.includes?("@posts = Post.order_desc(:id).paginate(")                    # no label: nothing to load
-assert form.includes?("<%= option.id == @post.user_id ? \" selected\" : \"\" %>")
-assert !form_view(post, user_ref).includes?("<select")     # no label: a number field
+assert !form_view(post, user_ref).includes?("f.select")     # no label: a number field
+assert form_view(post, user_ref).includes?("<%= f.number_field :user_id %>")
+bool_form = form_view(post, [Field.new("published", "bool"), Field.new("body", "text"), Field.new("at", "time")])
+assert bool_form.includes?("<label class=\"check\"><%= f.check_box :published %> Published</label>")
+assert bool_form.includes?("<%= f.text_area :body, rows: 8 %>")
+assert bool_form.includes?("<%= f.datetime_field :at %>")
 assert show_view(post, user_ref, labels).includes?("<dt>User</dt>\n  <dd><% if (user = @post.user?).is_a?(User) %><%= user.name %><% end %></dd>")
 assert index_view(post, user_ref, labels).includes?("<% if (user = post.user?).is_a?(User) %><%= user.name %><% end %>")
 
@@ -122,7 +128,9 @@ assert home_view("blog").includes?("<img src=\"/icon.svg\" alt=\"Kurt\"")
 
 # Tailwind and daisyUI (the default for `kurt new`)
 assert tailwind_css.includes?("@import \"tailwindcss\" source(none);")
-assert tailwind_css.includes?("@source \"../../views/**/*.eiy\";")
+assert tailwind_css.includes?("@source \"../../views/**/*.eiy\";\n@source inline(\"input input-error")
+assert with_form_classes(tailwind_css).nil?
+assert with_form_classes("@source \"../../views/**/*.eiy\";\n").as(String).includes?("@source inline(")
 assert tailwind_css.includes?("@plugin \"./daisyui.mjs\"")
 assert tailwind_css.includes?("themes: light --default, dracula --prefersdark;")
 assert layout_view("blog", true).includes?("<ul class=\"menu menu-horizontal gap-1\"><!-- kurt:nav --></ul>")
@@ -134,10 +142,10 @@ assert home_view("blog", true).includes?("mockup-code")
 assert nav_link(post, true) == "<li><a href=\"/posts\">Posts</a></li>"
 assert nav_link(post) == "<a href=\"/posts\">Posts</a>"
 daisy_form = form_view(post, user_ref, labels, true)
-assert daisy_form.includes?("class=\"card bg-base-100 shadow-sm\"")
-assert daisy_form.includes?("class=\"input w-full<%= @post.errors.on(\"title\").empty? ? \"\" : \" input-error\" %>\"")
-assert daisy_form.includes?("class=\"select w-full")
-assert daisy_form.includes?("btn btn-primary")
+assert daisy_form.includes?("<% form_with model: @post, class: \"card bg-base-100 shadow-sm\" do |f| %>")
+assert daisy_form.includes?("<fieldset class=\"fieldset\">\n      <%= f.label :title %>\n      <%= f.text_field :title %>\n    </fieldset>")
+assert daisy_form.includes?("alert alert-error")
+assert daisy_form.includes?("<%= f.submit %>")
 assert index_view(post, user_ref, labels, true).includes?("<table class=\"table\">")
 assert show_view(post, user_ref, labels, true).includes?("card-actions")
 assert new_view(post, true).includes?("<h1 class=\"text-3xl font-bold mb-6\">New post</h1>")
@@ -152,6 +160,8 @@ assert auth_nav(true).includes?("<%= button_to \"Sign out\", \"/logout\", method
 assert gitignore(true).includes?("/public/assets/app.css")
 assert !gitignore.includes?("app.css")
 assert !form_view(post, user_ref, labels).includes?("btn")          # --css none: plain classes
+assert application_controller(true).includes?("  form_style :daisyui\n")
+assert !application_controller.includes?("form_style")
 
 assert scaffold_test("blog", Names.new("User"), [Field.new("email", "string")]).includes?("user%5Bemail%5D=example%40example.com")
 

@@ -336,7 +336,7 @@ def cmd_new(args : Array(String)) : Nil
     write("config/application.iyi", application_config(Random::Secure.hex(32)))
     write("config/routes.iyi", routes_file)
     write("app/models/.keep", "")
-    write("app/controllers/application_controller.iyi", application_controller)
+    write("app/controllers/application_controller.iyi", application_controller(daisy))
     write("app/controllers/home_controller.iyi", home_controller)
     write("app/views/layouts/application.eiy", layout_view(name, daisy))
     write("app/views/home/index.eiy", home_view(name, daisy))
@@ -476,6 +476,13 @@ def gen_scaffold(app : String, names : Names, fields : Array(Field)) : Nil
   write(base + "new.eiy", new_view(names, daisy))
   write(base + "edit.eiy", edit_view(names, daisy))
   write(base + "_form.eiy", form_view(names, fields, labels, daisy))
+  # An application made before form_with: its forms get daisyUI's classes.
+  if daisy && (line = form_style_line(File.read("app/controllers/application_controller.iyi")))
+    insert_after_line("app/controllers/application_controller.iyi", "class ApplicationController", line)
+  end
+  if daisy && (css = with_form_classes(File.read(CSS_INPUT)))
+    update(CSS_INPUT, css)
+  end
   add_route("resources \"" + names.plural + "\", " + names.controller)
   add_nav(names)
   test = scaffold_test(app, names, fields, auth_sign_in(names.plural))
@@ -619,11 +626,15 @@ def users_scaffold_takes_passwords(daisy : Bool) : Nil
   form = "app/views/users/_form.eiy"
   if File.exists?(form)
     source = File.read(form)
-    unless source.includes?("user[password]")
-      inputs = auth_input("user_password", "user[password]", "Password", "password", "", " maxlength=\"72\" autocomplete=\"new-password\"", daisy) +
-               auth_input("user_password_confirmation", "user[password_confirmation]", "Password confirmation", "password", "", " autocomplete=\"new-password\"", daisy)
+    unless source.includes?("user[password]") || source.includes?("f.password_field")
+      inputs = auth_input("password", "Password", "password", "maxlength: 72, autocomplete: \"new-password\"", daisy) +
+               auth_input("password_confirmation", "Password confirmation", "password", "autocomplete: \"new-password\"", daisy)
       marker = daisy ? "    <div class=\"card-actions" : "  <div class=\"actions\">"
-      update(form, source.sub(marker, inputs + marker)) if source.includes?(marker)
+      if source.includes?("form_with") && source.includes?(marker)
+        update(form, source.sub(marker, inputs + marker))
+      else
+        STDERR.puts "kurt: add password and password_confirmation fields to " + form + " yourself"
+      end
     end
   end
 end

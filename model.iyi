@@ -77,8 +77,11 @@ pub class Errors
     @messages = {} of String => Array(String)
   end
 
+  # The same message twice on one field is kept once: a blank `user_id`
+  # that did not convert and failed `presence` is one problem.
   def add(field : String, message : String) : Nil
     list = @messages[field]? || [] of String
+    return if list.includes?(message)
     list << message
     @messages[field] = list
     nil
