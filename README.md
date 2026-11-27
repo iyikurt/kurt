@@ -67,6 +67,7 @@ published version.
 | `kurt generate model NAME FIELD...` | Model and migration |
 | `kurt generate controller NAME ACTION...` | Controller, views and routes |
 | `kurt generate migration NAME` | An empty migration |
+| `kurt generate mailer NAME METHOD...` | A mailer, a text and an HTML view per method, the mail layouts and a test |
 | `kurt generate authentication` | Users, sign-in and sign-up; every page then requires sign-in |
 | `kurt db:migrate` / `db:rollback [N]` / `db:status` / `db:reset` | Manage the schema (`db:reset` also runs the seeds) |
 | `kurt db:seed` | Runs `db/seeds.iyi` |
@@ -97,6 +98,7 @@ config/routes.iyi          the routes
 app/models/post.iyi        class Post < ApplicationRecord
 app/controllers/posts_controller.iyi
 app/views/posts/index.eiy
+app/mailers/user_mailer.iyi        class UserMailer < ApplicationMailer
 db/migrations/20261123153000_create_posts.sql
 db/seeds.iyi               the first records of a new database
 test/posts_test.iyi
@@ -513,6 +515,7 @@ place, `install_error_pages`:
 | `Unauthorized` | A redirect to `/login`; 401 for JSON |
 | `Forbidden` | 403 |
 | `DBError` | 503; the details go only to the log |
+| `DeliveryError` | 503; mail could not be sent (the reason goes to the log) |
 
 An application registers its own page with
 `router.error NotFound do |env, err| ... end`, before `install_error_pages`.
@@ -632,6 +635,74 @@ end
 The show and index pages print the name instead of the number. A form
 submitted without a choice comes back with 422 and
 `user_id can't be blank`.
+
+## Mailers
+
+```sh
+kurt generate mailer User welcome
+```
+
+```iyi
+# app/mailers/user_mailer.iyi
+class UserMailer < ApplicationMailer
+  def welcome(user : User)
+    @user = user
+    mail to: user.email, subject: "Welcome to the blog"
+  end
+end
+```
+
+```erb
+<%# app/views/user_mailer/welcome.text.eiy %>
+Hello <%= @user.name %>, welcome!
+
+<%# app/views/user_mailer/welcome.html.eiy %>
+<p>Hello <%= @user.name %>, <a href="https://blog.example/posts">welcome</a>!</p>
+```
+
+```iyi
+UserMailer.welcome(user).deliver_now!      # in an action: Message | DeliveryError
+```
+
+- `mail` renders `app/views/<mailer>/<method>.text.eiy` and `.html.eiy`.
+  Both are optional, but one must exist; with both, the mail is
+  `multipart/alternative`.
+- When `app/views/layouts/mailer.text.eiy` or `mailer.html.eiy` exists,
+  each part is rendered inside it (`<%= content %>`). `layout: false`
+  leaves them out, and `template: "other"` renders another view.
+- The HTML part is escaped as a page is. The text part is not escaped,
+  since it is not HTML.
+- `mail` also takes `cc:`, `bcc:`, `reply_to:` and `from:`. An address is
+  `"ada@example.com"` or `"Ada <ada@example.com>"`, and `to:` takes one or
+  an array.
+- `default from: "Blog <noreply@blog.example>"` in a mailer sets its
+  sender. Without one, it is `MAIL_FROM`.
+- Each public method of a mailer is also a class method:
+  `UserMailer.welcome(user)` is `UserMailer.new.welcome(user)`.
+- Model variables (`@user`) need no declaration, as in controllers. Any
+  other is declared: `@greeting : String = ""`.
+- `message.attach("report.pdf", data)` answers the mail with a file
+  attached.
+
+Where `deliver_now` sends mail:
+
+| Setting | Where mail goes |
+|---|---|
+| `SMTP_URL` set | To that server: `smtp://user:password@host:587` (STARTTLS), `smtps://user:password@host:465` (TLS), or `smtp://localhost:1025?security=none` (a local catcher) |
+| `KURT_ENV=test` | Into `deliveries`, for tests to read |
+| `KURT_ENV=development` | Into the log, and into `deliveries` |
+| `KURT_ENV=production` | Nowhere: `deliver_now` answers a `DeliveryError`, which an action's `!` turns into a 503 |
+
+A test reads what was sent:
+
+```iyi
+clear_deliveries
+res = dispatch(app, form_request("POST", "/posts", "post%5Btitle%5D=Hi"))
+assert deliveries.last.subject == "Welcome to the blog"
+assert deliveries.last.body.includes?("Hello")
+```
+
+Sending uses iyi's `std/smtp` and `std/mail`.
 
 ## Authentication
 
@@ -891,6 +962,7 @@ The model and fixture tests pass on both SQLite and PostgreSQL 16.
 | `strong_parameters.iyi` | `params.require(...).permit(...)` |
 | `helpers.iyi` | view helpers |
 | `forms.iyi` | `form_with`'s form builder |
+| `mailers.iyi`, `mail_views.iyi` | mailers, `deliveries`, SMTP; the program that finds a mail's views at compile time |
 | `json_writer.iyi` | the JSON that `json(data)` writes |
 | `exporter.iyi` | `kurt export`'s routes, output files and links |
 | `migrator.iyi` | timestamped SQL migrations |

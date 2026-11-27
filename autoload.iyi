@@ -14,6 +14,7 @@
 #
 #   app/models.iyi       every model, with `pub`, a `property` per column of
 #                        its table in db/schema.json, and `derive model` added
+#   app/mailers.iyi      every mailer, ApplicationMailer first
 #   app/controllers.iyi  every controller, ApplicationController first, with
 #                        `@post : Post = Post.new` and `@posts : Array(Post) =
 #                        [] of Post` declared for the model variables it uses
@@ -48,10 +49,17 @@ pub def models_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*"]
 end
 
+pub def mailers_imports : Array(String)
+  ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
+   "import web/iyi_web/templates::{raw, content_for, yield_content}",
+   "import kurt/mailers::*", "import kurt/helpers::*", "import kurt/model::*", "import app/models::*"]
+end
+
 pub def controllers_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
    "import web/iyi_web/templates::{raw, content_for, yield_content}",
-   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import app/models::*"]
+   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import app/models::*",
+   "import app/mailers::*"]
 end
 
 pub def routes_imports : Array(String)
@@ -72,6 +80,7 @@ pub def test_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import web/iyi_web/router::{RouteHandler}",
    "import web/iyi_web/harness::*", "import web/iyi_web/handler::{chain}", "import web/iyi_web/session::{SessionHandler}",
    "import kurt/model::*", "import kurt/controllers::{sign_in_as, sign_out}", "import app/models::*", "import app/routes::*",
+   "import kurt/mailers::{deliveries, clear_deliveries, Message}", "import app/mailers::*",
    "import app/fixtures::*"]
 end
 
@@ -356,6 +365,15 @@ pub def controllers_module(sources : Array(Source), models : Array(String) = [] 
   ordered = sources.select { |s| s.path.ends_with?("/application_controller.iyi") }
   sources.each { |s| ordered << s unless ordered.includes?(s) }
   header("app/controllers", controllers_imports, ordered) + pieces(ordered, false, model_names: models)
+end
+
+# Every mailer, ApplicationMailer first, its model variables declared as a
+# controller's are. A module of its own, which controllers (and jobs)
+# import: a mail is sent from either.
+pub def mailers_module(sources : Array(Source), models : Array(String) = [] of String) : String
+  ordered = sources.select { |s| s.path.ends_with?("/application_mailer.iyi") }
+  sources.each { |s| ordered << s unless ordered.includes?(s) }
+  header("app/mailers", mailers_imports, ordered) + pieces(ordered, false, model_names: models)
 end
 
 pub def routes_module(source : Source, generated : String) : String

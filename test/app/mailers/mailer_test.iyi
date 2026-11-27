@@ -1,0 +1,78 @@
+module test/app/mailers/mailer_test
+
+import std/text
+import mailers::*
+import std/smtp::{SmtpSecurity}
+
+class Person
+  getter name : String
+  getter email : String
+
+  def initialize(@name : String, @email : String)
+  end
+end
+
+class ApplicationMailer < Mailer
+  default from: "Blog <noreply@blog.example>"
+end
+
+class UserMailer < ApplicationMailer
+  @person : Person = Person.new("", "")
+
+  def welcome(person : Person)
+    @person = person
+    mail to: person.email, subject: "Welcome, " + person.name
+  end
+
+  def notice(person : Person, note : String = "hi")
+    mail to: [person.email], cc: "boss@example.com", subject: "Notice", layout: false, from: "Other <other@example.com>"
+  end
+end
+
+clear_deliveries
+ada = Person.new("Ada & <Bob>", "ada@example.com")
+message = UserMailer.welcome(ada)
+assert message.to == ["ada@example.com"]
+assert message.from == "Blog <noreply@blog.example>"
+assert message.subject == "Welcome, Ada & <Bob>"
+assert message.mailer == "UserMailer#welcome"
+# the text is not escaped; the HTML is, inside the layout
+assert message.text.as(String) == "-- text layout --\nHello Ada & <Bob>!\nVisit us.\n-- end --\n"
+html = message.html.as(String)
+assert html.includes?("<html><body><p>Hello <b>Ada &amp; &lt;Bob&gt;</b>!</p>\n</body></html>")
+
+# KURT_ENV is not test here, and no SMTP_URL: development logs and keeps it
+assert delivery_method == "log"
+sent = message.deliver_now.as(Message)
+assert deliveries.size == 1
+assert deliveries.last.subject == "Welcome, Ada & <Bob>"
+
+# no layout, only an HTML view, an array of addresses, a cc, another sender
+other = UserMailer.new.notice(ada)
+assert other.text.nil?
+assert other.html.as(String) == "<p>Note for Ada &amp; &lt;Bob&gt;: hi</p>\n"
+assert other.cc == ["boss@example.com"]
+assert other.from == "Other <other@example.com>"
+
+# std/mail writes it: multipart/alternative, the name in From
+wire = message.attach("hello.txt", "file").to_mail.to_s
+assert wire.includes?("From: Blog <noreply@blog.example>")
+assert wire.includes?("multipart/mixed")
+assert wire.includes?("multipart/alternative")
+assert address("ada@example.com").address == "ada@example.com"
+assert address("\"Ada L\" <ada@example.com>").name == "Ada L"
+
+# SMTP_URL
+settings = smtp_settings("smtp://user%40x.com:p%40ss@mail.example.com:2525").as(SmtpSettings)
+assert settings.host == "mail.example.com"
+assert settings.port == 2525
+assert settings.user == "user@x.com"
+assert settings.password == "p@ss"
+assert settings.security == SmtpSecurity::StartTls
+assert smtp_settings("smtps://mail.example.com").as(SmtpSettings).port == 465
+assert smtp_settings("smtp://localhost:1025?security=none").as(SmtpSettings).security == SmtpSecurity::Cleartext
+assert smtp_settings("http://x").is_a?(DeliveryError)
+
+clear_deliveries
+assert deliveries.empty?
+puts "mailer: all assertions passed"

@@ -165,6 +165,17 @@ assert !application_controller.includes?("form_style")
 
 assert scaffold_test("blog", Names.new("User"), [Field.new("email", "string")]).includes?("user%5Bemail%5D=example%40example.com")
 
+# kurt generate mailer
+assert mailer_file_name("User") == "user_mailer"
+assert mailer_file_name("UserMailer") == "user_mailer"
+mailer = mailer_class("user", ["welcome", "password_reset"])
+assert mailer.starts_with?("class UserMailer < ApplicationMailer\n")
+assert mailer.includes?("  def password_reset\n    @greeting = \"Hi\"\n    mail to: \"to@example.org\", subject: \"Password reset\"\n  end\n")
+assert application_mailer.includes?("class ApplicationMailer < Mailer\n  default from: ")
+assert mailer_text_view("user", "welcome").includes?("<%= @greeting %>")
+assert mailer_layout_html.includes?("<%= content %>")
+assert mailer_test("user", ["welcome"]).includes?("mail = UserMailer.welcome\n")
+
 puts "generators: all assertions passed"
 
 # db/seeds.iyi for a new application

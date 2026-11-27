@@ -1,0 +1,423 @@
+# Mailers, as Rails' Action Mailer: a class per kind of mail, a method per
+# mail, and its text and HTML from templates.
+#
+#   # app/mailers/user_mailer.iyi
+#   class UserMailer < ApplicationMailer
+#     def welcome(user : User)
+#       @user = user
+#       mail to: user.email, subject: "Welcome"
+#     end
+#   end
+#
+#   # app/views/user_mailer/welcome.text.eiy and welcome.html.eiy
+#   Hello <%= @user.name %>!
+#
+#   UserMailer.welcome(user).deliver_now!          # Message | DeliveryError
+#
+# `mail` renders `app/views/<mailer>/<method>.text.eiy` and `.html.eiy`, the
+# ones that exist (at least one must), inside `layouts/mailer.text.eiy` and
+# `layouts/mailer.html.eiy` when those exist. The HTML is escaped as a page
+# is; the text is not, since it is not HTML. Each public method a mailer
+# defines is also a class method (`UserMailer.welcome(user)`).
+#
+# Where mail goes depends on the environment:
+#
+# * `SMTP_URL` set: to that server. `smtp://user:password@host:587` speaks
+#   STARTTLS, `smtps://...:465` TLS from the first byte, and
+#   `smtp://host:1025?security=none` neither (a local catcher).
+# * otherwise, in test: kept in `deliveries`, for a test to read;
+# * otherwise, in development: written to the log and kept in `deliveries`;
+# * otherwise, in production: refused with a DeliveryError, so a missing
+#   setting is not a silent loss.
+#
+# `MAIL_FROM` is the sender when the mailer names none.
+module mailers
+
+import std/text
+import std/time::{Time}
+import std/mutex::{Mutex}
+import std/random::{Random}
+import std/mail::{Mail}
+import std/smtp::{SmtpClient, SmtpError, SmtpSecurity}
+import std/eiy::{Eiy}
+import std/uri::{URI}
+import environment::{env}
+
+pub import std/eiy
+pub import web/iyi_web/templates
+
+# A file sent with a mail.
+pub class Attachment
+  getter filename : String
+  getter data : String
+  getter content_type : String?
+
+  def initialize(@filename : String, @data : String, @content_type : String? = nil)
+  end
+end
+
+# A mail, built by a mailer method and not sent yet: `deliver_now` sends it.
+# It does not change once built, so a test can keep it.
+pub class Message
+  getter to : Array(String)
+  getter cc : Array(String)
+  getter bcc : Array(String)
+  getter from : String
+  getter reply_to : String?
+  getter subject : String
+  getter text : String?
+  getter html : String?
+  getter attachments : Array(Attachment)
+  # Which mailer and method made it: "UserMailer#welcome".
+  getter mailer : String
+
+  def initialize(@to : Array(String), @from : String, @subject : String, @text : String?, @html : String?,
+                 @cc : Array(String) = [] of String, @bcc : Array(String) = [] of String, @reply_to : String? = nil,
+                 @attachments : Array(Attachment) = [] of Attachment, @mailer : String = "")
+  end
+
+  # The same mail with a file attached.
+  def attach(filename : String, data : String, content_type : String? = nil) : Message
+    files = @attachments.dup
+    files << Attachment.new(filename, data, content_type)
+    Message.new(@to, @from, @subject, @text, @html, @cc, @bcc, @reply_to, files, @mailer)
+  end
+
+  # The text, or the HTML when there is no text: what a test usually reads.
+  def body : String
+    @text || @html || ""
+  end
+
+  # Sends it now, where the environment sends mail (see the module's
+  # comment): the message, or why it could not be sent.
+  def deliver_now : Message | DeliveryError
+    ::Kurt::Mailers.deliver(self)
+  end
+
+  # As std/mail writes it: the headers, the text and HTML as
+  # multipart/alternative, the attachments.
+  def to_mail : Mail::Message
+    message = Mail::Message.new
+    sender = ::Kurt::Mailers.address(@from)
+    message.from = sender
+    @to.each { |a| message.to << ::Kurt::Mailers.address(a) }
+    @cc.each { |a| message.cc << ::Kurt::Mailers.address(a) }
+    @bcc.each { |a| message.bcc << ::Kurt::Mailers.address(a) }
+    if reply = @reply_to
+      message.reply_to << ::Kurt::Mailers.address(reply)
+    end
+    message.subject = @subject
+    message.date = Mail.date(Time.utc.to_unix, 0)
+    domain = sender.domain
+    message.message_id = "<" + Random::Secure.hex(12) + "@" + (domain.empty? ? "localhost" : domain) + ">"
+    if body = @text
+      message.text = body
+    end
+    if body = @html
+      message.html = body
+    end
+    @attachments.each { |file| message.attach(file.filename, file.data, file.content_type) }
+    message
+  end
+end
+
+# A mail that could not be sent: the server's reason, or no server set up.
+pub class DeliveryError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+impl Error for DeliveryError
+  def message : String
+    @message
+  end
+end
+
+# "Ada <ada@example.com>" or "ada@example.com".
+pub def address(text : String) : Mail::Address
+  stripped = text.strip
+  if (open = stripped.index('<')) && stripped.ends_with?(">")
+    name = stripped[0, open].strip
+    name = name[1, name.size - 2] if name.size >= 2 && name.starts_with?("\"") && name.ends_with?("\"")
+    Mail::Address.new(stripped[open + 1, stripped.size - open - 2].strip, name)
+  else
+    Mail::Address.new(stripped)
+  end
+end
+
+# A delivered mail as the deliveries keep it: unchangeable, so it can be
+# shared between the server's threads. Each one points at the one
+# delivered before it.
+pub class Sent
+  getter to : String
+  getter cc : String
+  getter bcc : String
+  getter from : String
+  getter reply_to : String?
+  getter subject : String
+  getter text : String?
+  getter html : String?
+  getter mailer : String
+  getter files : SentFile?
+  getter previous : Sent?
+
+  def initialize(@to : String, @cc : String, @bcc : String, @from : String, @reply_to : String?, @subject : String,
+                 @text : String?, @html : String?, @mailer : String, @files : SentFile?, @previous : Sent?)
+  end
+
+  def self.of(message : Message) : Sent
+    files = nil
+    message.attachments.reversed.each { |file| files = SentFile.new(file.filename, file.data, file.content_type, files) }
+    Sent.new(message.to.join("\n"), message.cc.join("\n"), message.bcc.join("\n"), message.from, message.reply_to,
+      message.subject, message.text, message.html, message.mailer, files, nil)
+  end
+
+  def after(head : Sent?) : Sent
+    Sent.new(@to, @cc, @bcc, @from, @reply_to, @subject, @text, @html, @mailer, @files, head)
+  end
+
+  def to_message : Message
+    attachments = [] of Attachment
+    file = @files
+    while current = file
+      attachments << Attachment.new(current.filename, current.data, current.content_type)
+      file = current.next_file
+    end
+    Message.new(split(@to), @from, @subject, @text, @html, split(@cc), split(@bcc), @reply_to, attachments, @mailer)
+  end
+
+  def split(joined : String) : Array(String)
+    joined.empty? ? [] of String : joined.split("\n")
+  end
+end
+
+pub class SentFile
+  getter filename : String
+  getter data : String
+  getter content_type : String?
+  getter next_file : SentFile?
+
+  def initialize(@filename : String, @data : String, @content_type : String?, @next_file : SentFile?)
+  end
+end
+
+# Mail sent in test and development, the last one first.
+DELIVERIES = Mutex.new { nil.as(Sent?) }
+
+# What was delivered without a server, oldest first: in test, every mail;
+# a test reads `deliveries.last.subject`.
+pub def deliveries : Array(Message)
+  head = case found = DELIVERIES.get { |last| last }
+         in Sent, Nil then found
+         in Cancelled then nil
+         end
+  list = [] of Message
+  while current = head
+    list.unshift(current.to_message)
+    head = current.previous
+  end
+  list
+end
+
+# Forgets the deliveries, so a test starts from none.
+pub def clear_deliveries : Nil
+  DELIVERIES.update { |_| nil.as(Sent?) }
+  nil
+end
+
+def keep(message : Message) : Nil
+  entry = Sent.of(message)
+  DELIVERIES.update { |head| entry.after(head).as(Sent?) }
+  nil
+end
+
+# Where `deliver_now` sends mail: "smtp", "test", "log" or "none" (see the
+# module's comment).
+pub def delivery_method : String
+  url = Program.env("SMTP_URL") || ""
+  return "smtp" unless url.empty?
+  case env
+  when "test"       then "test"
+  when "production" then "none"
+  else                   "log"
+  end
+end
+
+pub def deliver(message : Message) : Message | DeliveryError
+  case delivery_method
+  when "smtp"
+    if failure = send_smtp(message, Program.env("SMTP_URL") || "")
+      return failure
+    end
+  when "test"
+    keep(message)
+  when "log"
+    keep(message)
+    STDOUT.puts log_entry(message)
+  else
+    return DeliveryError.new("no SMTP_URL: mail cannot be sent in production (" + message.mailer + " to " + message.to.join(", ") + ")")
+  end
+  message
+end
+
+# What development's log shows of a mail.
+pub def log_entry(message : Message) : String
+  head = "[mail] " + message.mailer + " to " + message.to.join(", ") + ": " + message.subject
+  head + "\n" + (message.text || message.html || "").lines.map { |line| "  | " + line }.join("\n")
+end
+
+# The parts of an SMTP_URL: host, port, security, user, password.
+pub class SmtpSettings
+  getter host : String
+  getter port : Int32
+  getter security : SmtpSecurity
+  getter user : String?
+  getter password : String?
+
+  def initialize(@host : String, @port : Int32, @security : SmtpSecurity, @user : String?, @password : String?)
+  end
+end
+
+# `smtp://user:password@host:587`, `smtps://host:465`, or
+# `smtp://host:1025?security=none`; the user and password percent-decoded.
+pub def smtp_settings(url : String) : SmtpSettings | DeliveryError
+  scheme_end = url.index("://")
+  return DeliveryError.new("SMTP_URL is not smtp://... or smtps://...") if scheme_end.nil?
+  scheme = url[0, scheme_end]
+  return DeliveryError.new("SMTP_URL is not smtp://... or smtps://...") unless scheme == "smtp" || scheme == "smtps"
+  rest = url[scheme_end + 3, url.size - scheme_end - 3]
+  query = ""
+  if q = rest.index('?')
+    query = rest[q + 1, rest.size - q - 1]
+    rest = rest[0, q]
+  end
+  rest = rest.rstrip("/")
+  user = nil
+  password = nil
+  if at = rest.rindex('@')
+    credentials = rest[0, at]
+    rest = rest[at + 1, rest.size - at - 1]
+    if colon = credentials.index(':')
+      user = percent_decode(credentials[0, colon])
+      password = percent_decode(credentials[colon + 1, credentials.size - colon - 1])
+    else
+      user = percent_decode(credentials)
+    end
+  end
+  host = rest
+  port = scheme == "smtps" ? 465 : 587
+  if colon = rest.rindex(':')
+    host = rest[0, colon]
+    port = rest[colon + 1, rest.size - colon - 1].to_i? || return DeliveryError.new("SMTP_URL's port is not a number")
+  end
+  return DeliveryError.new("SMTP_URL names no host") if host.empty?
+  security = scheme == "smtps" ? SmtpSecurity::Tls : SmtpSecurity::StartTls
+  query.split("&").each do |pair|
+    security = SmtpSecurity::Cleartext if pair == "security=none"
+  end
+  SmtpSettings.new(host, port, security, user, password)
+end
+
+def percent_decode(text : String) : String
+  URI.decode?(text) || text
+end
+
+def send_smtp(message : Message, url : String) : DeliveryError?
+  settings = case found = smtp_settings(url)
+             in SmtpSettings  then found
+             in DeliveryError then return found
+             end
+  client = case opened = SmtpClient.connect(settings.host, settings.port, settings.security)
+           in SmtpClient then opened
+           in SmtpError  then return DeliveryError.new(opened.message)
+           end
+  if (user = settings.user) && (password = settings.password)
+    client.cleartext_auth = true if settings.security == SmtpSecurity::Cleartext
+    if failure = client.auth(user, password)
+      client.close
+      return DeliveryError.new(failure.message)
+    end
+  end
+  failure = client.send(message.to_mail)
+  client.quit
+  failure ? DeliveryError.new(failure.message) : nil
+end
+
+# The text a template printed, for the text part: std/eiy's, which does
+# not escape, since a text mail is not HTML.
+pub class TextBuffer
+  @parts : Array(String)
+
+  def initialize
+    @parts = [] of String
+  end
+
+  def print(text : String) : Nil
+    @parts << text
+  end
+
+  def to_s : String
+    @parts.join
+  end
+end
+
+# The parent of every mailer: ApplicationMailer < Mailer.
+pub class Mailer
+  # Who mail is from unless `mail` says: `default from: "..."` in the
+  # mailer, or MAIL_FROM, or a placeholder.
+  def default_from : String
+    Program.env("MAIL_FROM") || "from@example.com"
+  end
+
+  # `default from: "Blog <noreply@blog.example>"`.
+  macro default(from)
+    def default_from : String
+      {{ from }}
+    end
+  end
+
+  # Each public method a mailer writes is a class method too, as in Rails:
+  # `UserMailer.welcome(user)` is `UserMailer.new.welcome(user)`.
+  macro inherited
+    macro finished
+      \{% for m in @type.methods %}
+        \{% unless m.name.starts_with?("_") || m.visibility != :public || m.name == "default_from" || m.name.ends_with?("=") %}
+          def self.\{{ m.name }}(\{{ m.args.splat }}) : ::Kurt::Mailers::Message
+            new.\{{ m.name }}(\{% for a in m.args %}\{{ a.name }}, \{% end %})
+          end
+        \{% end %}
+      \{% end %}
+    end
+  end
+
+  # The mail a mailer method answers: its addresses and subject, its text
+  # and HTML from `app/views/<mailer>/<method>.text.eiy` and `.html.eiy`.
+  # `template:` names another view of the same mailer; `layout: false`
+  # renders without `layouts/mailer.*`. To, cc and bcc take one address or
+  # an array.
+  macro mail(to, subject, from = nil, cc = nil, bcc = nil, reply_to = nil, template = nil, layout = "mailer")
+    {% caller = @caller.first.filename || "" %}
+    {% folder = @type.name.split("::").last.underscore %}
+    {% view = template ? template.id.stringify : @def.name.stringify %}
+    {% frame = layout == false ? "" : layout.id.stringify %}
+    ::Kurt::Mailers::Message.new(::Kurt::Mailers.list({{ to }}), ({{ from }} || default_from), {{ subject }},
+      ({{ run("./mail_views", caller, "text", folder, view, frame) }}),
+      ({{ run("./mail_views", caller, "html", folder, view, frame) }}),
+      ::Kurt::Mailers.list({{ cc }}), ::Kurt::Mailers.list({{ bcc }}), {{ reply_to }}, [] of ::Kurt::Mailers::Attachment,
+      {{ @type.name.split("::").last + "#" + @def.name.stringify }})
+  end
+end
+
+pub def list(value : String) : Array(String)
+  [value]
+end
+
+pub def list(value : Array(String)) : Array(String)
+  value
+end
+
+pub def list(value : Nil) : Array(String)
+  [] of String
+end

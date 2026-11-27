@@ -60,6 +60,7 @@ Usage:
   kurt generate model NAME FIELD...      model and migration
   kurt generate controller NAME ACTION...
   kurt generate migration NAME
+  kurt generate mailer NAME METHOD...    a mailer, its text and HTML views, a test
   kurt generate authentication           users, sign-in, sign-up; sign-in required
   kurt db:migrate                        run pending migrations
   kurt db:rollback [STEPS]               undo the last migration(s)
@@ -503,6 +504,24 @@ def gen_controller(name : String, actions : Array(String)) : Nil
   end
 end
 
+# A mailer, a text and an HTML view per method, the mailer layouts, and a
+# test.
+def gen_mailer(name : String, methods : Array(String)) : Nil
+  methods = ["welcome"] if methods.empty?
+  file = mailer_file_name(name)
+  write("app/mailers/application_mailer.iyi", application_mailer) unless File.exists?("app/mailers/application_mailer.iyi")
+  path = "app/mailers/" + file + ".iyi"
+  fail(camelize(file) + " exists already: " + path) if File.exists?(path)
+  write(path, mailer_class(name, methods))
+  methods.each do |method|
+    write("app/views/" + file + "/" + method + ".text.eiy", mailer_text_view(name, method))
+    write("app/views/" + file + "/" + method + ".html.eiy", mailer_html_view(name, method))
+  end
+  write("app/views/layouts/mailer.html.eiy", mailer_layout_html) unless File.exists?("app/views/layouts/mailer.html.eiy")
+  write("app/views/layouts/mailer.text.eiy", mailer_layout_text) unless File.exists?("app/views/layouts/mailer.text.eiy")
+  write("test/" + file + "_test.iyi", mailer_test(name, methods))
+end
+
 # ---------------------------------------------------------------------------
 # generate authentication
 # ---------------------------------------------------------------------------
@@ -661,7 +680,7 @@ def sign_in_existing_tests(login : String, fields : Array(String)) : Nil
 end
 
 def cmd_generate(args : Array(String)) : Nil
-  fail("usage: kurt generate (scaffold|model|controller|migration) NAME ..., or kurt generate authentication") if args.empty?
+  fail("usage: kurt generate (scaffold|model|controller|migration|mailer) NAME ..., or kurt generate authentication") if args.empty?
   kind = args[0]
   app = require_app
   if kind == "authentication"
@@ -684,8 +703,10 @@ def cmd_generate(args : Array(String)) : Nil
     gen_controller(name, rest)
   when "migration"
     write(migration_path(underscore(name)), empty_migration)
+  when "mailer"
+    gen_mailer(name, rest)
   else
-    fail("unknown generator `" + kind + "`: scaffold, model, controller or migration")
+    fail("unknown generator `" + kind + "`: scaffold, model, controller, migration or mailer")
   end
 end
 
@@ -857,6 +878,7 @@ def build_app(name : String, tests : Bool = false) : String
   emit(BUILD + "/app/models.iyi", models_module(models, tables, root + "/" + SCHEMA))
   model_names = [] of String
   models.each { |source| model_tables(source.text).each { |pair| model_names << pair[0] } }
+  emit(BUILD + "/app/mailers.iyi", mailers_module(sources("app/mailers"), model_names))
   emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers"), model_names))
   routes = source?("config/routes.iyi") || fail("no config/routes.iyi")
   emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi"))

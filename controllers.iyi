@@ -2,7 +2,8 @@
 # route. Built on iyi-web: the routing macros register ordinary iyi-web
 # routes, and the errors an action hands up with `!` become responses in one
 # place, `install_error_pages` (NotFound -> 404, Invalid -> 422,
-# Unauthorized -> the login page, Forbidden -> 403, DBError -> 503).
+# Unauthorized -> the login page, Forbidden -> 403, DBError and
+# DeliveryError -> 503).
 #
 #   class PostsController < ApplicationController
 #     before_action :require_login, except: [:index, :show]
@@ -35,6 +36,7 @@ import web/iyi_web/session::{Session, session}
 import web/iyi_web/csrf::{csrf_tag, csrf_token}
 import web/iyi_web/log::{StdoutLogger}
 import model::{NotFound, Invalid}
+import mailers::{DeliveryError}
 import datasource::{database}
 import environment::{production?, env}
 import strong_parameters::{Parameters}
@@ -705,6 +707,17 @@ pub def install_error_pages(router : Router, login_path : String = "/login") : N
   router.error Forbidden do |env, err|
     env.response.status_code = 403
     page("Forbidden", "<h1>Forbidden</h1><p>" + escape(err.message) + "</p>")
+  end
+
+  router.error DeliveryError do |env, err|
+    LOG.write("mail not sent: " + err.message)
+    env.response.status_code = 503
+    if json_request?(env)
+      env.response.content_type = "application/json"
+      %({"error":"mail could not be sent"})
+    else
+      page("Unavailable", "<h1>Mail could not be sent</h1><p>Please try again shortly.</p>")
+    end
   end
 
   router.error DBError do |env, err|

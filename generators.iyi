@@ -949,6 +949,84 @@ pub def sessions_test(login : String, fields : Array(String)) : String
 end
 
 # ---------------------------------------------------------------------------
+# Mailers: `kurt generate mailer User welcome`
+# ---------------------------------------------------------------------------
+
+# `user` or `UserMailer` -> "user_mailer".
+pub def mailer_file_name(name : String) : String
+  base = underscore(name)
+  base.ends_with?("_mailer") ? base : base + "_mailer"
+end
+
+pub def application_mailer : String
+  <<-IYI
+  # The parent of every mailer. `default from:` is who mail is from unless a
+  # mailer says otherwise (MAIL_FROM when this line is taken out).
+  class ApplicationMailer < Mailer
+    default from: "from@example.com"
+  end
+
+  IYI
+end
+
+pub def mailer_class(name : String, methods : Array(String)) : String
+  file = mailer_file_name(name)
+  html = "class " + camelize(file) + " < ApplicationMailer\n"
+  html += "  @greeting : String = \"\"\n"
+  methods.each do |method|
+    html += "\n  # " + camelize(file) + "." + method + ".deliver_now!\n"
+    html += "  # Its text and HTML: app/views/" + file + "/" + method + ".text.eiy and .html.eiy\n"
+    html += "  def " + method + "\n    @greeting = \"Hi\"\n    mail to: \"to@example.org\", subject: \"" + humanize(method) + "\"\n  end\n"
+  end
+  html + "end\n"
+end
+
+pub def mailer_text_view(name : String, method : String) : String
+  file = mailer_file_name(name)
+  "<%= @greeting %>,\n\nThis is " + camelize(file) + "#" + method + ": app/views/" + file + "/" + method + ".text.eiy\n"
+end
+
+pub def mailer_html_view(name : String, method : String) : String
+  file = mailer_file_name(name)
+  "<h1>" + camelize(file) + "#" + method + "</h1>\n\n<p><%= @greeting %>, find me in app/views/" + file + "/" + method + ".html.eiy</p>\n"
+end
+
+pub def mailer_layout_html : String
+  <<-EIY
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+  </head>
+  <body style="font-family: system-ui, sans-serif; line-height: 1.5; color: #1f2328">
+    <%= content %>
+  </body>
+  </html>
+
+  EIY
+end
+
+pub def mailer_layout_text : String
+  "<%= content %>\n"
+end
+
+pub def mailer_test(name : String, methods : Array(String)) : String
+  klass = camelize(mailer_file_name(name))
+  html = "# Mail is not sent in tests: `deliver_now` keeps it in `deliveries`.\nclear_deliveries\n"
+  methods.each do |method|
+    html += "\n# " + method + "\n"
+    html += "mail = " + klass + "." + method + "\n"
+    html += "assert mail.to == [\"to@example.org\"]\n"
+    html += "assert mail.subject == \"" + humanize(method) + "\"\n"
+    html += "assert mail.body.includes?(\"Hi\")\n"
+    html += "mail.deliver_now\n"
+    html += "assert deliveries.last.subject == \"" + humanize(method) + "\"\n"
+  end
+  html
+end
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -1233,6 +1311,7 @@ pub def agents_md(app : String) : String
   - `kurt generate model Comment body:text post:references`
   - `kurt generate controller Pages about contact`
   - `kurt generate migration add_slug_to_posts`
+  - `kurt generate mailer User welcome`: app/mailers/user_mailer.iyi, its .text.eiy and .html.eiy views
   - `kurt db:migrate`, `kurt db:rollback [STEPS]`, `kurt db:status`, `kurt db:reset` (then seeds)
   - `kurt db:seed`: run db/seeds.iyi (models, `find_or_create_by`, `!` works there).
   - `kurt test`: migrate a fresh test database and run every test/*_test.iyi. Each test file
@@ -1304,6 +1383,23 @@ pub def agents_md(app : String) : String
     neither is ever nil. Any other instance variable is declared with its type:
     `@featured : Array(Post) = [] of Post`. Views read them as they are.
   - Views see the action's locals and the controller's methods.
+
+  ## Mailers
+
+  ```iyi
+  class UserMailer < ApplicationMailer
+    def welcome(user : User)
+      @user = user
+      mail to: user.email, subject: "Welcome"
+    end
+  end
+  ```
+
+  - Views: app/views/user_mailer/welcome.text.eiy and/or welcome.html.eiy, inside
+    layouts/mailer.text.eiy and layouts/mailer.html.eiy (`<%= content %>`). The text is not escaped.
+  - Send: `UserMailer.welcome(user).deliver_now!`. SMTP_URL (`smtp://user:pass@host:587`) sends for
+    real; without it, test keeps mail in `deliveries` (`deliveries.last.subject`, `clear_deliveries`),
+    development prints it to the log, and production answers a DeliveryError (503).
 
   ## Forms
 
