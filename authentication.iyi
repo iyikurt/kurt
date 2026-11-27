@@ -1,0 +1,541 @@
+# Authentication: a model names the modules it
+# uses, and gets what each one needs.
+#
+#   class User < ApplicationRecord
+#     authentication :password, :registration, :recovery, :remember_me,
+#            :validation, :confirmation, :lock, :tracking, :timeout
+#   end
+#
+# | Module | Columns | What the model gets |
+# |---|---|---|
+# | password | email, encrypted_password | `password=`, `valid_password?`, `User.authenticate(email, password)` |
+# | registration | | (the sign-up and account controllers) |
+# | recovery | | `reset_password_token`, `User.with_reset_password_token`, `reset_password` |
+# | remember_me | remember_created_at | `remember_me`, `forget_me`, `remember_token`, `User.from_remember_token` |
+# | validation | | email present, an address, unique; password 8 to 72 bytes, confirmed |
+# | confirmation | confirmed_at, confirmation_sent_at | `confirmed?`, `confirm`, `confirmation_token`, `User.confirm_by_token`, `skip_confirmation` |
+# | lock | failed_attempts, locked_at | locked after 5 wrong passwords for an hour; `unlock_token`, `User.unlock_by_token` |
+# | tracking | sign_in_count, current_sign_in_at, last_sign_in_at, current_sign_in_ip, last_sign_in_ip | `track_sign_in(ip)` |
+# | timeout | | a session idle for `timeout_in` seconds (30 minutes) ends |
+#
+# Tokens (password reset, confirmation, unlock, remember me) are not kept
+# in the database: each is signed with HMAC-SHA256 under SESSION_SECRET and
+# carries its record's id and when it expires. What it was made from is in
+# the signature, not the token: a reset token signs the password's digest,
+# so it stops working once the password changes; a confirmation token signs
+# the address, an unlock token the time of the lock, a remember token the
+# digest and the time "remember me" was set.
+#
+# The controllers, views, routes and mails are the application's
+# (`kurt generate authentication`, `authentication_for "users"`, `authentication_helpers User`).
+module authentication
+
+import std/text
+import std/time::{Time}
+import std/digest::{SHA256}
+import std/crypto::{HMAC, Subtle}
+import std/password::{Bcrypt}
+import std/mutex::{Mutex}
+import environment::{env, production?}
+import model::{Errors, bcrypt_cost, digest_password, verify_password, dummy_digest}
+
+# Why `authenticate` answered no user: "invalid" (no such address, or a
+# wrong password: the two look the same), "locked", "last_attempt" (one
+# wrong password left before the lock), or "unconfirmed".
+pub class AuthFailure
+  getter reason : String
+
+  def initialize(@reason : String)
+  end
+
+  # The words the sign-in page shows.
+  def message : String
+    case @reason
+    when "locked"       then "Your account is locked."
+    when "unconfirmed"  then "You have to confirm your email address before continuing."
+    when "last_attempt" then "You have one more attempt before your account is locked."
+    else                     "Invalid email or password."
+    end
+  end
+end
+
+# The key tokens are signed with: SESSION_SECRET, which production has to
+# set (the application refuses to start without it), or a fixed one in
+# development and test.
+pub def token_secret : String
+  secret = Program.env("SESSION_SECRET") || ""
+  return secret unless secret.empty?
+  raise "kurt: SESSION_SECRET is not set; tokens cannot be signed in production" if production?
+  "kurt development and test token secret, not for production"
+end
+
+# `<id>-<expires>-<signature>`: safe in a URL as it is. *fingerprint* is
+# signed and not written: it is what the token stops working without.
+pub def sign_token(purpose : String, id : Int64, expires_at : Int64, fingerprint : String) : String
+  id.to_s + "-" + expires_at.to_s + "-" + signature(purpose, id, expires_at, fingerprint)
+end
+
+def signature(purpose : String, id : Int64, expires_at : Int64, fingerprint : String) : String
+  HMAC.hexdigest(SHA256, token_secret, "kurt-auth|" + purpose + "|" + id.to_s + "|" + expires_at.to_s + "|" + fingerprint)
+end
+
+# The id a token names, when it is well formed and not expired; whether it
+# is genuine is `token_valid?`'s to say, once the record is found.
+pub def token_id(token : String) : Int64?
+  parts = token.strip.split("-")
+  return nil unless parts.size == 3
+  id = parts[0].to_i64?
+  expires = parts[1].to_i64?
+  return nil if id.nil? || expires.nil?
+  return nil if expires < Time.utc.to_unix
+  id
+end
+
+pub def token_valid?(token : String, purpose : String, id : Int64, fingerprint : String) : Bool
+  parts = token.strip.split("-")
+  return false unless parts.size == 3
+  expires = parts[1].to_i64?
+  return false if expires.nil? || expires < Time.utc.to_unix || parts[0] != id.to_s
+  Subtle.constant_time_compare(parts[2], signature(purpose, id, expires, fingerprint))
+end
+
+pub def now_unix : Int64
+  Time.utc.to_unix
+end
+
+pub def time_fingerprint(time : Time?) : String
+  time ? time.to_unix.to_s : ""
+end
+
+# The rules for a password: there when the record has none yet, 8 to
+# 72 bytes (bcrypt reads no more), and the same as its confirmation when
+# one was given.
+pub def check_password(errors : Errors, password : String?, confirmation : String?, digest : String, minimum : Int32, validation : Bool) : Nil
+  if password.nil? || password.empty?
+    errors.add("password", "can't be blank") if digest.empty?
+    return
+  end
+  if validation && password.size < minimum
+    errors.add("password", "is too short (minimum is " + minimum.to_s + " characters)")
+  end
+  errors.add("password", "is too long (maximum is 72 bytes)") if password.bytesize > 72
+  if confirmation && confirmation != password
+    errors.add("password_confirmation", "doesn't match Password")
+  end
+end
+
+# An address: something@something.something, no spaces. A blank one is
+# presence's to report.
+pub def check_email(errors : Errors, field : String, value : String) : Nil
+  return if value.strip.empty?
+  at = value.index('@')
+  ok = !at.nil? && at > 0 && value.count('@') == 1 && !value.includes?(" ")
+  if ok && (at = value.index('@'))
+    domain = value[at + 1, value.size - at - 1]
+    dot = domain.index('.')
+    ok = !dot.nil? && dot > 0 && dot < domain.size - 1
+  end
+  errors.add(field, "is invalid") unless ok
+end
+
+# Sign-in attempts counted per client and action, in fixed windows: what
+# keeps one address from trying passwords across many accounts, which
+# lock (per account) does not. Off in test, as Rails' rate_limit is.
+WINDOWS = Mutex.new { {} of String => Tuple(Int64, Int32) }
+
+# True when *key* (an address and an action) has made more than *limit*
+# requests in the current window of *period* seconds.
+pub def rate_limited?(key : String, limit : Int32 = 10, period : Int32 = 60, force : Bool = false) : Bool
+  return false if env == "test" && !force
+  now = Time.utc.to_unix
+  WINDOWS.update do |table|
+    # Old windows go, so the table holds only the last period's clients.
+    table.reject_in_place { |_, window| now - window[0] >= period } if table.size > 10000
+    window = table[key]?
+    if window.nil? || now - window[0] >= period
+      table[key] = {now, 1}
+    else
+      table[key] = {window[0], window[1] + 1}
+    end
+    table
+  end
+  count = WINDOWS.get do |table|
+    found = table[key]?
+    found ? found[1] : 0
+  end
+  count.is_a?(Int32) ? count > limit : false
+end
+
+# Forgets every window: for tests of the limit.
+pub def reset_rate_limits : Nil
+  WINDOWS.update { |table| table.clear; table }
+  nil
+end
+
+# `authentication :password, :registration, ...` in a model: see
+# the module's comment. Options: `authentication_key: :email_address` for
+# another column, `password_length: 12` for a longer minimum,
+# `maximum_attempts:` and `unlock_in:` (seconds) for lock,
+# `remember_for:` (seconds) for remember_me, `timeout_in:` (seconds) for
+# timeout, `reset_password_within:` and `confirm_within:` (seconds).
+pub macro authentication(*modules, authentication_key = :email, password_length = 8, maximum_attempts = 5, unlock_in = 3600,
+                 remember_for = 1209600, timeout_in = 1800, reset_password_within = 21600, confirm_within = 259200)
+  {% names = modules.map(&.id.stringify) %}
+  {% for name in names %}
+    {% unless ["password", "registration", "recovery", "remember_me", "validation", "confirmation", "lock", "tracking", "timeout"].includes?(name) %}
+      {% raise "authentication: unknown module :" + name + " (password, registration, recovery, remember_me, validation, confirmation, lock, tracking, timeout)" %}
+    {% end %}
+  {% end %}
+  {% unless names.includes?("password") %}
+    {% raise "authentication: :password is the module the others build on" %}
+  {% end %}
+  {% key = authentication_key.id %}
+
+  # The modules, for the controllers to ask: `User.authentication?("confirmation")`.
+  def self.authentication_modules : Array(String)
+    [{% for name in names %}{{ name }}, {% end %}] of String
+  end
+
+  def self.authentication?(name : String) : Bool
+    authentication_modules.includes?(name)
+  end
+
+  # ---- password --------------------------------------
+
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_password : String? = nil
+
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_password_confirmation : String? = nil
+
+  # The password being set: nil once saved; never read back.
+  def password : String?
+    @__kurt_password
+  end
+
+  # An empty password is no password: an account form left blank keeps
+  # the old one.
+  def password=(value : String?) : String?
+    @__kurt_password = value && !value.empty? ? value : nil
+  end
+
+  def password_confirmation : String?
+    @__kurt_password_confirmation
+  end
+
+  def password_confirmation=(value : String?) : String?
+    @__kurt_password_confirmation = value
+  end
+
+  # `User.new(email: "...", password: "...")`, `User.create(...)`.
+  def self.new(*, password : String, password_confirmation : String? = nil, **fields)
+    record = new(**fields)
+    record.password = password
+    record.password_confirmation = password_confirmation
+    record
+  end
+
+  # `user.update(password: "...", password_confirmation: "...")`.
+  def update(*, password : String, password_confirmation : String? = nil, **fields)
+    self.password = password
+    @__kurt_password_confirmation = password_confirmation
+    update(**fields)
+  end
+
+  def __kurt_password_checks(errors : ::Kurt::Model::Errors) : Nil
+    \{% if @type.has_method?("__kurt_auth_checks") %}
+      __kurt_auth_checks(errors)
+    \{% end %}
+    ::Kurt::Authentication.check_password(errors, @__kurt_password, @__kurt_password_confirmation, encrypted_password, {{ password_length }}, {{ names.includes?("validation") }})
+  end
+
+  def __kurt_digest_password : Nil
+    if plain = @__kurt_password
+      @encrypted_password = ::Kurt::Model.digest_password(plain) unless plain.empty?
+    end
+    @__kurt_password = nil
+    @__kurt_password_confirmation = nil
+  end
+
+  def __kurt_assign_password(attributes : Hash(String, String)) : Nil
+    if raw = attributes["password"]?
+      self.password = raw
+    end
+    if raw = attributes["password_confirmation"]?
+      @__kurt_password_confirmation = raw
+    end
+  end
+
+  # Whether *attempt* is this record's password.
+  def valid_password?(attempt : String) : Bool
+    ::Kurt::Model.verify_password(attempt, encrypted_password)
+  end
+
+  # Addresses are kept trimmed and lowercase, so "Ada@Example.com " signs in.
+  def __kurt_auth_normalize
+    @{{ key }} = {{ key }}.strip.downcase
+  end
+
+  ::Kurt::Model.before_validation :__kurt_auth_normalize
+
+  # The record an address signs in as, or nil.
+  def self.find_for_authentication(value : String) : self | Nil | ::Db::Errors::DBError
+    query.where({{ key.stringify }}, value.strip.downcase).first?
+  end
+
+  # The record whose address and password these are, or why not
+  # (AuthFailure). When there is no such address a password is checked
+  # anyway, so the time it takes does not tell which addresses exist.
+  # Lockable counts the wrong passwords and locks; confirmation refuses an
+  # address not confirmed yet.
+  def self.authenticate(value : String, password : String) : self | ::Kurt::Authentication::AuthFailure | ::Db::Errors::DBError
+    record = find_for_authentication(value)!
+    if record.nil?
+      ::Kurt::Model.verify_password(password, ::Kurt::Model.dummy_digest)
+      return ::Kurt::Authentication::AuthFailure.new("invalid")
+    end
+    {% if names.includes?("lock") %}
+      if record.access_locked?
+        return ::Kurt::Authentication::AuthFailure.new("locked")
+      end
+    {% end %}
+    unless record.valid_password?(password)
+      {% if names.includes?("lock") %}
+        return record.__kurt_failed_attempt!
+      {% else %}
+        return ::Kurt::Authentication::AuthFailure.new("invalid")
+      {% end %}
+    end
+    {% if names.includes?("lock") %}
+      record.__kurt_reset_attempts!
+    {% end %}
+    {% if names.includes?("confirmation") %}
+      return ::Kurt::Authentication::AuthFailure.new("unconfirmed") unless record.confirmed?
+    {% end %}
+    record
+  end
+
+  {% if names.includes?("validation") %}
+    # ---- validation --------------------------------------------------
+    ::Kurt::Model.validates {{ authentication_key }}, presence: true, uniqueness: true
+
+    def __kurt_auth_checks(errors : ::Kurt::Model::Errors) : Nil
+      ::Kurt::Authentication.check_email(errors, {{ key.stringify }}, {{ key }})
+    end
+  {% end %}
+
+  {% if names.includes?("recovery") %}
+    # ---- recovery ------------------------------------------------------
+
+    # A link's token for setting a new password, good for six hours and
+    # until the password changes.
+    def reset_password_token : String
+      ::Kurt::Authentication.sign_token("reset", @id, ::Kurt::Authentication.now_unix + {{ reset_password_within }}, encrypted_password)
+    end
+
+    # The record a reset token is for, or nil when it is not genuine, has
+    # expired or was used.
+    def self.with_reset_password_token(token : String) : self | Nil | ::Db::Errors::DBError
+      id = ::Kurt::Authentication.token_id(token)
+      return nil if id.nil?
+      record = find?(id)!
+      return nil if record.nil?
+      ::Kurt::Authentication.token_valid?(token, "reset", record.id, record.encrypted_password) ? record : nil
+    end
+
+    # Sets a new password from a reset form: false, with the reasons in
+    # `errors`, when it does not validate. A blank one is refused, unlike an
+    # account form's.
+    def reset_password(new_password : String, confirmation : String) : Bool | ::Db::Errors::DBError
+      if new_password.empty?
+        errors.add("password", "can't be blank")
+        return false
+      end
+      self.password = new_password
+      @__kurt_password_confirmation = confirmation
+      {% if names.includes?("lock") %}
+        @failed_attempts = 0_i64
+        @locked_at = nil
+      {% end %}
+      save
+    end
+  {% end %}
+
+  {% if names.includes?("remember_me") %}
+    # ---- remember_me -------------------------------------------------
+
+    # Marks the record remembered: the remember cookie is good until
+    # `forget_me` (signing out) or two weeks.
+    def remember_me : Bool | ::Db::Errors::DBError
+      @remember_created_at ||= Time.utc
+      save
+    end
+
+    def forget_me : Bool | ::Db::Errors::DBError
+      return true if @remember_created_at.nil?
+      @remember_created_at = nil
+      save
+    end
+
+    def remember_token : String
+      ::Kurt::Authentication.sign_token("remember", @id, ::Kurt::Authentication.now_unix + {{ remember_for }}, encrypted_password + "|" + ::Kurt::Authentication.time_fingerprint(@remember_created_at))
+    end
+
+    def self.remember_for : Int32
+      {{ remember_for }}
+    end
+
+    def remember_for : Int32
+      {{ remember_for }}
+    end
+
+    def self.from_remember_token(token : String) : self | Nil | ::Db::Errors::DBError
+      id = ::Kurt::Authentication.token_id(token)
+      return nil if id.nil?
+      record = find?(id)!
+      return nil if record.nil? || record.remember_created_at.nil?
+      fingerprint = record.encrypted_password + "|" + ::Kurt::Authentication.time_fingerprint(record.remember_created_at)
+      ::Kurt::Authentication.token_valid?(token, "remember", record.id, fingerprint) ? record : nil
+    end
+  {% end %}
+
+  {% if names.includes?("confirmation") %}
+    # ---- confirmation ----------------------------------------------------
+
+    def confirmed? : Bool
+      !@confirmed_at.nil?
+    end
+
+    # Marks the address confirmed and saves.
+    def confirm : Bool | ::Db::Errors::DBError
+      @confirmed_at = Time.utc
+      save
+    end
+
+    # Confirmed from the start: for seeds, fixtures and accounts an
+    # administrator makes. Call before the first save.
+    def skip_confirmation : Nil
+      @confirmed_at = Time.utc
+      nil
+    end
+
+    # The token of the link the confirmation mail carries: three days, and
+    # only for this address.
+    def confirmation_token : String
+      @confirmation_sent_at = Time.utc
+      ::Kurt::Authentication.sign_token("confirm", @id, ::Kurt::Authentication.now_unix + {{ confirm_within }}, {{ key }})
+    end
+
+    # Confirms the record a token is for: the record, or nil when the token
+    # is not genuine or has expired.
+    def self.confirm_by_token(token : String) : self | Nil | ::Db::Errors::DBError
+      id = ::Kurt::Authentication.token_id(token)
+      return nil if id.nil?
+      record = find?(id)!
+      return nil if record.nil?
+      return nil unless ::Kurt::Authentication.token_valid?(token, "confirm", record.id, record.{{ key }})
+      record.confirm! unless record.confirmed?
+      record
+    end
+  {% end %}
+
+  {% if names.includes?("lock") %}
+    # ---- lock -------------------------------------------------------
+
+    def self.maximum_attempts : Int32
+      {{ maximum_attempts }}
+    end
+
+    # Locked, and not for longer than an hour ago: the lock ends by itself.
+    def access_locked? : Bool
+      if at = @locked_at
+        (Time.utc - at).total_seconds < {{ unlock_in }}
+      else
+        false
+      end
+    end
+
+    def lock_access : Bool | ::Db::Errors::DBError
+      @locked_at = Time.utc
+      save
+    end
+
+    def unlock_access : Bool | ::Db::Errors::DBError
+      @locked_at = nil
+      @failed_attempts = 0_i64
+      save
+    end
+
+    # A wrong password: counted, and the account locked at the maximum.
+    def __kurt_failed_attempt : ::Kurt::Authentication::AuthFailure | ::Db::Errors::DBError
+      # A lock that has run out starts the count again.
+      unless @locked_at.nil? || access_locked?
+        @locked_at = nil
+        @failed_attempts = 0_i64
+      end
+      @failed_attempts += 1
+      if @failed_attempts >= {{ maximum_attempts }}
+        @locked_at = Time.utc
+      end
+      ::Kurt::Model.update_row(self.class.table_name, ["failed_attempts", "locked_at"], [@failed_attempts.as(::Db::Value::DBValue), @locked_at.as(::Db::Value::DBValue)], @id)!
+      return ::Kurt::Authentication::AuthFailure.new("locked") if access_locked?
+      return ::Kurt::Authentication::AuthFailure.new("last_attempt") if @failed_attempts == {{ maximum_attempts }} - 1
+      ::Kurt::Authentication::AuthFailure.new("invalid")
+    end
+
+    def __kurt_reset_attempts : Nil | ::Db::Errors::DBError
+      return nil if @failed_attempts == 0 && @locked_at.nil?
+      @failed_attempts = 0_i64
+      @locked_at = nil
+      ::Kurt::Model.update_row(self.class.table_name, ["failed_attempts", "locked_at"], [@failed_attempts.as(::Db::Value::DBValue), @locked_at.as(::Db::Value::DBValue)], @id)!
+      nil
+    end
+
+    # The token of the unlock mail's link, good while this lock lasts.
+    def unlock_token : String
+      ::Kurt::Authentication.sign_token("unlock", @id, ::Kurt::Authentication.now_unix + {{ unlock_in }}, ::Kurt::Authentication.time_fingerprint(@locked_at))
+    end
+
+    def self.unlock_by_token(token : String) : self | Nil | ::Db::Errors::DBError
+      id = ::Kurt::Authentication.token_id(token)
+      return nil if id.nil?
+      record = find?(id)!
+      return nil if record.nil? || record.locked_at.nil?
+      return nil unless ::Kurt::Authentication.token_valid?(token, "unlock", record.id, ::Kurt::Authentication.time_fingerprint(record.locked_at))
+      record.unlock_access!
+      record
+    end
+  {% end %}
+
+  {% if names.includes?("tracking") %}
+    # ---- tracking ------------------------------------------------------
+
+    # Counts a sign-in from *ip*, keeping the one before it as the last.
+    def track_sign_in(ip : String?) : Nil | ::Db::Errors::DBError
+      now = Time.utc
+      @last_sign_in_at = @current_sign_in_at || now
+      @current_sign_in_at = now
+      @last_sign_in_ip = @current_sign_in_ip || ip
+      @current_sign_in_ip = ip
+      @sign_in_count += 1
+      names = ["sign_in_count", "current_sign_in_at", "last_sign_in_at", "current_sign_in_ip", "last_sign_in_ip"]
+      values = [@sign_in_count.as(::Db::Value::DBValue), @current_sign_in_at.as(::Db::Value::DBValue), @last_sign_in_at.as(::Db::Value::DBValue),
+                @current_sign_in_ip.as(::Db::Value::DBValue), @last_sign_in_ip.as(::Db::Value::DBValue)]
+      ::Kurt::Model.update_row(self.class.table_name, names, values, @id)!
+      nil
+    end
+  {% end %}
+
+  {% if names.includes?("timeout") %}
+    # ---- timeout ----------------------------------------------------
+
+    # Seconds a signed-in session may sit idle.
+    def self.timeout_in : Int32
+      {{ timeout_in }}
+    end
+
+    def timeout_in : Int32
+      {{ timeout_in }}
+    end
+  {% end %}
+end

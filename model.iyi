@@ -77,8 +77,11 @@ pub class Errors
     @messages = {} of String => Array(String)
   end
 
+  # The same message twice on one field is kept once: a blank `user_id`
+  # that did not convert and failed `presence` is one problem.
   def add(field : String, message : String) : Nil
     list = @messages[field]? || [] of String
+    return if list.includes?(message)
     list << message
     @messages[field] = list
     nil
@@ -176,9 +179,30 @@ pub def transaction(on : Transaction? = nil, & : Transaction -> T) : T | Nil | D
   end
 end
 
+# The mark a plain column name carries in a query's clauses until the SQL
+# is written: there it becomes the table's name and a dot when the query
+# joins other tables (`posts.title`), and nothing otherwise.
+pub COLUMN_MARK = "\e"
+
+# `title` as a query writes it: marked, so a join can qualify it; a name
+# with a dot or anything but letters, digits and _ is written as it is.
+pub def mark_column(column : String) : String
+  return column if column.empty?
+  column.each_char do |c|
+    return column unless c.ascii_alphanumeric? || c == '_'
+  end
+  COLUMN_MARK + column
+end
+
 # A query against T's table, built up and run by `all`, `first`, `count`...
 # Nothing runs until one of those is called, so a scope can be passed around
 # and narrowed: `Post.feed.where(user_id: 5).limit(3).all`.
+#
+#   Post.joins(:user).where("users.name", "Ada").distinct.all!
+#   Post.where(published: true).or_where(Post.where(user_id: 5)).count!
+#   Post.pluck(:title, String)!                      # Array(String)
+#   Post.where(published: true).sum(:views)!         # Float64
+#   Post.group_by(:user_id).having("COUNT(*) > ?", [1]).counts!   # Hash(DBValue, Int64)
 pub class Query(T)
   @wheres : Array(String)
   @args : Array(DBValue)
@@ -188,6 +212,15 @@ pub class Query(T)
   @on : Transaction?
   @includes : Array(String)?
   @preloaded : Array(T)?
+  @joins : Array(String)?
+  @select : String?
+  @distinct : Bool
+  @groups : Array(String)?
+  @havings : Array(String)?
+  @having_args : Array(DBValue)?
+  # What a part of the query could not be built from (an unknown
+  # association): answered as a DBError when it runs.
+  @failure : String?
 
   def initialize
     @wheres = [] of String
@@ -200,6 +233,13 @@ pub class Query(T)
     @on = nil
     @includes = nil
     @preloaded = nil
+    @joins = nil
+    @select = nil
+    @distinct = false
+    @groups = nil
+    @havings = nil
+    @having_args = nil
+    @failure = nil
   end
 
   # Loads associations with the rows, one query each, so a list does not
@@ -219,13 +259,104 @@ pub class Query(T)
     self
   end
 
+  # An INNER JOIN for each association named, as the model declares it:
+  # `Post.joins(:user, :comments)`. The rows are still posts, `posts.*`;
+  # narrow by the joined table's columns with their table's name:
+  # `where("users.name", "Ada")`. A has_many join gives a post once per
+  # comment: add `distinct`.
+  def joins(*names : Symbol) : Query(T)
+    names.each { |name| join_association(name.to_s, "INNER") }
+    self
+  end
+
+  # A LEFT OUTER JOIN: rows with no associated record too.
+  def left_joins(*names : Symbol) : Query(T)
+    names.each { |name| join_association(name.to_s, "LEFT OUTER") }
+    self
+  end
+
+  # A join written out: `joins("INNER JOIN tags ON tags.id = taggings.tag_id")`.
+  def joins(sql : String) : Query(T)
+    @preloaded = nil
+    (@joins ||= [] of String) << sql
+    self
+  end
+
+  def join_association(name : String, kind : String) : Nil
+    @preloaded = nil
+    if sql = T.__kurt_join_sql(name, kind)
+      (@joins ||= [] of String) << sql
+    else
+      @failure = T.model_name + " has no association " + name
+    end
+    nil
+  end
+
+  def joined? : Bool
+    !@joins.nil?
+  end
+
+  # The columns to read instead of every one: `select("posts.*, users.name AS author")`.
+  # `all` still makes models, so the selection has to give each field; for
+  # other values, `pluck`.
+  def select(*columns : Symbol | String) : Query(T)
+    @preloaded = nil
+    names = [] of String
+    columns.each { |c| names << (c.is_a?(Symbol) ? mark_column(c.to_s) : c) }
+    @select = names.join(", ")
+    self
+  end
+
+  # SELECT DISTINCT.
+  def distinct : Query(T)
+    @preloaded = nil
+    @distinct = true
+    self
+  end
+
+  # GROUP BY: `group_by(:user_id)`; with `counts`, `sums`... for a value
+  # per group. (Rails' `group`: in iyi, `group` is the task group.)
+  def group_by(*columns : Symbol | String) : Query(T)
+    @preloaded = nil
+    list = @groups || [] of String
+    columns.each { |c| list << (c.is_a?(Symbol) ? mark_column(c.to_s) : c) }
+    @groups = list
+    self
+  end
+
+  # HAVING, after `group_by`: `having("COUNT(*) > ?", [2])`.
+  def having(fragment : String, args : Array(DBValue) = [] of DBValue) : Query(T)
+    @preloaded = nil
+    (@havings ||= [] of String) << "(" + fragment + ")"
+    list = @having_args || [] of DBValue
+    args.each { |arg| list << arg }
+    @having_args = list
+    self
+  end
+
+  # The rows of either query: `Post.where(published: true).or_where(Post.where(user_id: 5))`,
+  # Rails' `.or` (in iyi, `.or` is the error recovery). Each side's
+  # conditions stay together; joins, order and the rest are this query's.
+  def or_where(other : Query(T)) : Query(T)
+    @preloaded = nil
+    mine = @wheres.empty? ? "1 = 1" : @wheres.join(" AND ")
+    theirs = other.__kurt_wheres.empty? ? "1 = 1" : other.__kurt_wheres.join(" AND ")
+    @wheres = ["((" + mine + ") OR (" + theirs + "))"]
+    other.args.each { |arg| @args << arg }
+    self
+  end
+
+  def __kurt_wheres : Array(String)
+    @wheres
+  end
+
   # `column IN (...)`; no values matches nothing.
   def where_in(column : String, values : Array(DBValue)) : Query(T)
     @preloaded = nil
     if values.empty?
       @wheres << "1 = 0"
     else
-      @wheres << column + " IN (" + values.map { |_| "?" }.join(", ") + ")"
+      @wheres << mark_column(column) + " IN (" + values.map { |_| "?" }.join(", ") + ")"
       values.each { |value| @args << value }
     end
     self
@@ -246,9 +377,9 @@ pub class Query(T)
   def where(column : String, value : DBValue) : Query(T)
     @preloaded = nil
     if value.nil?
-      @wheres << column + " IS NULL"
+      @wheres << mark_column(column) + " IS NULL"
     else
-      @wheres << column + " = ?"
+      @wheres << mark_column(column) + " = ?"
       @args << value
     end
     self
@@ -277,9 +408,9 @@ pub class Query(T)
   def where_not(column : String, value : DBValue) : Query(T)
     @preloaded = nil
     if value.nil?
-      @wheres << column + " IS NOT NULL"
+      @wheres << mark_column(column) + " IS NOT NULL"
     else
-      @wheres << column + " <> ?"
+      @wheres << mark_column(column) + " <> ?"
       @args << value
     end
     self
@@ -287,7 +418,7 @@ pub class Query(T)
 
   def order(column : String) : Query(T)
     @preloaded = nil
-    (@orders ||= [] of String) << column + " ASC"
+    (@orders ||= [] of String) << mark_column(column) + " ASC"
     self
   end
 
@@ -297,7 +428,7 @@ pub class Query(T)
 
   def order_desc(column : String) : Query(T)
     @preloaded = nil
-    (@orders ||= [] of String) << column + " DESC"
+    (@orders ||= [] of String) << mark_column(column) + " DESC"
     self
   end
 
@@ -329,15 +460,44 @@ pub class Query(T)
     limit(per).offset((page - 1) * per)
   end
 
-  # The WHERE clause, and the arguments it binds.
-  def where_clause : String
-    @wheres.empty? ? "" : " WHERE " + @wheres.join(" AND ")
+  # Marked column names as SQL: `posts.title` when the query joins, `title`
+  # when it does not.
+  def resolve(text : String) : String
+    return text unless text.includes?(COLUMN_MARK)
+    text.gsub(COLUMN_MARK, joined? ? T.table_name + "." : "")
   end
 
-  def to_sql : String
-    sql = "SELECT * FROM " + T.table_name + where_clause
+  # The WHERE clause, and the arguments it binds.
+  def where_clause : String
+    @wheres.empty? ? "" : " WHERE " + resolve(@wheres.join(" AND "))
+  end
+
+  # FROM, the joins and WHERE: what every statement of the query shares.
+  def from_clause : String
+    sql = " FROM " + T.table_name
+    if joins = @joins
+      sql += " " + joins.join(" ")
+    end
+    sql + where_clause
+  end
+
+  # GROUP BY and HAVING.
+  def group_clause : String
+    sql = ""
+    if (groups = @groups) && !groups.empty?
+      sql += " GROUP BY " + resolve(groups.join(", "))
+    end
+    if (havings = @havings) && !havings.empty?
+      sql += " HAVING " + resolve(havings.join(" AND "))
+    end
+    sql
+  end
+
+  # ORDER BY, LIMIT and OFFSET.
+  def tail_clause : String
+    sql = ""
     if (orders = @orders) && !orders.empty?
-      sql += " ORDER BY " + orders.join(", ")
+      sql += " ORDER BY " + resolve(orders.join(", "))
     end
     if n = @limit
       sql += " LIMIT " + n.to_s
@@ -349,8 +509,33 @@ pub class Query(T)
     sql
   end
 
+  def select_list : String
+    if chosen = @select
+      resolve(chosen)
+    else
+      joined? ? T.table_name + ".*" : "*"
+    end
+  end
+
+  def to_sql : String
+    "SELECT " + (@distinct ? "DISTINCT " : "") + select_list + from_clause + group_clause + tail_clause
+  end
+
+  # The arguments the statement binds: the conditions', then HAVING's.
   def args : Array(DBValue)
-    @args
+    if extra = @having_args
+      @args + extra
+    else
+      @args
+    end
+  end
+
+  def failure : DBError?
+    if message = @failure
+      DBError.new(message)
+    else
+      nil
+    end
   end
 
   # Every row the query matches.
@@ -358,10 +543,13 @@ pub class Query(T)
     if loaded = @preloaded
       return loaded.dup
     end
+    if failed = failure
+      return failed
+    end
     rows = if tx = @on
-             tx.connection.query_all(placeholders(to_sql), args: @args, as: T)!
+             tx.connection.query_all(placeholders(to_sql), args: args, as: T)!
            else
-             database.query_all(placeholders(to_sql), args: @args, as: T)!
+             database.query_all(placeholders(to_sql), args: args, as: T)!
            end
     if names = @includes
       names.each do |name|
@@ -402,16 +590,32 @@ pub class Query(T)
     where("id", id).first
   end
 
+  # One value from the database: a COUNT, a SUM...
+  def scalar(sql : String) : DBValue | DBError
+    if failed = failure
+      return failed
+    end
+    if tx = @on
+      tx.connection.scalar(placeholders(sql), args: args)
+    else
+      database.scalar(placeholders(sql), args: args)
+    end
+  end
+
   def count : Int64 | DBError
     if loaded = @preloaded
       return loaded.size.to_i64
     end
-    sql = placeholders("SELECT COUNT(*) FROM " + T.table_name + where_clause)
-    value = if tx = @on
-              tx.connection.scalar(sql, args: @args)!
-            else
-              database.scalar(sql, args: @args)!
-            end
+    groups = @groups
+    sql = if groups && !groups.empty?
+            # One row per group: what the groups are, not every column.
+            "SELECT COUNT(*) FROM (" + values_sql(groups.join(", ")) + ") AS kurt_counted"
+          elsif @distinct || @select
+            "SELECT COUNT(*) FROM (" + to_sql + ") AS kurt_counted"
+          else
+            "SELECT COUNT(*)" + from_clause
+          end
+    value = scalar(sql)!
     case value
     when Int64 then value
     when Int32 then value.to_i64
@@ -424,14 +628,247 @@ pub class Query(T)
   end
 
   # Deletes every row the query matches, without loading them; answers how
-  # many went.
+  # many went. With joins, the rows are chosen by their ids.
   def delete_all : Int64 | DBError
-    sql = placeholders("DELETE FROM " + T.table_name + where_clause)
-    if tx = @on
-      tx.connection.exec(sql, args: @args)!.rows_affected
-    else
-      database.exec(sql, args: @args)!.rows_affected
+    if failed = failure
+      return failed
     end
+    sql = if joined?
+            "DELETE FROM " + T.table_name + " WHERE id IN (SELECT " + T.table_name + ".id" + from_clause + ")"
+          else
+            "DELETE FROM " + T.table_name + where_clause
+          end
+    if tx = @on
+      tx.connection.exec(placeholders(sql), args: @args)!.rows_affected
+    else
+      database.exec(placeholders(sql), args: @args)!.rows_affected
+    end
+  end
+
+  # ---- values instead of models ---------------------------------------
+
+  # The statement that reads *columns* instead of the rows.
+  def values_sql(columns : String) : String
+    "SELECT " + (@distinct ? "DISTINCT " : "") + resolve(columns) + from_clause + group_clause + tail_clause
+  end
+
+  def read_values(sql : String, width : Int32) : Array(Array(DBValue)) | DBError
+    if failed = failure
+      return failed
+    end
+    rows = [] of Array(DBValue)
+    problem = nil
+    reader = ->(rs : ::Db::Core::ResultSet) do
+      row = [] of DBValue
+      width.times do
+        value = rs.read
+        if value.is_a?(DBError)
+          problem = value
+          row << nil
+        else
+          row << value
+        end
+      end
+      rows << row
+      nil
+    end
+    if tx = @on
+      tx.connection.query_each(placeholders(sql), args: args) { |rs| reader.call(rs) }!
+    else
+      database.query_each(placeholders(sql), args: args) { |rs| reader.call(rs) }!
+    end
+    if failed = problem
+      return failed
+    end
+    rows
+  end
+
+  # One column's values: `Post.pluck(:title)!` is `Array(DBValue)`; with a
+  # type, `Post.pluck(:title, String)!` is `Array(String)`. An expression
+  # works too: `pluck("COUNT(*)")`.
+  def pluck(column : Symbol | String) : Array(DBValue) | DBError
+    name = column.is_a?(Symbol) ? mark_column(column.to_s) : column
+    read_values(values_sql(name), 1)!.map { |row| row[0] }
+  end
+
+  def pluck(column : Symbol | String, type : K.class) : Array(K) | DBError forall K
+    list = [] of K
+    pluck(column)!.each do |value|
+      converted = ::Kurt::Model.value_as(value, K)
+      return DBError.new("pluck: " + column.to_s + " is not a " + K.to_s + ": " + value.inspect) if converted.is_a?(CastError)
+      list << converted
+    end
+    list
+  end
+
+  # Several columns: one array of values per row.
+  def pluck(*columns : Symbol | String) : Array(Array(DBValue)) | DBError
+    names = [] of String
+    columns.each { |c| names << (c.is_a?(Symbol) ? mark_column(c.to_s) : c) }
+    read_values(values_sql(names.join(", ")), names.size)
+  end
+
+  # The ids: `Post.where(published: true).ids!`.
+  def ids : Array(Int64) | DBError
+    pluck(:id, Int64)
+  end
+
+  # ---- calculations ------------------------------------------------------
+
+  def float_type : String
+    postgres? ? "DOUBLE PRECISION" : "REAL"
+  end
+
+  # The sum of a column, 0.0 when no row matches: `Order.sum(:total)!`.
+  # `sum(:quantity, Int64)` for a whole number.
+  def sum(column : Symbol | String) : Float64 | DBError
+    value = scalar(values_sql("CAST(COALESCE(SUM(" + column_sql(column) + "), 0) AS " + float_type + ")"))!
+    ::Kurt::Model.number(value)
+  end
+
+  def sum(column : Symbol | String, type : Int64.class) : Int64 | DBError
+    value = scalar(values_sql("CAST(COALESCE(SUM(" + column_sql(column) + "), 0) AS " + (postgres? ? "BIGINT" : "INTEGER") + ")"))!
+    ::Kurt::Model.number(value).to_i64
+  end
+
+  # The mean, nil when no row matches.
+  def average(column : Symbol | String) : Float64 | Nil | DBError
+    value = scalar(values_sql("CAST(AVG(" + column_sql(column) + ") AS " + float_type + ")"))!
+    value.nil? ? nil : ::Kurt::Model.number(value)
+  end
+
+  # The smallest value, nil when no row matches: `minimum(:price, Float64)`,
+  # `minimum(:created_at, Time)`; without a type, the value as read.
+  def minimum(column : Symbol | String) : DBValue | DBError
+    scalar(values_sql("MIN(" + column_sql(column) + ")"))
+  end
+
+  def minimum(column : Symbol | String, type : K.class) : K | Nil | DBError forall K
+    typed(minimum(column)!, K, "minimum")
+  end
+
+  def maximum(column : Symbol | String) : DBValue | DBError
+    scalar(values_sql("MAX(" + column_sql(column) + ")"))
+  end
+
+  def maximum(column : Symbol | String, type : K.class) : K | Nil | DBError forall K
+    typed(maximum(column)!, K, "maximum")
+  end
+
+  def typed(value : DBValue, type : K.class, what : String) : K | Nil | DBError forall K
+    return nil if value.nil?
+    converted = ::Kurt::Model.value_as(value, K)
+    return DBError.new(what + ": not a " + K.to_s + ": " + value.inspect) if converted.is_a?(CastError)
+    converted
+  end
+
+  def column_sql(column : Symbol | String) : String
+    column.is_a?(Symbol) ? mark_column(column.to_s) : column
+  end
+
+  # ---- per group, after `group_by` -----------------------------------
+
+  # The rows in each group: `Post.group_by(:user_id).counts!` is
+  # `{1 => 3, 2 => 1}`, keyed by the group's value.
+  def counts : Hash(DBValue, Int64) | DBError
+    out = {} of DBValue => Int64
+    grouped("COUNT(*)")!.each { |pair| out[pair[0]] = ::Kurt::Model.number(pair[1]).to_i64 }
+    out
+  end
+
+  # The sum of *column* in each group.
+  def sums(column : Symbol | String) : Hash(DBValue, Float64) | DBError
+    out = {} of DBValue => Float64
+    grouped("CAST(COALESCE(SUM(" + column_sql(column) + "), 0) AS " + float_type + ")")!.each { |pair| out[pair[0]] = ::Kurt::Model.number(pair[1]) }
+    out
+  end
+
+  # The mean of *column* in each group.
+  def averages(column : Symbol | String) : Hash(DBValue, Float64) | DBError
+    out = {} of DBValue => Float64
+    grouped("CAST(AVG(" + column_sql(column) + ") AS " + float_type + ")")!.each { |pair| out[pair[0]] = ::Kurt::Model.number(pair[1]) }
+    out
+  end
+
+  def minimums(column : Symbol | String) : Hash(DBValue, DBValue) | DBError
+    out = {} of DBValue => DBValue
+    grouped("MIN(" + column_sql(column) + ")")!.each { |pair| out[pair[0]] = pair[1] }
+    out
+  end
+
+  def maximums(column : Symbol | String) : Hash(DBValue, DBValue) | DBError
+    out = {} of DBValue => DBValue
+    grouped("MAX(" + column_sql(column) + ")")!.each { |pair| out[pair[0]] = pair[1] }
+    out
+  end
+
+  # The group's value and *expression*, per group.
+  def grouped(expression : String) : Array(Tuple(DBValue, DBValue)) | DBError
+    groups = @groups
+    return DBError.new("counts, sums...: call `group_by` first") if groups.nil? || groups.empty?
+    rows = read_values(values_sql(groups.join(", ") + ", " + expression), groups.size + 1)!
+    rows.map do |row|
+      key = groups.size == 1 ? row[0] : row[0, groups.size].as(DBValue)
+      {key, row[groups.size]}
+    end
+  end
+end
+
+# A number a calculation answered, as a Float64 (0.0 for NULL).
+pub def number(value : DBValue) : Float64
+  case value
+  when Float64 then value
+  when Float32 then value.to_f64
+  when Int64   then value.to_f
+  when Int32   then value.to_f
+  when String  then value.to_f? || 0.0
+  else              0.0
+  end
+end
+
+# A value read from the database as *type*: the drivers answer an INTEGER
+# as Int64 or Int32, a REAL as Float64, a SQLite date as text.
+pub def value_as(value : DBValue, type : String.class) : String | CastError
+  value.is_a?(String) ? value : CastError.new("not text")
+end
+
+pub def value_as(value : DBValue, type : Int64.class) : Int64 | CastError
+  case value
+  when Int64 then value
+  when Int32 then value.to_i64
+  else            CastError.new("not a whole number")
+  end
+end
+
+pub def value_as(value : DBValue, type : Int32.class) : Int32 | CastError
+  case value
+  when Int32 then value
+  when Int64 then value.to_i32
+  else            CastError.new("not a whole number")
+  end
+end
+
+pub def value_as(value : DBValue, type : Float64.class) : Float64 | CastError
+  case value
+  when Float64, Float32, Int64, Int32 then number(value)
+  else                                     CastError.new("not a number")
+  end
+end
+
+pub def value_as(value : DBValue, type : Bool.class) : Bool | CastError
+  case value
+  when Bool  then value
+  when Int64 then value != 0
+  when Int32 then value != 0
+  else            CastError.new("not a Bool")
+  end
+end
+
+pub def value_as(value : DBValue, type : Time.class) : Time | CastError
+  case value
+  when Time   then value
+  when String then cast(value, Time)
+  else             CastError.new("not a time")
   end
 end
 
@@ -560,6 +997,77 @@ pub def increment_column(table : String, column : String, by : Int64, id : Int64
   write_rows("UPDATE " + table + " SET " + column + " = " + column + " + ? WHERE id = ?", args, on)
 end
 
+# ---------------------------------------------------------------------------
+# Bulk writes: many rows in one statement, without models, validations or
+# callbacks, as Rails' insert_all and upsert_all.
+# ---------------------------------------------------------------------------
+
+# The columns and values of *rows* (named tuples of one shape, or hashes
+# with the same keys), with `created_at` and `updated_at` filled when the
+# table has them and the rows do not.
+def bulk_rows(rows : Array(R), columns : Array(String)) : Tuple(Array(String), Array(DBValue)) | DBError forall R
+  names = [] of String
+  values = [] of DBValue
+  {% if R <= NamedTuple %}
+    {% for key in R.keys %}
+      names << {{ key.stringify }}
+    {% end %}
+  {% else %}
+    rows[0].each_key { |key| names << key }
+  {% end %}
+  names.each do |name|
+    return DBError.new("insert_all: no column " + name) unless columns.includes?(name) || name == "id"
+  end
+  stamps = ["created_at", "updated_at"].select { |c| columns.includes?(c) && !names.includes?(c) }
+  now = Time.utc
+  rows.each do |row|
+    {% if R <= NamedTuple %}
+      {% for key in R.keys %}
+        values << row[{{ key.symbolize }}].as(DBValue)
+      {% end %}
+    {% else %}
+      return DBError.new("insert_all: every row needs the same keys as the first") unless row.size == names.size
+      names.each do |name|
+        return DBError.new("insert_all: a row has no " + name) unless row.has_key?(name)
+        values << row[name].as(DBValue)
+      end
+    {% end %}
+    stamps.each { |_| values << now }
+  end
+  {names + stamps, values}
+end
+
+# INSERT ... VALUES (...), (...) RETURNING id: the ids of the rows written.
+# *conflict* is the ON CONFLICT clause, or "".
+def bulk_write(table : String, names : Array(String), values : Array(DBValue), conflict : String, on : Transaction?) : Array(Int64) | DBError
+  marks = "(" + names.map { |_| "?" }.join(", ") + ")"
+  count = names.empty? ? 0 : values.size // names.size
+  sql = "INSERT INTO " + table + " (" + names.join(", ") + ") VALUES " + (Array.new(count) { marks }).join(", ") + conflict + " RETURNING id"
+  if tx = on
+    tx.connection.query_all(placeholders(sql), args: values, as: Int64)
+  else
+    database.query_all(placeholders(sql), args: values, as: Int64)
+  end
+end
+
+pub def insert_all(table : String, columns : Array(String), rows : Array(R), skip_duplicates : Bool, on : Transaction?) : Array(Int64) | DBError forall R
+  return [] of Int64 if rows.empty?
+  names, values = bulk_rows(rows, columns)!
+  bulk_write(table, names, values, skip_duplicates ? " ON CONFLICT DO NOTHING" : "", on)
+end
+
+pub def upsert_all(table : String, columns : Array(String), rows : Array(R), unique_by : Array(String), on : Transaction?) : Array(Int64) | DBError forall R
+  return [] of Int64 if rows.empty?
+  names, values = bulk_rows(rows, columns)!
+  unique_by.each do |key|
+    return DBError.new("upsert_all: unique_by " + key + " is not among the rows' columns") unless names.includes?(key)
+  end
+  # A row that is there already keeps its id and created_at, and takes the rest.
+  changed = names.reject { |n| unique_by.includes?(n) || n == "id" || n == "created_at" }
+  action = changed.empty? ? " DO NOTHING" : " DO UPDATE SET " + changed.map { |n| n + " = excluded." + n }.join(", ")
+  bulk_write(table, names, values, " ON CONFLICT (" + unique_by.join(", ") + ")" + action, on)
+end
+
 # An UPDATE or DELETE, in *on* when there is one; how many rows it touched.
 def write_rows(sql : String, args : Array(DBValue), on : Transaction?) : Int64 | DBError
   if tx = on
@@ -649,13 +1157,15 @@ end
 # ({minimum:, maximum:, is:, in: 3..20}), format (a regex), inclusion
 # ({in: [...]}) and uniqueness (true). `message:` replaces every message of
 # the line.
+#
+# Each line is a method of its own, named for its fields and the line it is
+# on; `derive model` calls every one, in the order they were written. (A
+# chain through `previous_def` lost the lines a macro wrote, `authentication`'s, to
+# the lines written after it: a macro's methods are not among the type's
+# yet when the next line's macro looks.)
 pub macro validates(*fields, presence = nil, length = nil, format = nil, inclusion = nil, uniqueness = nil, message = nil)
-  def __kurt_validations(errors : ::Kurt::Model::Errors) : ::Db::Errors::DBError?
-    {% if @type.methods.any? { |m| m.name == "__kurt_validations" } %}
-      if failure = previous_def
-        return failure
-      end
-    {% end %}
+  {% line = @caller ? @caller.first.line_number : 0 %}
+  def __kurt_validations__{{ fields.map(&.id).join("__").id }}__l{{ line }}(errors : ::Kurt::Model::Errors) : ::Db::Errors::DBError?
     {% for field in fields %}
       {% name = field.id.stringify %}
       {% if presence %}
@@ -684,14 +1194,11 @@ pub macro validates(*fields, presence = nil, length = nil, format = nil, inclusi
   end
 end
 
-# One callback chain: each line calls its methods after the earlier lines'.
+# One callback line: a method of its own, named for the hook and the
+# methods it calls; `derive model` calls every line of a hook in the order
+# they were written (see `validates` for why not `previous_def`).
 pub macro __kurt_callbacks(hook, names)
-  def __kurt_{{ hook.id }} : ::Db::Errors::DBError?
-    {% if @type.methods.any? { |m| m.name == "__kurt_" + hook.id.stringify } %}
-      if failure = previous_def
-        return failure
-      end
-    {% end %}
+  def __kurt_{{ hook.id }}__{{ names.map(&.id).join("__").id }} : ::Db::Errors::DBError?
     {% for name in names %}
       result = {{ name.id }}
       return result if result.is_a?(::Db::Errors::DBError)
@@ -737,16 +1244,8 @@ pub macro after_destroy(*names)
 end
 
 # ---------------------------------------------------------------------------
-# Passwords: `has_secure_password`, as in Rails, over a `password_digest`
-# column. bcrypt, from std/password.
-#
-#   class User < ApplicationRecord
-#     has_secure_password
-#   end
-#
-#   user = User.create(email_address: "ada@example.com", password: "s3cret-pass", password_confirmation: "s3cret-pass")!
-#   user.authenticate("s3cret-pass")                                   # true
-#   User.authenticate_by("email_address", "ada@example.com", "s3cret-pass")!   # the user, or nil
+# Passwords: bcrypt, from std/password, for `authentication :password`
+# (authentication.iyi).
 # ---------------------------------------------------------------------------
 
 # bcrypt's cost: the lowest in tests, where every user hashes a password.
@@ -763,107 +1262,12 @@ pub def verify_password(attempt : String, digest : String) : Bool
   Bcrypt.verify(attempt, digest)
 end
 
-# What `authenticate_by` checks a password against when no record has the
+# What `authenticate` checks a password against when no record has the
 # value, so that a miss takes as long as a wrong password.
 DUMMY_DIGEST = "$2b$11$xIbZPOBwibM7ga01aso2t.tTpKxzprSE7YWt7sJ/ZxxJyVCPjfeUe"   # Bcrypt.hash("kurt: no such user", 11)
 
 pub def dummy_digest : String
   DUMMY_DIGEST
-end
-
-# Rails' rules: required while there is no digest yet, at most 72 bytes
-# (all bcrypt reads), and the confirmation, when one was given, the same.
-pub def check_password(errors : Errors, password : String?, confirmation : String?, digest : String) : Nil
-  if password.nil? || password.empty?
-    errors.add("password", "can't be blank") if digest.empty?
-    return
-  end
-  errors.add("password", "is too long (maximum is 72 bytes)") if password.bytesize > 72
-  if confirmation && confirmation != password
-    errors.add("password_confirmation", "doesn't match Password")
-  end
-end
-
-pub macro has_secure_password
-  @[::Db::Serializable::DBField(ignore: true)]
-  @__kurt_password : String? = nil
-
-  @[::Db::Serializable::DBField(ignore: true)]
-  @__kurt_password_confirmation : String? = nil
-
-  # The password being set: nil once it has been saved as the digest is
-  # not; it is never read back from the database.
-  def password : String?
-    @__kurt_password
-  end
-
-  # An empty password is no password, as in Rails: an edit form left blank
-  # keeps the old one.
-  def password=(value : String?) : String?
-    @__kurt_password = value && !value.empty? ? value : nil
-  end
-
-  def password_confirmation : String?
-    @__kurt_password_confirmation
-  end
-
-  def password_confirmation=(value : String?) : String?
-    @__kurt_password_confirmation = value
-  end
-
-  # `User.new(email_address: "...", password: "...")` and `User.create(...)`.
-  def self.new(*, password : String, password_confirmation : String? = nil, **fields)
-    record = new(**fields)
-    record.password = password
-    record.password_confirmation = password_confirmation
-    record
-  end
-
-  # `user.update(password: "...", password_confirmation: "...")`.
-  def update(*, password : String, password_confirmation : String? = nil, **fields)
-    self.password = password
-    @__kurt_password_confirmation = password_confirmation
-    update(**fields)
-  end
-
-  def __kurt_password_checks(errors : ::Kurt::Model::Errors) : Nil
-    ::Kurt::Model.check_password(errors, @__kurt_password, @__kurt_password_confirmation, password_digest)
-  end
-
-  # Turns a password that was set into the digest, just before the write.
-  def __kurt_digest_password : Nil
-    if plain = @__kurt_password
-      @password_digest = ::Kurt::Model.digest_password(plain) unless plain.empty?
-    end
-    @__kurt_password = nil
-    @__kurt_password_confirmation = nil
-  end
-
-  # A form's `password` and `password_confirmation`. Empty ones are kept as
-  # they came: on an edit form, an empty password leaves the old one.
-  def __kurt_assign_password(attributes : Hash(String, String)) : Nil
-    if raw = attributes["password"]?
-      self.password = raw
-    end
-    if raw = attributes["password_confirmation"]?
-      @__kurt_password_confirmation = raw
-    end
-  end
-
-  # True when *attempt* is this record's password.
-  def authenticate(attempt : String) : Bool
-    ::Kurt::Model.verify_password(attempt, password_digest)
-  end
-
-  # The record whose *column* is *value* and whose password *password* is;
-  # nil otherwise. A miss checks a password too, so it takes as long.
-  def self.authenticate_by(column : String, value : String, password : String) : self | Nil | ::Db::Errors::DBError
-    if record = query.where(column, value).first?!
-      return record.authenticate(password) ? record : nil
-    end
-    ::Kurt::Model.verify_password(password, ::Kurt::Model.dummy_digest)
-    nil
-  end
 end
 
 # Maps the class to its table. Writes, from the fields above it:
@@ -999,11 +1403,100 @@ pub macro model(declaration)
     query.includes(*names)
   end
 
+  # `Post.joins(:user)`, `Post.pluck(:title, String)`, `Post.sum(:views)`...:
+  # see Query.
+  def self.joins(*names : Symbol) : ::Kurt::Model::Query(self)
+    query.joins(*names)
+  end
+
+  def self.joins(sql : String) : ::Kurt::Model::Query(self)
+    query.joins(sql)
+  end
+
+  def self.left_joins(*names : Symbol) : ::Kurt::Model::Query(self)
+    query.left_joins(*names)
+  end
+
+  def self.select(*columns : Symbol | String) : ::Kurt::Model::Query(self)
+    query.select(*columns)
+  end
+
+  def self.distinct : ::Kurt::Model::Query(self)
+    query.distinct
+  end
+
+  def self.group_by(*columns : Symbol | String) : ::Kurt::Model::Query(self)
+    query.group_by(*columns)
+  end
+
+  def self.where_sql(fragment : String, args : Array(::Db::Value::DBValue) = [] of ::Db::Value::DBValue) : ::Kurt::Model::Query(self)
+    query.where_sql(fragment, args)
+  end
+
+  def self.where_not(column : String | Symbol, value : ::Db::Value::DBValue) : ::Kurt::Model::Query(self)
+    query.where_not(column.to_s, value)
+  end
+
+  def self.pluck(column : Symbol | String) : Array(::Db::Value::DBValue) | ::Db::Errors::DBError
+    query.pluck(column)
+  end
+
+  def self.pluck(column : Symbol | String, type : K.class) : Array(K) | ::Db::Errors::DBError forall K
+    query.pluck(column, K)
+  end
+
+  def self.pluck(*columns : Symbol | String) : Array(Array(::Db::Value::DBValue)) | ::Db::Errors::DBError
+    query.pluck(*columns)
+  end
+
+  def self.ids : Array(Int64) | ::Db::Errors::DBError
+    query.ids
+  end
+
+  def self.sum(column : Symbol | String) : Float64 | ::Db::Errors::DBError
+    query.sum(column)
+  end
+
+  def self.sum(column : Symbol | String, type : Int64.class) : Int64 | ::Db::Errors::DBError
+    query.sum(column, Int64)
+  end
+
+  def self.average(column : Symbol | String) : Float64 | Nil | ::Db::Errors::DBError
+    query.average(column)
+  end
+
+  def self.minimum(column : Symbol | String) : ::Db::Value::DBValue | ::Db::Errors::DBError
+    query.minimum(column)
+  end
+
+  def self.minimum(column : Symbol | String, type : K.class) : K | Nil | ::Db::Errors::DBError forall K
+    query.minimum(column, K)
+  end
+
+  def self.maximum(column : Symbol | String) : ::Db::Value::DBValue | ::Db::Errors::DBError
+    query.maximum(column)
+  end
+
+  def self.maximum(column : Symbol | String, type : K.class) : K | Nil | ::Db::Errors::DBError forall K
+    query.maximum(column, K)
+  end
+
+  def self.exists? : Bool | ::Db::Errors::DBError
+    query.exists?
+  end
+
   # Loads the association *name* into *records*; see Query#includes.
   def self.__kurt_preload(records : Array(self), name : String, on : ::Kurt::Model::Transaction?) : ::Db::Errors::DBError?
     return nil if records.empty?
     records[0].__kurt_preload_into(records, name, on)
   end
+
+  \{% unless @type.class.methods.any? { |m| m.name == "__kurt_join_sql" } %}
+    # A model with no associations has nothing to join.
+    def self.__kurt_join_sql(name : String, kind : String) : String?
+      nil
+    end
+  \{% end %}
 
   \{% unless @type.methods.any? { |m| m.name == "__kurt_preload_into" } %}
     # A model with no associations has nothing to include.
@@ -1121,6 +1614,26 @@ pub macro model(declaration)
     record
   end
 
+  # Many rows in one INSERT, without validations or callbacks: the ids of
+  # the rows written. A row that would break a unique index is skipped
+  # (ON CONFLICT DO NOTHING) unless `skip_duplicates: false`, which makes it
+  # an error. `created_at` and `updated_at` are filled when not given.
+  #
+  #   Post.insert_all([{title: "A", user_id: 1}, {title: "B", user_id: 1}])!
+  def self.insert_all(rows : Array(R), skip_duplicates : Bool = true, on : ::Kurt::Model::Transaction? = nil) : Array(Int64) | ::Db::Errors::DBError forall R
+    ::Kurt::Model.insert_all(table_name, column_names, rows, skip_duplicates, on)
+  end
+
+  # Inserts the rows, or updates the ones whose *unique_by* columns match a
+  # row there already (ON CONFLICT ... DO UPDATE), in one statement; their
+  # ids. *unique_by* needs a unique index on those columns.
+  #
+  #   User.upsert_all([{email: "ada@example.com", name: "Ada"}], unique_by: :email)!
+  def self.upsert_all(rows : Array(R), unique_by : Symbol | Array(Symbol), on : ::Kurt::Model::Transaction? = nil) : Array(Int64) | ::Db::Errors::DBError forall R
+    keys = unique_by.is_a?(Symbol) ? [unique_by.to_s] : unique_by.map(&.to_s)
+    ::Kurt::Model.upsert_all(table_name, column_names, rows, keys, on)
+  end
+
   # The first row with these *fields*, or a new one created with them, so
   # running it twice (db/seeds.iyi) makes one row:
   #
@@ -1184,8 +1697,8 @@ pub macro model(declaration)
   # the model has it) and keeps what they found in `errors`. A DBError when a
   # check that asks the database (uniqueness) or a callback could not run.
   def __kurt_check : Bool | ::Db::Errors::DBError
-    \{% if @type.has_method?("__kurt_before_validation") %}
-      if failure = __kurt_before_validation
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_validation__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1193,14 +1706,18 @@ pub macro model(declaration)
     if pending = @__kurt_cast_errors
       pending.to_h.each { |field, messages| messages.each { |message| found.add(field, message) } }
     end
-    \{% if @type.has_method?("__kurt_validations") %}
-      if failure = __kurt_validations(found)
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_validations__") } %}
+      if failure = \{{ m.name.id }}(found)
         @__kurt_errors = found
         return failure
       end
     \{% end %}
     \{% if @type.has_method?("__kurt_password_checks") %}
       __kurt_password_checks(found)
+    \{% end %}
+    # has_one_attached's checks (storage.iyi), one per attachment.
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_check_") } %}
+      \{{ m.name.id }}(found)
     \{% end %}
     \{% if @type.has_method?("validate") %}
       validate(found)
@@ -1249,8 +1766,8 @@ pub macro model(declaration)
     @__kurt_on = on
     defer (@__kurt_on = nil)
     return false unless __kurt_check!
-    \{% if @type.has_method?("__kurt_before_save") %}
-      if failure = __kurt_before_save
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_save__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1261,8 +1778,8 @@ pub macro model(declaration)
       __kurt_digest_password
     \{% end %}
     if new_record?
-      \{% if @type.has_method?("__kurt_before_create") %}
-        if failure = __kurt_before_create
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_create__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
@@ -1270,26 +1787,33 @@ pub macro model(declaration)
         @created_at = ::Kurt::Model.now
       {% end %}
       @id = ::Kurt::Model.insert_row(self.class.table_name, self.class.column_names, attributes, on)!
-      \{% if @type.has_method?("__kurt_after_create") %}
-        if failure = __kurt_after_create
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_create__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
     else
-      \{% if @type.has_method?("__kurt_before_update") %}
-        if failure = __kurt_before_update
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_update__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
       ::Kurt::Model.update_row(self.class.table_name, self.class.column_names, attributes, @id, on)!
-      \{% if @type.has_method?("__kurt_after_update") %}
-        if failure = __kurt_after_update
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_update__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
     end
-    \{% if @type.has_method?("__kurt_after_save") %}
-      if failure = __kurt_after_save
+    # Files waiting to be attached (has_one_attached), now that the record
+    # has an id.
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_attach_") } %}
+      if failure = \{{ m.name.id }}
+        return failure
+      end
+    \{% end %}
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_save__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1323,8 +1847,8 @@ pub macro model(declaration)
   def __kurt_destroy(on : ::Kurt::Model::Transaction?) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
     @__kurt_on = on
     defer (@__kurt_on = nil)
-    \{% if @type.has_method?("__kurt_before_destroy") %}
-      if failure = __kurt_before_destroy
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_destroy__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1335,8 +1859,13 @@ pub macro model(declaration)
     \{% end %}
     gone = ::Kurt::Model.delete_row(self.class.table_name, @id, on)!
     return ::Kurt::Model::NotFound.new({{ declaration[:name] }}) if gone == 0
-    \{% if @type.has_method?("__kurt_after_destroy") %}
-      if failure = __kurt_after_destroy
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_purge_") } %}
+      if failure = \{{ m.name.id }}
+        return failure
+      end
+    \{% end %}
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_destroy__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1385,6 +1914,10 @@ pub macro belongs_to(decl, foreign_key = nil)
     @__kurt_{{ decl.var }}_loaded = true
   end
 
+  ::Kurt::Model.__kurt_join_link({{ decl.var.stringify }}, {{ @type.class.methods.any? { |m| m.name == "__kurt_join_sql" } }}) do |kind|
+    kind + " JOIN " + {{ decl.type }}.table_name + " ON " + {{ decl.type }}.table_name + ".id = " + table_name + "." + {{ key.stringify }}
+  end
+
   ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|
     ids = [] of ::Db::Value::DBValue
     records.each do |record|
@@ -1398,6 +1931,22 @@ pub macro belongs_to(decl, foreign_key = nil)
       id = record.{{ key }}
       record.__kurt_set_{{ decl.var }}(id.nil? ? nil : by_id[id.to_i64]?)
     end
+  end
+end
+
+# One association's part of `__kurt_join_sql`, the chain `joins` calls:
+# the JOIN that reaches it from this model's table, INNER or LEFT OUTER.
+pub macro __kurt_join_link(name, chained, &block)
+  def self.__kurt_join_sql(__kurt_name : String, __kurt_kind : String) : String?
+    unless __kurt_name == {{ name }}
+      {% if chained %}
+        return previous_def
+      {% else %}
+        return nil
+      {% end %}
+    end
+    {{ block.args[0] }} = __kurt_kind
+    {{ block.body }}
   end
 end
 
@@ -1428,8 +1977,60 @@ end
 # `dependent: :destroy` destroys them first when this record is destroyed,
 # each with its callbacks and its own dependents; `dependent: :delete_all`
 # deletes their rows in one statement, without loading them.
-pub macro has_many(decl, foreign_key = nil, dependent = nil)
+#
+# `through:` reaches them across another table, as Rails' has_many
+# :through:
+#
+#   class Post < ApplicationRecord
+#     has_many taggings : Tagging
+#     has_many tags : Tag, through: :taggings      # taggings.post_id, taggings.tag_id
+#   end
+#
+#   class User < ApplicationRecord
+#     has_many posts : Post
+#     has_many comments : Comment, through: :posts # posts.user_id, comments.post_id
+#   end
+#
+# The through table is the one the name says (`taggings`); which side holds
+# the key is read from the target's columns (a Comment with `post_id`
+# belongs to the through table, a Tag without `tagging_id` is pointed at by
+# `taggings.tag_id`). `source_key:` names that key when it is not
+# `<target>_id`. A through association is a query (`post.tags.order(:name)`)
+# and can be joined (`Post.joins(:tags)`); `includes` does not load it.
+pub macro has_many(decl, foreign_key = nil, dependent = nil, through = nil, source_key = nil)
   {% key = foreign_key ? foreign_key.id.stringify : (@type.name.split("::").last.underscore + "_id") %}
+  {% if through %}
+    {% middle = through.id.stringify %}
+    {% middle_one = middle.ends_with?("ies") ? middle[0...-3] + "y" : (middle.ends_with?("ses") || middle.ends_with?("xes") ? middle[0...-2] : (middle.ends_with?("s") ? middle[0...-1] : middle)) %}
+    {% target = decl.var.stringify %}
+    {% target_one = target.ends_with?("ies") ? target[0...-3] + "y" : (target.ends_with?("ses") || target.ends_with?("xes") ? target[0...-2] : (target.ends_with?("s") ? target[0...-1] : target)) %}
+    {% source = source_key ? source_key.id.stringify : target_one + "_id" %}
+    {% back = middle_one + "_id" %}
+
+    # {{ decl.var }} through {{ middle.id }}.
+    def {{ decl.var }} : ::Kurt::Model::Query({{ decl.type }})
+      {{ decl.type }}.query.joins(self.class.__kurt_through_{{ decl.var }}("INNER", false)).where({{ middle + "." + key }}, @id)
+    end
+
+    # The join from the target's table to {{ middle.id }} (*from_owner*
+    # false), or from this model's table through {{ middle.id }} to the
+    # target (true, for `joins`).
+    def self.__kurt_through_{{ decl.var }}(kind : String, from_owner : Bool) : String
+      there = {{ decl.type }}.table_name
+      # The target holds the key ({{ decl.type }}.{{ back.id }}), or the
+      # through table does ({{ middle.id }}.{{ source.id }}).
+      link = \{% if {{ decl.type }}.instance_vars.any? { |v| v.name == {{ back }} } %}there + "." + {{ back }} + " = " + {{ middle }} + ".id"\{% else %}{{ middle }} + "." + {{ source }} + " = " + there + ".id"\{% end %}
+      if from_owner
+        kind + " JOIN " + {{ middle }} + " ON " + {{ middle + "." + key }} + " = " + table_name + ".id " + kind + " JOIN " + there + " ON " + link
+      else
+        kind + " JOIN " + {{ middle }} + " ON " + link
+      end
+    end
+
+    ::Kurt::Model.__kurt_join_link({{ decl.var.stringify }}, {{ @type.class.methods.any? { |m| m.name == "__kurt_join_sql" } }}) do |kind|
+      __kurt_through_{{ decl.var }}(kind, true)
+    end
+  {% else %}
   @[::Db::Serializable::DBField(ignore: true)]
   @__kurt_{{ decl.var }} : Array({{ decl.type }})? = nil
 
@@ -1445,6 +2046,10 @@ pub macro has_many(decl, foreign_key = nil, dependent = nil)
     @__kurt_{{ decl.var }} = rows
   end
 
+  ::Kurt::Model.__kurt_join_link({{ decl.var.stringify }}, {{ @type.class.methods.any? { |m| m.name == "__kurt_join_sql" } }}) do |kind|
+    kind + " JOIN " + {{ decl.type }}.table_name + " ON " + {{ decl.type }}.table_name + "." + {{ key }} + " = " + table_name + ".id"
+  end
+
   ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|
     ids = records.map { |record| record.id.as(::Db::Value::DBValue) }
     children = ids.empty? ? [] of {{ decl.type }} : {{ decl.type }}.query.on(on).where_in({{ key }}, ids).all!
@@ -1457,6 +2062,7 @@ pub macro has_many(decl, foreign_key = nil, dependent = nil)
   end
   {% if dependent %}
     ::Kurt::Model.__kurt_dependent({{ decl.type }}, {{ key }}, {{ dependent }}, {{ @type.methods.any? { |m| m.name == "__kurt_dependents" } }})
+  {% end %}
   {% end %}
 end
 
@@ -1508,6 +2114,10 @@ pub macro has_one(decl, foreign_key = nil, dependent = nil)
   def __kurt_set_{{ decl.var }}(record : {{ decl.type }}?) : Nil
     @__kurt_{{ decl.var }} = record
     @__kurt_{{ decl.var }}_loaded = true
+  end
+
+  ::Kurt::Model.__kurt_join_link({{ decl.var.stringify }}, {{ @type.class.methods.any? { |m| m.name == "__kurt_join_sql" } }}) do |kind|
+    kind + " JOIN " + {{ decl.type }}.table_name + " ON " + {{ decl.type }}.table_name + "." + {{ key }} + " = " + table_name + ".id"
   end
 
   ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|

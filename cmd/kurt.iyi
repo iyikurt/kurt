@@ -27,11 +27,12 @@ import environment::{database_url, postgres_url?}
 import migrator::{migrate, rollback, status, MigrationError, Migration}
 import inflector::{underscore, camelize}
 import generators::*
+import authentication_generators::*
 import autoload::*
 import schema::{Table, introspect, to_json, parse, find}
 import fixtures::{FixtureSet, read_fixture_sets}
 import exporter::{get_paths, output_file, local_links}
-import inflector::{pluralize}
+import inflector::{pluralize, singularize}
 
 VERSION = "0.1.0"
 
@@ -60,7 +61,16 @@ Usage:
   kurt generate model NAME FIELD...      model and migration
   kurt generate controller NAME ACTION...
   kurt generate migration NAME
-  kurt generate authentication           users, sign-in, sign-up; sign-in required
+  kurt generate mailer NAME METHOD...    a mailer, its text and HTML views, a test
+  kurt generate job NAME                 a background job, a test, the queue's table
+  kurt generate attachments              the table has_one_attached keeps files in
+  kurt generate authentication [MODULE...]
+                                         users: sign-in, sign-up, password reset,
+                                         remember me; MODULE adds confirmation,
+                                         lock, tracking or timeout
+  kurt generate authentication:views     the sign-in and other views, to change them
+  kurt generate authentication:controllers
+                                         the authentication controllers, to change them
   kurt db:migrate                        run pending migrations
   kurt db:rollback [STEPS]               undo the last migration(s)
   kurt db:status                         which migrations have run
@@ -68,6 +78,7 @@ Usage:
   kurt db:seed                           run db/seeds.iyi
   kurt dev [-p PORT] [--no-reload]       run the application; rebuild and reload on change
   kurt routes                            every route: verb, path, controller#action
+  kurt jobs                              run the background jobs worker on its own
   kurt test                              run every test/*_test.iyi on a fresh test database,
                                          with test/fixtures/*.yml loaded
   kurt build                             a release binary in bin/NAME
@@ -79,7 +90,7 @@ Usage:
   kurt version
 
 FIELD is name:type, with type one of string, text, int, float, bool, time,
-references. `g` is short for generate.
+references, attachment. `g` is short for generate.
 
 The database is DATABASE_URL, or sqlite3:./db/<env>.sqlite3 with env from
 KURT_ENV (development by default).
@@ -336,7 +347,7 @@ def cmd_new(args : Array(String)) : Nil
     write("config/application.iyi", application_config(Random::Secure.hex(32)))
     write("config/routes.iyi", routes_file)
     write("app/models/.keep", "")
-    write("app/controllers/application_controller.iyi", application_controller)
+    write("app/controllers/application_controller.iyi", application_controller(daisy))
     write("app/controllers/home_controller.iyi", home_controller)
     write("app/views/layouts/application.eiy", layout_view(name, daisy))
     write("app/views/home/index.eiy", home_view(name, daisy))
@@ -476,11 +487,17 @@ def gen_scaffold(app : String, names : Names, fields : Array(Field)) : Nil
   write(base + "new.eiy", new_view(names, daisy))
   write(base + "edit.eiy", edit_view(names, daisy))
   write(base + "_form.eiy", form_view(names, fields, labels, daisy))
+  # An application made before form_with: its forms get daisyUI's classes.
+  if daisy && (line = form_style_line(File.read("app/controllers/application_controller.iyi")))
+    insert_after_line("app/controllers/application_controller.iyi", "class ApplicationController", line)
+  end
+  if daisy && (css = with_form_classes(File.read(CSS_INPUT)))
+    update(CSS_INPUT, css)
+  end
   add_route("resources \"" + names.plural + "\", " + names.controller)
   add_nav(names)
-  test = scaffold_test(app, names, fields, auth_sign_in(names.plural))
-  # With authentication, the signed-in tester is one of the users.
-  test = test.gsub("User.count.as(Int64) == 0", "User.count.as(Int64) == 1") if names.model == "User" && auth_app?
+  ensure_attachments_table if fields.any?(&.attachment?)
+  test = scaffold_test(app, names, fields.reject(&.attachment?))
   write("test/" + names.plural + "_test.iyi", test)
 end
 
@@ -496,50 +513,60 @@ def gen_controller(name : String, actions : Array(String)) : Nil
   end
 end
 
+# A mailer, a text and an HTML view per method, the mailer layouts, and a
+# test.
+def gen_mailer(name : String, methods : Array(String)) : Nil
+  methods = ["welcome"] if methods.empty?
+  file = mailer_file_name(name)
+  write("app/mailers/application_mailer.iyi", application_mailer) unless File.exists?("app/mailers/application_mailer.iyi")
+  path = "app/mailers/" + file + ".iyi"
+  fail(camelize(file) + " exists already: " + path) if File.exists?(path)
+  write(path, mailer_class(name, methods))
+  methods.each do |method|
+    write("app/views/" + file + "/" + method + ".text.eiy", mailer_text_view(name, method))
+    write("app/views/" + file + "/" + method + ".html.eiy", mailer_html_view(name, method))
+  end
+  write("app/views/layouts/mailer.html.eiy", mailer_layout_html) unless File.exists?("app/views/layouts/mailer.html.eiy")
+  write("app/views/layouts/mailer.text.eiy", mailer_layout_text) unless File.exists?("app/views/layouts/mailer.text.eiy")
+  write("test/" + file + "_test.iyi", mailer_test(name, methods))
+end
+
+# A job, ApplicationJob, a test, and the queue's migration when no
+# migration makes it yet.
+def gen_job(name : String) : Nil
+  write("app/jobs/application_job.iyi", application_job) unless File.exists?("app/jobs/application_job.iyi")
+  path = "app/jobs/" + job_file_name(name) + ".iyi"
+  fail(camelize(job_file_name(name)) + " exists already: " + path) if File.exists?(path)
+  write(path, job_class(name))
+  write("test/" + job_file_name(name) + "_test.iyi", job_test(name))
+  ensure_jobs_table
+end
+
+# Whether a migration creates *table*.
+def migration_makes?(table : String) : Bool
+  return false unless Dir.exists?("db/migrations")
+  Dir.entries("db/migrations").any? { |f| f.ends_with?(".sql") && File.read("db/migrations/" + f).includes?("CREATE TABLE " + table + " ") }
+end
+
+# The kurt_jobs migration, unless one is there.
+def ensure_jobs_table : Nil
+  return if migration_makes?("kurt_jobs")
+  write(migration_path("create_kurt_jobs"), jobs_migration(postgres_url?(database_url)))
+end
+
+# The kurt_attachments migration, unless one is there; storage/ out of git.
+def ensure_attachments_table : Nil
+  unless migration_makes?("kurt_attachments")
+    write(migration_path("create_kurt_attachments"), attachments_migration(postgres_url?(database_url)))
+  end
+  if File.exists?(".gitignore") && !File.read(".gitignore").includes?("/storage/")
+    update(".gitignore", File.read(".gitignore").rstrip + "\n/storage/\n")
+  end
+end
+
 # ---------------------------------------------------------------------------
 # generate authentication
 # ---------------------------------------------------------------------------
-
-AUTH_MARKER = "app/controllers/sessions_controller.iyi"
-
-def auth_app? : Bool
-  File.exists?(AUTH_MARKER)
-end
-
-# The users table's text columns (not the digest), from db/schema.json or,
-# before it is migrated, from its create migration.
-def user_text_columns : Array(String)
-  skip = ["id", "password_digest", "created_at", "updated_at"]
-  if table = find(read_schema, "users")
-    return table.columns.select { |c| c.type == "String" || c.type == "String?" }.map(&.name).reject { |n| skip.includes?(n) }
-  end
-  found = [] of String
-  return found unless Dir.exists?("db/migrations")
-  file = Dir.entries("db/migrations").sorted.find { |f| f.ends_with?("_create_users.sql") }
-  return found if file.nil?
-  File.read("db/migrations/" + file).lines.each do |line|
-    parts = line.strip.split(" ")
-    next if parts.size < 2 || skip.includes?(parts[0]) || parts[0] == "--"
-    type = parts[1].upcase
-    found << parts[0] if type.starts_with?("TEXT") || type.starts_with?("VARCHAR")
-  end
-  found
-end
-
-# The column a user signs in with: email_address, or an email column the
-# users table has.
-def auth_login(columns : Array(String)) : String
-  return "email_address" if columns.includes?("email_address")
-  return "email" if columns.includes?("email")
-  "email_address"
-end
-
-# The line that signs a generated test in; empty without authentication.
-def auth_sign_in(tag : String) : String
-  return "" unless auth_app?
-  columns = user_text_columns
-  auth_sign_in_line(auth_login(columns), columns, tag)
-end
 
 def insert_after_line(path : String, line_start : String, text : String) : Bool
   return false unless File.exists?(path)
@@ -561,50 +588,99 @@ def insert_before_last_end(path : String, text : String) : Bool
   true
 end
 
-def gen_authentication(app : String) : Nil
-  fail("authentication is set up already: " + AUTH_MARKER + " exists") if auth_app?
+# Authentication for User: `authentication :...` in the model, the
+# columns, `authentication_for "users"`, `authentication_helpers User`, the layout's links,
+# the mail layouts and a test. *extra* names modules beyond the
+# defaults (confirmation, lock, tracking, timeout). Kurt ships the
+# controllers and views; `authentication:views` and `authentication:controllers` copy them.
+def gen_authentication(app : String, extra : Array(String)) : Nil
+  extra.each do |name|
+    fail("`" + name + "` is not one of " + OPTIONAL_MODULES.join(", ")) unless OPTIONAL_MODULES.includes?(name)
+  end
+  modules = DEFAULT_MODULES + extra
   daisy = tailwind_app?
-  has_model = File.exists?("app/models/user.iyi")
-  columns = has_model ? user_text_columns : [] of String
-  login = auth_login(columns)
-  fields = columns.includes?(login) ? columns : [login] + columns
-
-  if has_model
-    model = File.read("app/models/user.iyi")
-    fail("app/models/user.iyi has has_secure_password already") if model.includes?("has_secure_password")
-    insert_after_line("app/models/user.iyi", "class User", auth_user_lines(login))
-    write(migration_path("add_authentication_to_users"), auth_columns_migration(login, !columns.includes?(login)))
+  model_file = "app/models/user.iyi"
+  if File.exists?(model_file)
+    model = File.read(model_file)
+    fail(model_file + " has `authentication` already") if auth_modules_of(model)
+    insert_after_line(model_file, "class User", auth_model_line(modules))
+    existing = [] of String
+    if table = find(read_schema, "users")
+      existing = table.columns.map(&.name)
+    else
+      fail("migrate first: the users table is not in " + SCHEMA)
+    end
+    write(migration_path("add_authentication_to_users"), auth_columns_migration("email", existing, postgres_url?(database_url)))
     users_scaffold_takes_passwords(daisy)
+    users_test_takes_passwords
   else
-    write("app/models/user.iyi", auth_user_model(login))
-    write(migration_path("create_users"), auth_users_migration(login, postgres_url?(database_url)))
+    write(model_file, auth_model(modules))
+    write(migration_path("create_users"), auth_users_migration("email", postgres_url?(database_url)))
   end
-
-  write("app/controllers/sessions_controller.iyi", sessions_controller(login))
-  write("app/controllers/registrations_controller.iyi", registrations_controller(fields))
-  unless File.read("app/controllers/application_controller.iyi").includes?("require_authentication")
-    insert_before_last_end("app/controllers/application_controller.iyi", "\n" + auth_application_lines)
+  # A users scaffold has POST /users already, which signing up would be.
+  routes = File.read("config/routes.iyi")
+  base = routes.includes?("resources \"users\"") ? "auth" : nil
+  # What sign-up asks for besides the address: the other text columns.
+  fields = [] of String
+  if table = find(read_schema, "users")
+    skip = AUTH_COLUMNS + ["id", "email", "created_at", "updated_at"]
+    table.columns.each { |c| fields << c.name if c.type == "String" && !skip.includes?(c.name) }
   end
-  if File.exists?("app/controllers/home_controller.iyi") && !File.read("app/controllers/home_controller.iyi").includes?("allow_unauthenticated_access")
-    insert_after_line("app/controllers/home_controller.iyi", "class HomeController", "  allow_unauthenticated_access\n")
+  scope = AuthScope.new("users", modules, "email", fields, base)
+  add_route(auth_for_line(scope))
+  controller = "app/controllers/application_controller.iyi"
+  unless File.read(controller).includes?("authentication_helpers")
+    insert_after_line(controller, "class ApplicationController", "  # current_user, user_signed_in?, authenticate_user!, sign_in, sign_out\n" + auth_helpers_line(scope))
   end
-  write("app/views/sessions/new.eiy", sessions_view(login, daisy))
-  write("app/views/registrations/new.eiy", registrations_view(login, fields, daisy))
+  write("app/mailers/application_mailer.iyi", application_mailer) unless File.exists?("app/mailers/application_mailer.iyi")
+  write("app/views/layouts/mailer.html.eiy", mailer_layout_html) unless File.exists?("app/views/layouts/mailer.html.eiy")
+  write("app/views/layouts/mailer.text.eiy", mailer_layout_text) unless File.exists?("app/views/layouts/mailer.text.eiy")
   layout = "app/views/layouts/application.eiy"
-  if File.exists?(layout) && !File.read(layout).includes?("current_user?")
-    update(layout, File.read(layout).sub("<!-- kurt:nav -->", "<!-- kurt:nav -->" + auth_nav(daisy)))
+  if File.exists?(layout) && !File.read(layout).includes?("user_signed_in?")
+    update(layout, File.read(layout).sub("<!-- kurt:nav -->", "<!-- kurt:nav -->" + auth_nav(scope, daisy)))
   end
-  auth_routes.each { |route| add_route(route) }
-
-  write("test/sessions_test.iyi", sessions_test(login, fields))
-  sign_in_existing_tests(login, fields)
+  write("test/authentication_test.iyi", auth_test(scope))
+  if daisy && (css = with_auth_classes(File.read(CSS_INPUT)))
+    update(CSS_INPUT, css)
+  end
 
   puts ""
-  puts "Authentication is in. Next:"
+  puts "Authentication is in: " + modules.join(", ") + ". Next:"
   puts "  kurt db:migrate"
-  puts "  kurt dev        # /signup, then /login; every page now needs a signed-in user"
+  puts "  kurt dev        # " + scope.path + "/sign_up, " + scope.path + "/sign_in"
   puts ""
-  puts "Pages anyone may see: `allow_unauthenticated_access` (or `only: [:index, :show]`) in their controller."
+  puts "A page that needs a signed-in user: `before_action :authenticate_user!` in its controller"
+  puts "(or in ApplicationController, for every page). To change the pages:"
+  puts "  kurt generate authentication:views          # app/views/authentication/"
+  puts "  kurt generate authentication:controllers    # app/controllers/user_*_controller.iyi"
+end
+
+# `kurt generate authentication:views`: Kurt's sign-in, sign-up, password and mail
+# views into app/views/authentication/, where the build uses them instead.
+def gen_auth_views : Nil
+  scopes = auth_scopes(read_schema)
+  fail("no authentication_for in config/routes.iyi: run `kurt generate authentication` first") if scopes.empty?
+  key = scopes[0].key
+  daisy = tailwind_app?
+  auth_view_names.each { |name| write("app/views/authentication/" + name + ".eiy", auth_view(name, key, daisy)) }
+  auth_mail_names.each do |name|
+    write("app/views/authentication/mailer/" + name + ".text.eiy", auth_mail_view(name, key, false))
+    write("app/views/authentication/mailer/" + name + ".html.eiy", auth_mail_view(name, key, true))
+  end
+end
+
+# `kurt generate authentication:controllers [users]`: the scope's controllers and
+# mailer into the application, rendering app/views/authentication/ (copied too).
+def gen_auth_controllers(plural : String?) : Nil
+  scopes = auth_scopes(read_schema)
+  fail("no authentication_for in config/routes.iyi: run `kurt generate authentication` first") if scopes.empty?
+  scope = plural ? (scopes.find { |s| s.plural == plural } || fail("no authentication_for \"" + plural + "\" in config/routes.iyi")) : scopes[0]
+  gen_auth_views
+  scope.kinds.each { |kind| write("app/controllers/" + scope.controller_file(kind), auth_controller(kind, scope)) }
+  if scope.mails?
+    parent = File.exists?("app/mailers/application_mailer.iyi") ? "ApplicationMailer" : "Mailer"
+    write("app/mailers/" + scope.mailer_file, auth_mailer(scope, parent))
+  end
 end
 
 # A users scaffold made before: its form and its permit list take a password.
@@ -619,42 +695,45 @@ def users_scaffold_takes_passwords(daisy : Bool) : Nil
   form = "app/views/users/_form.eiy"
   if File.exists?(form)
     source = File.read(form)
-    unless source.includes?("user[password]")
-      inputs = auth_input("user_password", "user[password]", "Password", "password", "", " maxlength=\"72\" autocomplete=\"new-password\"", daisy) +
-               auth_input("user_password_confirmation", "user[password_confirmation]", "Password confirmation", "password", "", " autocomplete=\"new-password\"", daisy)
+    unless source.includes?("user[password]") || source.includes?("f.password_field")
+      inputs = auth_input("password", "Password", "password", "maxlength: 72, autocomplete: \"new-password\"", daisy) +
+               auth_input("password_confirmation", "Password confirmation", "password", "autocomplete: \"new-password\"", daisy)
       marker = daisy ? "    <div class=\"card-actions" : "  <div class=\"actions\">"
-      update(form, source.sub(marker, inputs + marker)) if source.includes?(marker)
+      if source.includes?("form_with") && source.includes?(marker)
+        update(form, source.sub(marker, inputs + marker))
+      else
+        STDERR.puts "kurt: add password and password_confirmation fields to " + form + " yourself"
+      end
     end
   end
 end
 
-# Tests written before sign-in was the rule sign in as a user of their own.
-def sign_in_existing_tests(login : String, fields : Array(String)) : Nil
-  return unless Dir.exists?("test")
-  Dir.entries("test").sorted.each do |file|
-    next unless file.ends_with?("_test.iyi") && file != "sessions_test.iyi"
-    path = "test/" + file
-    source = File.read(path)
-    next if source.includes?("sign_in_as(") || !source.includes?("app = RouteHandler.new(routes)\n")
-    tag = file[0, file.size - 9]
-    source = source.sub("app = RouteHandler.new(routes)\n", "app = RouteHandler.new(routes)\n" + auth_sign_in_line(login, fields, tag))
-    if file == "users_test.iyi"
-      # The signed-in tester is a user too, and a user now needs a password.
-      source = source.gsub("User.count.as(Int64) == 0", "User.count.as(Int64) == 1")
-      # A test written before address rules sends "Example" as one.
-      source = source.gsub("user%5B" + login + "%5D=Example", "user%5B" + login + "%5D=example%40example.com")
-      source = source.gsub(/form_request\("POST", "\/users", "([^"]*)"\)/) { |m| m[0, m.size - 2] + "&user%5Bpassword%5D=" + AUTH_PASSWORD + "&user%5Bpassword_confirmation%5D=" + AUTH_PASSWORD + "\")" }
-    end
-    update(path, source)
-  end
+# A users scaffold's test: a user now needs a password.
+def users_test_takes_passwords : Nil
+  path = "test/users_test.iyi"
+  return unless File.exists?(path)
+  source = File.read(path)
+  return if source.includes?("user%5Bpassword%5D")
+  source = source.gsub(/form_request\("POST", "\/users", "([^"]*)"\)/) { |m| m[0, m.size - 2] + "&user%5Bpassword%5D=" + AUTH_TEST_PASSWORD + "&user%5Bpassword_confirmation%5D=" + AUTH_TEST_PASSWORD + "\")" }
+  update(path, source)
 end
 
 def cmd_generate(args : Array(String)) : Nil
-  fail("usage: kurt generate (scaffold|model|controller|migration) NAME ..., or kurt generate authentication") if args.empty?
+  fail("usage: kurt generate (scaffold|model|controller|migration|mailer|job) NAME ..., or kurt generate authentication") if args.empty?
   kind = args[0]
   app = require_app
-  if kind == "authentication"
-    gen_authentication(app)
+  case kind
+  when "attachments"
+    ensure_attachments_table
+    return
+  when "authentication"
+    gen_authentication(app, args[1, args.size - 1])
+    return
+  when "authentication:views"
+    gen_auth_views
+    return
+  when "authentication:controllers"
+    gen_auth_controllers(args[1]?)
     return
   end
   fail("usage: kurt generate (scaffold|model|controller|migration) NAME ...") if args.size < 2
@@ -673,8 +752,12 @@ def cmd_generate(args : Array(String)) : Nil
     gen_controller(name, rest)
   when "migration"
     write(migration_path(underscore(name)), empty_migration)
+  when "mailer"
+    gen_mailer(name, rest)
+  when "job"
+    gen_job(name)
   else
-    fail("unknown generator `" + kind + "`: scaffold, model, controller or migration")
+    fail("unknown generator `" + kind + "`: scaffold, model, controller, migration or mailer")
   end
 end
 
@@ -846,9 +929,12 @@ def build_app(name : String, tests : Bool = false) : String
   emit(BUILD + "/app/models.iyi", models_module(models, tables, root + "/" + SCHEMA))
   model_names = [] of String
   models.each { |source| model_tables(source.text).each { |pair| model_names << pair[0] } }
-  emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers"), model_names))
+  auth_controllers, auth_mailers = auth_sources(tables)
+  emit(BUILD + "/app/mailers.iyi", mailers_module(sources("app/mailers") + auth_mailers, model_names))
+  emit(BUILD + "/app/jobs.iyi", jobs_module(sources("app/jobs"), model_names))
+  emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers") + auth_controllers, model_names))
   routes = source?("config/routes.iyi") || fail("no config/routes.iyi")
-  emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi"))
+  emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi", migration_makes?("kurt_attachments")))
   entry = BUILD + "/" + name + ".iyi"
   migrations = [] of Tuple(String, String)
   if Dir.exists?("db/migrations")
@@ -872,6 +958,98 @@ def build_app(name : String, tests : Bool = false) : String
     end
   end
   entry
+end
+
+# ---------------------------------------------------------------------------
+# Authentication: what Kurt ships for each `authentication_for` scope
+# ---------------------------------------------------------------------------
+
+# Each `authentication_for "users"` scope in config/routes.iyi, with its model's
+# modules, its sign-in column and the text columns sign-up asks for.
+def auth_scopes(tables : Array(Table)) : Array(AuthScope)
+  return [] of AuthScope unless File.exists?("config/routes.iyi")
+  found = [] of AuthScope
+  auth_for_scopes(File.read("config/routes.iyi")).each do |pair|
+    plural, base = pair
+    model = model_path(camelize(singularize(plural)))
+    fail("authentication_for \"" + plural + "\": no " + model) unless File.exists?(model)
+    text = File.read(model)
+    modules = auth_modules_of(text) || fail("authentication_for \"" + plural + "\": " + model + " has no `authentication :password, ...` line")
+    key = auth_key_of(text)
+    fields = [] of String
+    if table = find(tables, plural)
+      skip = AUTH_COLUMNS + ["id", key, "created_at", "updated_at"]
+      table.columns.each { |c| fields << c.name if c.type == "String" && !skip.includes?(c.name) }
+    end
+    found << AuthScope.new(plural, modules, key, fields, base)
+  end
+  found
+end
+
+AUTH_BUILD = BUILD + "/authentication"
+
+# The controllers, routes and mailer of every scope, as sources for the
+# controllers and mailers modules: the application's own copies where it
+# has them (app/controllers/user_sessions_controller.iyi...), Kurt's
+# otherwise. Kurt's are written into .kurt/build/authentication/, with their views
+# there too unless app/views/authentication/ has the application's.
+def auth_sources(tables : Array(Table)) : Tuple(Array(Source), Array(Source))
+  controllers = [] of Source
+  mailers = [] of Source
+  scopes = auth_scopes(tables)
+  # Controllers written for a build before, which the application now has
+  # its own copy of (or no scope needs), go.
+  if Dir.exists?(AUTH_BUILD)
+    Dir.entries(AUTH_BUILD).each do |file|
+      File.delete(AUTH_BUILD + "/" + file) if file.ends_with?(".iyi")
+    end
+  end
+  return {controllers, mailers} if scopes.empty?
+  root = Dir.current
+  daisy = tailwind_app?
+  scopes.each do |scope|
+    paths = {"layout" => root + "/app/views/layouts/application.eiy"}
+    auth_view_names.each do |name|
+      own = "app/views/authentication/" + name + ".eiy"
+      if File.exists?(own)
+        paths[name] = root + "/" + own
+      else
+        shipped = AUTH_BUILD + "/views/" + daisy.to_s + "/" + scope.key + "/" + name + ".eiy"
+        emit(shipped, auth_view(name, scope.key, daisy))
+        paths[name] = root + "/" + shipped
+      end
+    end
+    scope.kinds.each do |kind|
+      next if File.exists?("app/controllers/" + scope.controller_file(kind))
+      file = AUTH_BUILD + "/" + scope.controller_file(kind)
+      text = auth_controller(kind, scope, paths)
+      emit(file, text)
+      controllers << Source.new(root + "/" + file, text)
+    end
+    routes = AUTH_BUILD + "/" + scope.plural + "_routes.iyi"
+    text = auth_routes_source(scope)
+    emit(routes, text)
+    controllers << Source.new(root + "/" + routes, text)
+    next unless scope.mails? && !File.exists?("app/mailers/" + scope.mailer_file)
+    mail_paths = {"layout" => File.exists?("app/views/layouts/mailer.text.eiy") || File.exists?("app/views/layouts/mailer.html.eiy") ? root + "/app/views/layouts/mailer" : ""}
+    auth_mail_names.each do |name|
+      own = "app/views/authentication/mailer/" + name
+      if File.exists?(own + ".text.eiy") || File.exists?(own + ".html.eiy")
+        mail_paths["mailer/" + name] = root + "/" + own
+      else
+        shipped = AUTH_BUILD + "/views/mail/" + scope.key + "/" + name
+        emit(shipped + ".text.eiy", auth_mail_view(name, scope.key, false))
+        emit(shipped + ".html.eiy", auth_mail_view(name, scope.key, true))
+        mail_paths["mailer/" + name] = root + "/" + shipped
+      end
+    end
+    parent = File.exists?("app/mailers/application_mailer.iyi") ? "ApplicationMailer" : "Mailer"
+    file = AUTH_BUILD + "/" + scope.mailer_file
+    text = auth_mailer(scope, parent, mail_paths)
+    emit(file, text)
+    mailers << Source.new(root + "/" + file, text)
+  end
+  {controllers, mailers}
 end
 
 def exec_iyi(args : Array(String), env : Hash(String, String)? = nil) : NoReturn
@@ -934,6 +1112,12 @@ end
 
 def start_server(binary : String, args : Array(String)) : ChildProcess?
   env = {"KURT_LIVE_RELOAD" => "1"}
+  # Links in mail lead to this server unless APP_URL says otherwise.
+  if (Program.env("APP_URL") || "").empty?
+    at = args.index("-p") || args.index("--port")
+    port = at ? (args[at + 1]? || "3000") : "3000"
+    env["APP_URL"] = "http://localhost:" + port
+  end
   case child = Process.spawn(binary, args, env: env)
   in ChildProcess  then child
   in ProcessError
@@ -1019,6 +1203,15 @@ end
 def cmd_routes : Nil
   name = require_app
   exec_iyi(["run", build_app(name)], {"KURT_PRINT_ROUTES" => "1"})
+end
+
+# The worker alone, from the application's own binary: `kurt jobs` here,
+# `./bin/app jobs` on a server.
+def cmd_jobs : Nil
+  name = require_app
+  entry = build_app(name)
+  fail("no kurt_jobs table among the migrations: `kurt generate job NAME` writes its migration") unless File.read(entry).includes?("Program.args[0]? == \"jobs\"")
+  exec_iyi(["run", entry, "--", "jobs"])
 end
 
 def cmd_test(args : Array(String)) : Nil
@@ -1195,6 +1388,7 @@ when "build"                     then cmd_build(rest)
 when "export"                    then cmd_export(rest)
 when "css:install", "css:build"  then cmd_css(command, rest)
 when "routes"                    then cmd_routes
+when "jobs"                      then cmd_jobs
 when "version", "--version", "-v" then puts "kurt " + VERSION
 when "help", "--help", "-h"      then puts USAGE
 else

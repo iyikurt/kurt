@@ -1,0 +1,141 @@
+module test/app/controllers/authentication_helpers_test
+
+import std/text
+import std/time::{Time}
+import db/db/errors::{DBError}
+import web/iyi_web/router::{Router, RouteHandler}
+import web/iyi_web/harness::*
+import web/iyi_web/handler::{chain}
+import web/iyi_web/session::{SessionHandler}
+import datasource::{database}
+import model::*
+import authentication::*
+import controllers::*
+
+class User
+  property email : String
+  property encrypted_password : String
+  property remember_created_at : Time?
+  property sign_in_count : Int64
+  property current_sign_in_at : Time?
+  property last_sign_in_at : Time?
+  property current_sign_in_ip : String?
+  property last_sign_in_ip : String?
+
+  authentication :password, :remember_me, :tracking, :timeout
+
+  derive model
+end
+
+class ApplicationController < Controller
+  authentication_helpers User
+end
+
+class SecretsController < ApplicationController
+  before_action :authenticate_user!
+
+  def index
+    "secret for " + current_user.as(User).email
+  end
+end
+
+class LoginController < ApplicationController
+  def create
+    case found = User.authenticate(params[:email], params[:password])!
+    in User
+      sign_in(found, remember: params[:remember] == "1")!
+      redirect_to after_sign_in_path_for(found)
+    in AuthFailure
+      status(422)
+      found.message
+    end
+  end
+
+  def destroy
+    sign_out(current_user)!
+    redirect_to after_sign_out_path_for(nil)
+  end
+
+  def whoami
+    user_signed_in? ? current_user.as(User).email : "nobody"
+  end
+end
+
+def routes : Router
+  router = Router.new
+  get "/secret", SecretsController, :index
+  post "/login", LoginController, :create
+  delete "/logout", LoginController, :destroy
+  get "/whoami", LoginController, :whoami
+  install_error_pages router
+  router
+end
+
+def setup : Nil | DBError
+  database.exec("DROP TABLE IF EXISTS users")!
+  database.exec("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL, encrypted_password TEXT NOT NULL DEFAULT '', remember_created_at DATETIME, " +
+                "sign_in_count INTEGER NOT NULL DEFAULT 0, current_sign_in_at DATETIME, last_sign_in_at DATETIME, current_sign_in_ip TEXT, last_sign_in_ip TEXT)")!
+  nil
+end
+
+case failed = setup
+in DBError
+  STDERR.puts failed.message
+  exit 1
+in Nil
+end
+
+app = chain([SessionHandler.new("kurt test session secret, at least 32 bytes"), RouteHandler.new(routes)])
+ada = User.create(email: "ada@example.com", password: "password123").as(User)
+
+# every Set-Cookie of a response, by name
+def cookies_of(res) : Hash(String, String)
+  found = {} of String => String
+  res.headers.each do |name, value|
+    if name.downcase == "set-cookie"
+      pair = value.split(";")[0]
+      key, _, val = pair.partition("=")
+      found[key] = val
+    end
+  end
+  found
+end
+
+def with_cookies(request, jar : Hash(String, String))
+  request.headers["Cookie"] = jar.map { |k, v| k + "=" + v }.join("; ")
+  request
+end
+
+# not signed in: sent to the scope's sign-in page
+res = dispatch(app, "GET", "/secret").response
+assert res.status_code == 302
+assert res.headers["Location"]? == "/users/sign_in"
+back = cookies_of(res)
+
+# a wrong password: no session
+res = dispatch(app, with_cookies(form_request("POST", "/login", "email=ada%40example.com&password=nope"), back)).response
+assert res.status_code == 422
+assert res.body == "Invalid email or password."
+
+# signed in, with remember me: back to the page asked for
+res = dispatch(app, with_cookies(form_request("POST", "/login", "email=ada%40example.com&password=password123&remember=1"), back)).response
+assert res.status_code == 303
+assert res.headers["Location"]? == "/secret"
+jar = cookies_of(res)
+assert jar.has_key?("remember_user_token")
+assert dispatch(app, with_cookies(http_request("GET", "/secret"), jar)).response.body == "secret for ada@example.com"
+tracked = User.find(ada.id).as(User)
+assert tracked.sign_in_count == 1
+assert !tracked.remember_created_at.nil?
+
+# the remember cookie alone signs in again
+only_remember = {"remember_user_token" => jar["remember_user_token"]}
+assert dispatch(app, with_cookies(http_request("GET", "/whoami"), only_remember)).response.body == "ada@example.com"
+
+# signing out voids it
+res = dispatch(app, with_cookies(http_request("DELETE", "/logout"), jar)).response
+assert res.status_code == 303
+assert dispatch(app, with_cookies(http_request("GET", "/whoami"), only_remember)).response.body == "nobody"
+assert User.find(ada.id).as(User).remember_created_at.nil?
+
+puts "authentication helpers: all assertions passed"

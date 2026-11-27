@@ -40,6 +40,38 @@ posts = Source.new("/app/controllers/posts_controller.iyi", "class PostsControll
 controllers = controllers_module([posts, app])
 assert controllers.index("ApplicationController < Controller").as(Int32) < controllers.index("PostsController <").as(Int32)
 
+# mailers: a module of their own, ApplicationMailer first; controllers and tests import it
+app_mailer = Source.new("/app/mailers/application_mailer.iyi", "class ApplicationMailer < Mailer\nend\n")
+user_mailer = Source.new("/app/mailers/user_mailer.iyi", "class UserMailer < ApplicationMailer\n  def welcome(user : User)\n    @user = user\n  end\nend\n")
+mailers = mailers_module([user_mailer, app_mailer], ["User"])
+assert mailers.includes?("module app/mailers\n")
+assert mailers.includes?("import kurt/mailers::*\n")
+assert mailers.index("ApplicationMailer < Mailer").as(Int32) < mailers.index("UserMailer <").as(Int32)
+assert mailers.includes?("  @user : User = User.new")
+assert controllers.includes?("import app/mailers::*\n")
+assert test_imports.includes?("import app/mailers::*")
+
+# jobs: a module of their own, with the worker's dispatcher by class name
+welcome_job = Source.new("/app/jobs/welcome_job.iyi", "class WelcomeJob < ApplicationJob\n  def perform(user : User)\n  end\nend\n")
+app_job = Source.new("/app/jobs/application_job.iyi", "class ApplicationJob < Job\nend\n")
+assert job_classes(welcome_job.text) == ["WelcomeJob"]
+assert job_classes(app_job.text).empty?
+jobs = jobs_module([welcome_job, app_job], ["User"])
+assert jobs.includes?("module app/jobs\n")
+assert jobs.index("ApplicationJob < Job").as(Int32) < jobs.index("WelcomeJob <").as(Int32)
+assert jobs.includes?("  when \"WelcomeJob\" then WelcomeJob.__kurt_perform(arguments)\n")
+assert jobs.includes?("  when \"Kurt::Mail\" then perform_delivery(arguments)\n")
+assert jobs.includes?("pub def perform_enqueued_jobs : Int32")
+assert controllers.includes?("import app/jobs::*\n")
+
+# the entry: a worker beside the server, and `jobs`, only with a queue
+queued = entry_module("blog", nil, "/b/blog.iyi", [{"db/migrations/1_create_kurt_jobs.sql", "-- up\nCREATE TABLE kurt_jobs (id INTEGER);\n"}])
+assert queued.includes?("if Program.args[0]? == \"jobs\"")
+assert queued.includes?("    g.spawn(unit: :new) do\n      work_jobs\n")
+plain = entry_module("blog", nil, "/b/blog.iyi")
+assert !plain.includes?("work_jobs\n")
+assert plain.includes?("mount routes\nrun\n")
+
 # routes become the body of `routes`
 routes = routes_module(Source.new("/config/routes.iyi", "root HomeController, :index\n"), "/build/app/routes.iyi")
 assert routes.includes?("pub def routes : Router\n  router = Router.new\n" + %(#<loc:"/config/routes.iyi",1,1>root HomeController, :index))

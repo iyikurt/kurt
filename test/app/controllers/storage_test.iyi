@@ -1,0 +1,153 @@
+module test/app/controllers/storage_test
+
+import std/text
+import std/file::{File}
+import std/dir::{Dir}
+import std/random::{Random}
+import std/env::{ENV}
+import std/file_utils::{FileUtils}
+import db/db/errors::{DBError}
+import web/iyi_web/router::{Router, RouteHandler}
+import web/iyi_web/harness::*
+import datasource::{database, postgres?}
+import model::*
+import controllers::*
+import storage::*
+import generators::{attachments_migration}
+
+pub class Profile
+  property name : String
+
+  has_one_attached :avatar, content_types: ["image/png", "image/jpeg"], max_size: 1000
+  has_many_attached :documents
+
+  validates :name, presence: true
+
+  derive model
+end
+
+class ApplicationController < Controller
+end
+
+class ProfilesController < ApplicationController
+  @profile : Profile = Profile.new
+
+  def create
+    @profile = Profile.new(params.require(:profile).permit(:name))
+    @profile.avatar = uploaded_file(:profile, :avatar)
+    @profile.documents = uploaded_files(:profile, :documents)
+    if @profile.save!
+      redirect_to path_to(@profile)
+    else
+      status(422)
+      @profile.errors.full_messages.join(", ")
+    end
+  end
+
+  def show
+    @profile = Profile.find(params[:id])!
+    (@profile.avatar.url? || "none") + " " + @profile.documents.all?.map(&.filename).join(",")
+  end
+end
+
+def routes : Router
+  router = Router.new
+  resources "profiles", ProfilesController
+  install_file_routes router
+  install_error_pages router
+  router
+end
+
+def setup : Nil | DBError
+  ["kurt_attachments", "profiles"].each { |t| database.exec("DROP TABLE IF EXISTS " + t)! }
+  id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  database.exec("CREATE TABLE profiles (id " + id + ", name TEXT NOT NULL)")!
+  sql = attachments_migration(postgres?)
+  sql[6, sql.index("-- down").as(Int32) - 6].split(";").each do |statement|
+    database.exec(statement)! unless statement.strip.empty?
+  end
+  nil
+end
+
+case failed = setup
+in DBError
+  STDERR.puts failed.message
+  exit 1
+in Nil
+end
+
+STORE = "/tmp/kurt-storage-test-" + Random::Secure.hex(4)
+ENV["KURT_STORAGE"] = STORE
+
+BOUNDARY = "----kurtboundary"
+
+# A multipart body: text fields, then files {field, filename, type, data}.
+def multipart(fields : Array(Tuple(String, String)), files : Array(Tuple(String, String, String, String))) : String
+  body = ""
+  fields.each do |pair|
+    body += "--" + BOUNDARY + "\r\nContent-Disposition: form-data; name=\"" + pair[0] + "\"\r\n\r\n" + pair[1] + "\r\n"
+  end
+  files.each do |file|
+    body += "--" + BOUNDARY + "\r\nContent-Disposition: form-data; name=\"" + file[0] + "\"; filename=\"" + file[1] + "\"\r\nContent-Type: " + file[2] + "\r\n\r\n" + file[3] + "\r\n"
+  end
+  body + "--" + BOUNDARY + "--\r\n"
+end
+
+def post_form(app, body : String)
+  dispatch(app, http_request("POST", "/profiles", body: body, content_type: "multipart/form-data; boundary=" + BOUNDARY)).response
+end
+
+app = RouteHandler.new(routes)
+png = "\x89PNG\r\n\x1a\nfake image bytes"
+
+# a profile with an avatar and two documents
+res = post_form(app, multipart([{"profile[name]", "Ada"}], [{"profile[avatar]", "../../me.png", "image/png", png},
+  {"profile[documents][]", "a.txt", "text/plain", "first"}, {"profile[documents][]", "b.html", "text/html", "<script>x</script>"}]))
+assert res.status_code == 303
+ada = Profile.last?.as(Profile)
+shown = dispatch(app, "GET", "/profiles/" + ada.id.to_s).response.body
+assert shown.starts_with?("/files/")
+assert shown.ends_with?("/me.png a.txt,b.html")             # the path is gone from the name
+avatar = ada.avatar.attachment.as(Attachment)
+assert avatar.content_type == "image/png"
+assert avatar.byte_size == png.bytesize
+assert File.read(avatar.path) == png
+assert avatar.path.starts_with?(STORE + "/")
+
+# served: an image inline, HTML as a download
+got = dispatch(app, "GET", avatar.url).response
+assert got.status_code == 200
+assert got.headers["Content-Disposition"]?.as(String).starts_with?("inline")
+html = ada.documents.all.as(Array(Attachment)).find { |d| d.filename == "b.html" }.as(Attachment)
+assert dispatch(app, "GET", html.url).response.headers["Content-Disposition"]?.as(String).starts_with?("attachment")
+assert dispatch(app, "GET", "/files/" + "0" * 48 + "/x.png").response.status_code == 404
+assert dispatch(app, "GET", "/files/nothex/x.png").response.status_code == 404
+
+# a type not allowed, a file too large: the record is not saved, nothing is kept
+before = Profile.count.as(Int64)
+res = post_form(app, multipart([{"profile[name]", "Bob"}], [{"profile[avatar]", "x.gif", "image/gif", "GIF89a"}]))
+assert res.status_code == 422
+assert res.body.includes?("avatar is not a file of an allowed type")
+res = post_form(app, multipart([{"profile[name]", "Bob"}], [{"profile[avatar]", "big.png", "image/png", "x" * 2000}]))
+assert res.body.includes?("avatar is too large")
+assert Profile.count.as(Int64) == before
+
+# no file chosen: the browser sends an empty part, which is no upload
+res = post_form(app, multipart([{"profile[name]", "Cy"}], [{"profile[avatar]", "", "application/octet-stream", ""}]))
+assert res.status_code == 303
+assert !Profile.last?.as(Profile).avatar.attached?.as(Bool)
+
+# replacing one: the old file goes
+old_path = avatar.path
+ada.avatar.attach("new bytes", "new.jpg").as(Attachment)
+assert !File.exists?(old_path)
+assert ada.avatar.attachment.as(Attachment).content_type == "image/jpeg"
+
+# destroying the record purges its files
+paths = ada.documents.all.as(Array(Attachment)).map(&.path)
+ada.destroy.as(Profile)
+paths.each { |path| assert !File.exists?(path) }
+assert ada.documents.count.as(Int32) == 0
+
+FileUtils.rm_rf(STORE)
+puts "storage: all assertions passed" + (postgres? ? " (postgres)" : "")

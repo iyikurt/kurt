@@ -2,6 +2,7 @@ module test/model_test
 
 import std/text
 import db/db/errors::{DBError}
+import db/db/value::{DBValue}
 import datasource::{database, postgres?}
 import std/regex::{Regex}
 import model::*
@@ -64,17 +65,6 @@ end
 
 class Pin
   property post_id : Int64
-
-  derive model
-end
-
-# has_secure_password over password_digest.
-class Person
-  property email_address : String
-  property password_digest : String
-
-  has_secure_password
-  validates :password, length: {minimum: 8}
 
   derive model
 end
@@ -159,13 +149,185 @@ class Member
   end
 end
 
+# has_many :through, both ways: across a join table (taggings), and across
+# a has_many whose rows the target belongs to (writers -> notes -> remarks).
+pub class Writer
+  property name : String
+
+  has_many notes : Note
+  has_many remarks : Remark, through: :notes
+  has_many taggings : Tagging, foreign_key: note_id
+
+  derive model
+end
+
+pub class Note
+  property title : String
+  property writer_id : Int64
+  property views : Int64
+  property score : Float64
+
+  belongs_to writer : Writer
+  has_many remarks : Remark
+  has_many taggings : Tagging
+  has_many tags : Tag, through: :taggings
+
+  derive model
+end
+
+pub class Remark
+  property body : String
+  property note_id : Int64
+
+  derive model
+end
+
+pub class Tag
+  property name : String
+
+  derive model
+end
+
+pub class Tagging
+  property note_id : Int64
+  property tag_id : Int64
+
+  derive model
+end
+
+def setup_queries : Nil | DBError
+  db = database
+  id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres? ? "BIGINT" : "INTEGER"
+  float = postgres? ? "DOUBLE PRECISION" : "REAL"
+  ["taggings", "tags", "remarks", "notes", "writers"].each { |t| db.exec("DROP TABLE IF EXISTS " + t)! }
+  db.exec("CREATE TABLE writers (id " + id + ", name TEXT NOT NULL)")!
+  db.exec("CREATE TABLE notes (id " + id + ", title TEXT NOT NULL, writer_id " + int + " NOT NULL, views " + int + " NOT NULL DEFAULT 0, score " + float + " NOT NULL DEFAULT 0)")!
+  db.exec("CREATE TABLE remarks (id " + id + ", body TEXT NOT NULL, note_id " + int + " NOT NULL)")!
+  db.exec("CREATE TABLE tags (id " + id + ", name TEXT NOT NULL)")!
+  db.exec("CREATE TABLE taggings (id " + id + ", note_id " + int + " NOT NULL, tag_id " + int + " NOT NULL)")!
+  nil
+end
+
+def run_queries : Nil | DBError | NotFound | Invalid
+  setup_queries!
+  ada = Writer.create(name: "Ada")!
+  bob = Writer.create(name: "Bob")!
+  cy = Writer.create(name: "Cy")!
+  one = Note.create(title: "One", writer_id: ada.id, views: 10, score: 1.5)!
+  two = Note.create(title: "Two", writer_id: ada.id, views: 30, score: 2.5)!
+  three = Note.create(title: "Three", writer_id: bob.id, views: 5, score: 4.0)!
+  Remark.create(body: "first", note_id: one.id)!
+  Remark.create(body: "second", note_id: one.id)!
+  Remark.create(body: "third", note_id: three.id)!
+  red = Tag.create(name: "red")!
+  blue = Tag.create(name: "blue")!
+  Tagging.create(note_id: one.id, tag_id: red.id)!
+  Tagging.create(note_id: one.id, tag_id: blue.id)!
+  Tagging.create(note_id: two.id, tag_id: red.id)!
+
+  # has_many :through a join table, and through a has_many
+  assert one.tags.order(:name).all!.map(&.name) == ["blue", "red"]
+  assert two.tags.count! == 1
+  assert three.tags.all!.empty?
+  assert ada.remarks.order(:id).all!.map(&.body) == ["first", "second"]
+  assert bob.remarks.count! == 1
+  assert cy.remarks.all!.empty?
+
+  # joins: a belongs_to, a has_many (with distinct), a through; where on the joined table
+  assert Note.joins(:writer).where("writers.name", "Ada").order(:id).all!.map(&.title) == ["One", "Two"]
+  assert Note.joins(:remarks).count! == 3
+  assert Note.joins(:remarks).distinct.count! == 2
+  assert Note.joins(:remarks).distinct.order(:id).all!.map(&.title) == ["One", "Three"]
+  assert Note.joins(:tags).where("tags.name", "red").order(:id).pluck(:title, String)! == ["One", "Two"]
+  assert Writer.joins(:remarks).distinct.order(:name).pluck(:name, String)! == ["Ada", "Bob"]
+  # a column of the model's own is qualified once there are joins: `id` is not ambiguous
+  assert Note.joins(:writer).where(id: one.id).first!.title == "One"
+  # left_joins: writers with no notes too
+  assert Writer.left_joins(:notes).where_sql("notes.id IS NULL").pluck(:name, String)! == ["Cy"]
+  assert Note.joins(:nothing).all.is_a?(DBError)
+
+  # pluck, ids, select, distinct
+  assert Note.order(:id).pluck(:title, String)! == ["One", "Two", "Three"]
+  assert Note.order(:id).pluck(:views, Int64)! == [10_i64, 30_i64, 5_i64]
+  assert Note.order(:id).pluck(:title, :views)!.map { |row| row[0] } == ["One", "Two", "Three"] of DBValue
+  assert Note.where(writer_id: ada.id).ids! == [one.id, two.id]
+  assert Note.select(:writer_id).distinct.count! == 2
+  assert Note.distinct.order(:writer_id).pluck(:writer_id, Int64)! == [ada.id, bob.id]
+  assert Note.select("notes.*").joins(:writer).where("writers.name", "Bob").first!.title == "Three"
+
+  # calculations
+  assert Note.sum(:views)! == 45.0
+  assert Note.sum(:views, Int64)! == 45
+  assert Note.where(writer_id: ada.id).sum(:score)! == 4.0
+  assert Note.where(writer_id: cy.id).sum(:views)! == 0.0
+  assert Note.average(:views)! == 15.0
+  assert Note.where(writer_id: cy.id).average(:views)!.nil?
+  assert Note.minimum(:views, Int64)! == 5
+  assert Note.maximum(:score, Float64)! == 4.0
+  assert Note.maximum(:title, String)! == "Two"
+  assert Note.where(writer_id: cy.id).maximum(:views, Int64)!.nil?
+
+  # group_by and having
+  counts = Note.group_by(:writer_id).counts!
+  assert counts[ada.id] == 2
+  assert counts[bob.id] == 1
+  assert Note.group_by(:writer_id).having("COUNT(*) > ?", [1] of DBValue).counts!.keys == [ada.id] of DBValue
+  sums = Note.group_by(:writer_id).sums(:views)!
+  assert sums[ada.id] == 40.0
+  assert Note.group_by(:writer_id).averages(:score)![ada.id] == 2.0
+  assert Note.group_by(:writer_id).maximums(:views)![bob.id] == 5_i64
+  assert Note.group_by(:writer_id).count! == 2          # groups, counted
+  assert Note.query.counts.is_a?(DBError)           # counts needs group_by
+
+  # or_where: either side's conditions together
+  either = Note.where(writer_id: bob.id).or_where(Note.where(title: "Two")).order(:id)
+  assert either.pluck(:title, String)! == ["Two", "Three"]
+  assert Note.where(views: 10).where(writer_id: ada.id).or_where(Note.where(views: 5)).count! == 2
+  assert Note.joins(:writer).where("writers.name", "Ada").or_where(Note.joins(:writer).where("writers.name", "Bob")).count! == 3
+
+  # insert_all: one statement, ids back; a duplicate is skipped
+  database.exec("CREATE UNIQUE INDEX tags_name ON tags (name)")!
+  ids = Tag.insert_all([{name: "green"}, {name: "red"}, {name: "gold"}])!
+  assert ids.size == 2                                  # red was there
+  assert Tag.where(name: "green").first!.id == ids[0]
+  assert Tag.count! == 4
+  assert Tag.insert_all([{name: "red"}], skip_duplicates: false).is_a?(DBError)
+  assert Tag.insert_all([] of NamedTuple(name: String))!.empty?
+  assert Tag.insert_all([{nope: "x"}]).is_a?(DBError)
+  # hashes work too
+  assert Tag.insert_all([{"name" => "pink"} of String => DBValue])!.size == 1
+  # timestamps are filled in
+  User.insert_all([{name: "Bulk", email: "bulk@example.com", admin: false}])!
+  assert User.email("bulk@example.com").count! == 1
+
+  # upsert_all: new rows inserted, existing ones updated, by a unique column
+  database.exec("CREATE UNIQUE INDEX writers_name ON writers (name)")!
+  before = Writer.where(name: "Ada").first!.id
+  upserted = Note.upsert_all([{id: one.id, title: "One!", writer_id: ada.id, views: 11, score: 1.5},
+                              {id: 9999_i64, title: "New", writer_id: bob.id, views: 1, score: 0.5}], unique_by: :id)!
+  assert upserted.size == 2
+  assert Note.find(one.id)!.title == "One!"
+  assert Note.find(one.id)!.views == 11
+  assert Note.find(9999_i64)!.title == "New"
+  same = Writer.upsert_all([{name: "Ada"}, {name: "Dee"}], unique_by: :name)!
+  assert same.size == 1                               # only the key given: a row there is left alone (DO NOTHING) and not returned
+  assert Writer.where(name: "Ada").first!.id == before
+  assert Writer.count! == 4
+  assert Writer.upsert_all([{name: "X"}], unique_by: :nope).is_a?(DBError)
+
+  # delete_all through a join
+  assert Remark.joins("INNER JOIN notes ON notes.id = remarks.note_id").where("notes.title", "One!").delete_all! == 2
+  assert Remark.count! == 1
+  nil
+end
+
 def setup : Nil | DBError
   db = database
   id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
   int = postgres? ? "BIGINT" : "INTEGER"
   bool = postgres? ? "BOOLEAN NOT NULL DEFAULT FALSE" : "INTEGER NOT NULL DEFAULT 0"
   ["comments", "posts", "users", "members", "likes", "accounts", "people", "pins"].each { |t| db.exec("DROP TABLE IF EXISTS " + t)! }
-  db.exec("CREATE TABLE people (id " + id + ", email_address TEXT NOT NULL, password_digest TEXT NOT NULL DEFAULT '')")!
   db.exec("CREATE TABLE pins (id " + id + ", post_id " + int + " NOT NULL)")!
   db.exec("CREATE TABLE likes (id " + id + ", comment_id " + int + " NOT NULL)")!
   db.exec("CREATE TABLE accounts (id " + id + ", name TEXT NOT NULL)")!
@@ -390,45 +552,6 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert CALLS == ["comment destroyed", "comment destroyed"]
   assert Comment.find(keep.id)!.body == "other"   # another post's comment stays
 
-  # has_secure_password
-  nopass = Person.new(email_address: "p@example.com")
-  assert !nopass.valid?
-  assert nopass.errors.on("password") == ["can't be blank"]
-  short = Person.new(email_address: "p@example.com", password: "short")
-  assert !short.valid?
-  assert short.errors.on("password") == ["is too short (minimum is 8 characters)"]
-  mismatch = Person.new(email_address: "p@example.com", password: "long enough", password_confirmation: "different")
-  assert !mismatch.valid?
-  assert mismatch.errors.on("password_confirmation") == ["doesn't match Password"]
-  huge = Person.new(email_address: "p@example.com", password: "x" * 73)
-  assert !huge.valid?
-  assert huge.errors.on("password").includes?("is too long (maximum is 72 bytes)")
-
-  pat = Person.create(email_address: "pat@example.com", password: "correct horse", password_confirmation: "correct horse")!
-  assert pat.password_digest.starts_with?("$2b$")
-  assert !pat.password_digest.includes?("correct horse")
-  assert pat.password.nil?                        # not kept once saved
-  assert pat.authenticate("correct horse")
-  assert !pat.authenticate("wrong horse")
-  case found = Person.authenticate_by("email_address", "pat@example.com", "correct horse")
-  in Person then assert found.id == pat.id
-  in Nil, DBError then assert false
-  end
-  assert Person.authenticate_by("email_address", "pat@example.com", "wrong horse")!.nil?
-  assert Person.authenticate_by("email_address", "nobody@example.com", "correct horse")!.nil?
-
-  # an edit form's empty password keeps the old one; a new one replaces it
-  digest = pat.password_digest
-  pat.update({"email_address" => "pat@example.com", "password" => "", "password_confirmation" => ""})!
-  assert pat.errors.empty?
-  assert Person.find(pat.id)!.password_digest == digest
-  pat.update(password: "battery staple", password_confirmation: "battery staple")!
-  assert Person.find(pat.id)!.authenticate("battery staple")
-  assert !Person.find(pat.id)!.authenticate("correct horse")
-  from_form = Person.new({"email_address" => "form@example.com", "password" => "from a form", "password_confirmation" => "from a form"})
-  assert from_form.save!
-  assert from_form.authenticate("from a form")
-
   # includes: associations load with the rows, one query each
   Comment.delete_all!
   Post.delete_all!
@@ -500,6 +623,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   in User, DBError then assert false
   end
 
+  run_queries!
   puts "model: all assertions passed" + (postgres? ? " (postgres)" : " (sqlite)")
   nil
 end

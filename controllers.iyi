@@ -2,7 +2,8 @@
 # route. Built on iyi-web: the routing macros register ordinary iyi-web
 # routes, and the errors an action hands up with `!` become responses in one
 # place, `install_error_pages` (NotFound -> 404, Invalid -> 422,
-# Unauthorized -> the login page, Forbidden -> 403, DBError -> 503).
+# Unauthorized -> the login page, Forbidden -> 403, DBError and
+# DeliveryError -> 503).
 #
 #   class PostsController < ApplicationController
 #     before_action :require_login, except: [:index, :show]
@@ -34,13 +35,17 @@ import web/iyi_web/status::{HttpError}
 import web/iyi_web/session::{Session, session}
 import web/iyi_web/csrf::{csrf_tag, csrf_token}
 import web/iyi_web/log::{StdoutLogger}
+import std/mutex::{Mutex}
 import model::{NotFound, Invalid}
+import mailers::{DeliveryError}
 import datasource::{database}
 import environment::{production?, env}
+import std/time::{Time}
 import strong_parameters::{Parameters}
 import std/html::{HTML}
 import web/iyi_web/templates::{SafeHTML}
 import helpers::{attributes_html}
+import forms::{FormBuilder, form_values}
 import json_writer
 
 pub import web/iyi_web/context
@@ -48,13 +53,17 @@ pub import web/iyi_web/templates
 pub import model
 pub import strong_parameters
 pub import helpers
+pub import forms
+pub import storage
 
-# The visitor must sign in first. A page sends them to the login page; a
-# JSON request gets 401.
+# The visitor must sign in first. A page sends them to the sign-in page
+# (*location*, or the one `install_error_pages` names); a JSON request gets
+# 401.
 pub class Unauthorized
   getter message : String
+  getter location : String?
 
-  def initialize(@message : String = "sign in first")
+  def initialize(@message : String = "sign in first", @location : String? = nil)
   end
 end
 
@@ -90,9 +99,30 @@ impl HttpError for Forbidden
   end
 end
 
+# Too many requests from one client: 429. Sign-in forms answer it past
+# their rate limit.
+pub class TooManyRequests
+  getter message : String
+
+  def initialize(@message : String = "too many requests; try again in a minute")
+  end
+end
+
+impl Error for TooManyRequests
+  def message : String
+    @message
+  end
+end
+
+impl HttpError for TooManyRequests
+  def status : Int32
+    429
+  end
+end
+
 # What a filter answers to stop the action: nil lets it run. A DBError is
 # one too, so a filter may hand up what `Post.find(...)!` hands it.
-pub alias Halt = Unauthorized | Forbidden | NotFound | DBError
+pub alias Halt = Unauthorized | Forbidden | NotFound | TooManyRequests | DBError
 
 pub class Controller
   getter env : Context
@@ -214,35 +244,6 @@ pub class Controller
     false
   end
 
-  # The signed-in user's id, kept in the session by `start_session_for`;
-  # nil when nobody is signed in. In a test, the one `sign_in_as` named.
-  def session_user_id : Int64?
-    if forced = ::Kurt::Controllers.test_user_id
-      return forced
-    end
-    store = session?
-    return nil if store.nil?
-    raw = store["user_id"]?
-    raw ? raw.to_i64? : nil
-  end
-
-  # Signs *user* in: a new session id first, so an id someone planted
-  # before the login is worth nothing after it.
-  def start_session_for(user : T) : Nil forall T
-    store = session
-    store.regenerate
-    store["user_id"] = user.id.to_s
-    nil
-  end
-
-  # Signs out: the session is emptied and its cookie deleted.
-  def terminate_session : Nil
-    if store = session?
-      store.clear
-    end
-    nil
-  end
-
   # A link: `<%= link_to "Edit", path_to(post) + "/edit", class: "btn" %>`.
   # The text is escaped; a SafeHTML one (an icon, `raw(...)`) is not. Other
   # attributes follow: `target: "_blank"`, `data_turbo: false`.
@@ -271,6 +272,47 @@ pub class Controller
                  (form_method == "post" ? csrf_field : "") + hidden + "<button type=\"submit\"" + attributes_html(class: klass) + ">" + inner + "</button></form>")
   end
 
+  # The classes `form_with`'s fields get: "plain" (none) or "daisyui".
+  # `form_style :daisyui` in ApplicationController sets it.
+  def form_style : String
+    "plain"
+  end
+
+  # What `form_with` builds for a record: its scope (`post`), its path
+  # (`/posts`, or `/posts/7` with `_method=patch` once saved), its values
+  # and its errors.
+  def __kurt_form_builder(model : T, url : String?, method : Symbol | String | Nil, scope : Symbol | String | Nil, html_class : String?, multipart : Bool, attrs : String) : FormBuilder forall T
+    saved = model.persisted?
+    action = url || (saved ? path_to(model) : "/" + T.table_name)
+    verb = method ? method.to_s : (saved ? "patch" : "post")
+    name = scope ? scope.to_s : ::Kurt::Inflector.underscore(T.model_name)
+    FormBuilder.new(name.empty? ? nil : name, action, verb, form_style, form_values(model), model.errors, saved, T.model_name, csrf_field, html_class, multipart, attrs)
+  end
+
+  # A form with no record: `form_with url: "/search" do |f|`; fields are
+  # bare (`email`) unless `scope:` names one.
+  def __kurt_form_builder(model : Nil, url : String?, method : Symbol | String | Nil, scope : Symbol | String | Nil, html_class : String?, multipart : Bool, attrs : String) : FormBuilder
+    verb = method ? method.to_s : "post"
+    name = scope ? scope.to_s : nil
+    FormBuilder.new(name, url || env.request.path, verb, form_style, {} of String => ::Db::Value::DBValue, nil, false, "", csrf_field, html_class, multipart, attrs)
+  end
+
+  # The file a form sent as `user[avatar]` (`f.file_field :avatar` in
+  # `form_with model: @user`): `uploaded_file(:user, :avatar)`; nil when
+  # none was chosen. Without *name*, the field is *scope* alone.
+  def uploaded_file(scope : Symbol | String, name : Symbol | String | Nil = nil) : ::IyiWeb::Multipart::FileUpload?
+    field = name ? scope.to_s + "[" + name.to_s + "]" : scope.to_s
+    found = @env.params.files[field]?
+    return nil if found.nil? || (found.filename.empty? && found.size == 0)
+    found
+  end
+
+  # The files of a `multiple: true` field (`user[documents][]`).
+  def uploaded_files(scope : Symbol | String, name : Symbol | String) : Array(::IyiWeb::Multipart::FileUpload)
+    list = @env.params.all_files[scope.to_s + "[" + name.to_s + "][]"]? || [] of ::IyiWeb::Multipart::FileUpload
+    list.reject { |upload| upload.filename.empty? && upload.size == 0 }
+  end
+
   # Whether the request is for *path*: a navbar marks its page with it.
   def current_page?(path : String) : Bool
     @env.request.path == path
@@ -284,6 +326,39 @@ pub class Controller
   # `/posts/7` for a Post with id 7.
   def path_to(record : T) : String forall T
     "/" + T.table_name + "/" + record.id.to_s
+  end
+end
+
+# A form, as Rails' `form_with`, in a template's `<% %>` tag:
+#
+#   <% form_with model: @post do |f| %>
+#     <%= f.label :title %>
+#     <%= f.text_field :title %>
+#     <%= f.submit %>
+#   <% end %>
+#
+# `model:` gives the fields their names (`post[title]`), values and errors,
+# and the form its path: `/posts` with POST for a new record, `/posts/7`
+# with `_method=patch` for a saved one. `url:` and `method:` say otherwise;
+# without a model, `url:` is the path and `scope:` the fields' prefix, if
+# any. `class:` is the form's class, `multipart: true` lets it send files,
+# and other attributes go on the tag (`data_turbo: false`). The CSRF field
+# is always in it.
+pub macro form_with(model = nil, url = nil, method = nil, scope = nil, multipart = false, **attrs, &block)
+  {% f = block.args.empty? ? "__kurt_form".id : block.args[0] %}
+  {% klass = attrs[:class] %}
+  {{ f }} = __kurt_form_builder({{ model }}, {{ url }}, {{ method }}, {{ scope }}, {{ klass }}, {{ multipart }}, ::Kurt::Helpers.attributes_html({% for key, value in attrs %}{% if key.stringify != "class" %}{{ key }}: {{ value }}, {% end %}{% end %}))
+  __iyi_web_io__.output({{ f }}.open_tag)
+  {{ block.body }}
+  __iyi_web_io__.output({{ f }}.close_tag)
+end
+
+# `form_style :daisyui` in ApplicationController: the classes `form_with`
+# gives fields (daisyUI's `input`, `select`, `btn`, and `input-error` on a
+# field that did not validate).
+pub macro form_style(style)
+  def form_style : String
+    {{ style.id.stringify }}
   end
 end
 
@@ -322,14 +397,14 @@ pub macro before_action(name, only = nil, except = nil)
     {% if except %}
       return nil if {{ except.map(&.id.stringify) }}.includes?(action)
     {% end %}
-    return nil if __kurt_skip?({{ name.id.stringify }}, action)
+    return nil if __kurt_skip?({{ name.id.stringify.gsub(/!$/, "") }}, action)
     answer = {{ name.id }}
     answer.is_a?(::Kurt::Controllers::Halt) ? answer : nil
   end
 end
 
 # Leaves out a filter a parent class set, for every action or only some:
-# `skip_before_action :require_authentication, only: [:new, :create]`.
+# `skip_before_action :authenticate_user!, only: [:new, :create]`.
 pub macro skip_before_action(name, only = nil, except = nil)
   def __kurt_skip?(filter : String, action : String) : Bool
     {% if @type.methods.any? { |m| m.name == "__kurt_skip?" } %}
@@ -337,7 +412,7 @@ pub macro skip_before_action(name, only = nil, except = nil)
     {% else %}
       return true if super
     {% end %}
-    return false unless filter == {{ name.id.stringify }}
+    return false unless filter == {{ name.id.stringify.gsub(/!$/, "") }}
     {% if only %}
       {{ only.map(&.id.stringify) }}.includes?(action)
     {% elsif except %}
@@ -348,39 +423,35 @@ pub macro skip_before_action(name, only = nil, except = nil)
   end
 end
 
-# Pages anyone may see once `kurt generate authentication` has made sign-in
-# the rule: `allow_unauthenticated_access only: [:index, :show]`, or every
-# action of the controller without arguments.
-pub macro allow_unauthenticated_access(only = nil, except = nil)
-  ::Kurt::Controllers.skip_before_action(:require_authentication, {{ only }}, {{ except }})
-end
-
-# Who `sign_in_as` signed in for the test process; 0 for nobody.
-TEST_USER = Atomic(Int64).new(0_i64)
+# Who `sign_in` signed in for the test process: "User:5", or "" for
+# nobody.
+TEST_USER = Mutex.new { "" }
 
 # In a test, makes every request after it signed in as *user*, without a
-# login form or a cookie. Refused anywhere but KURT_ENV=test, which
+# sign-in form or a cookie. Refused anywhere but KURT_ENV=test, which
 # `kurt test` sets: a server never runs this.
-pub def sign_in_as(user : T) : Nil forall T
-  sign_in_as(user.id)
-end
-
-pub def sign_in_as(id : Int64) : Nil
-  raise "sign_in_as is for tests, and KURT_ENV is " + env unless env == "test"
-  TEST_USER.set(id)
+pub def sign_in(user : T) : Nil forall T
+  raise "sign_in is for tests, and KURT_ENV is " + env unless env == "test"
+  who = T.model_name + ":" + user.id.to_s
+  TEST_USER.update { |_| who }
   nil
 end
 
-# Undoes `sign_in_as`.
+# Undoes `sign_in`.
 pub def sign_out : Nil
-  TEST_USER.set(0_i64)
+  TEST_USER.update { |_| "" }
   nil
 end
 
-pub def test_user_id : Int64?
+# The id `sign_in` signed in as a *model*, in a test; nil anywhere else.
+pub def test_user_id(model : String) : Int64?
   return nil unless env == "test"
-  id = TEST_USER.get
-  id == 0 ? nil : id
+  who = TEST_USER.get { |value| value }
+  return nil unless who.is_a?(String)
+  return nil if who.empty?
+  name, _, id = who.partition(":")
+  return nil unless name == model
+  id.to_i64?
 end
 
 # Renders `app/views/<name>.eiy` inside `app/views/layouts/application.eiy`,
@@ -430,6 +501,188 @@ pub macro render(name, layout = "application", status = nil, collection = nil, *
       {% end %}
     end
   {% end %}
+end
+
+# Renders a view and a layout given by absolute paths: what the
+# authentication controllers `kurt` writes into its build use, since their
+# views are the application's when it has copies and Kurt's otherwise.
+pub macro render_file(view, layout = nil, status = nil)
+  begin
+    {% if status %}
+      self.status({{ status }})
+    {% end %}
+    {% if layout %}
+      ::IyiWeb::Templates.render({{ view }}, {{ layout }})
+    {% else %}
+      ::IyiWeb::Templates.render({{ view }})
+    {% end %}
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Authentication: the controller helpers. ApplicationController
+# says which model signs in:
+#
+#   class ApplicationController < Controller
+#     authentication_helpers User
+#   end
+#
+# and every controller and view then has, for that model:
+#
+#   current_user               the signed-in User, or nil
+#   user_signed_in?
+#   authenticate_user!         before_action :authenticate_user!: a visitor
+#                              who is not signed in goes to /users/sign_in,
+#                              and back to the page after signing in
+#   sign_in(user, remember: false)
+#   sign_out(user)
+#   after_sign_in_path_for(user), after_sign_out_path_for(user)
+#
+# `authenticate_user!` is `authenticate_user` with iyi's `!`: it answers
+# Unauthorized when nobody is signed in, and `!` hands that up, which stops
+# the action. The session keeps the user's id under "user_id", renewing the
+# session's id on sign-in. With remember_me, `remember: true` sets a
+# remember_user_token cookie that signs the user in again after the session
+# is gone; with timeout, a session idle for longer than the model's
+# `timeout_in` ends; with tracking, each sign-in is counted.
+# ---------------------------------------------------------------------------
+pub macro authentication_helpers(model, path = nil)
+  {% scope = model.id.stringify.split("::").last.underscore %}
+  {% base = path ? path : "/" + (scope.ends_with?("y") ? scope[0...-1] + "ies" : (scope.ends_with?("s") ? scope + "es" : scope + "s")) %}
+  @__kurt_current_{{ scope.id }} : {{ model }}? = nil
+  @__kurt_current_{{ scope.id }}_loaded : Bool = false
+
+  # The signed-in {{ model }}, or nil; views ask it too.
+  def current_{{ scope.id }} : {{ model }}?
+    unless @__kurt_current_{{ scope.id }}_loaded
+      @__kurt_current_{{ scope.id }}_loaded = true
+      @__kurt_current_{{ scope.id }} = __kurt_find_{{ scope.id }}
+    end
+    @__kurt_current_{{ scope.id }}
+  end
+
+  def {{ scope.id }}_signed_in? : Bool
+    !current_{{ scope.id }}.nil?
+  end
+
+  def __kurt_find_{{ scope.id }} : {{ model }}?
+    if forced = ::Kurt::Controllers.test_user_id({{ model.id.stringify.split("::").last }})
+      found = {{ model }}.find?(forced)
+      return found.is_a?({{ model }}) ? found : nil
+    end
+    store = session?
+    return nil if store.nil?
+    if raw = store[{{ scope + "_id" }}]?
+      \{% if {{ model }}.has_method?(:timeout_in) %}
+        if (last = store[{{ scope + "_last_request_at" }}]?) && (at = last.to_i64?)
+          if Time.utc.to_unix - at > {{ model }}.timeout_in && env.cookies[{{ "remember_" + scope + "_token" }}]?.nil?
+            store.clear
+            flash("alert", "Your session expired. Please sign in again to continue.")
+            return nil
+          end
+        end
+        store[{{ scope + "_last_request_at" }}] = Time.utc.to_unix.to_s
+      \{% end %}
+      found = {{ model }}.find?(raw.to_i64? || 0_i64)
+      return found if found.is_a?({{ model }})
+      store.delete({{ scope + "_id" }})
+    end
+    \{% if {{ model }}.has_method?(:remember_token) %}
+      if token = env.cookies[{{ "remember_" + scope + "_token" }}]?
+        found = {{ model }}.from_remember_token(token)
+        if found.is_a?({{ model }})
+          store.regenerate
+          store[{{ scope + "_id" }}] = found.id.to_s
+          store[{{ scope + "_last_request_at" }}] = Time.utc.to_unix.to_s
+          return found
+        end
+      end
+    \{% end %}
+    nil
+  end
+
+  # `before_action :authenticate_{{ scope.id }}!`: nil when someone is signed
+  # in; otherwise Unauthorized, which sends the visitor to the sign-in page
+  # (401 for JSON) and remembers the page to come back to.
+  def authenticate_{{ scope.id }} : ::Kurt::Controllers::Unauthorized?
+    return nil if current_{{ scope.id }}
+    if (store = session?) && env.request.method == "GET"
+      query = env.request.query_string
+      store[{{ scope + "_return_to" }}] = env.request.path + (query.empty? ? "" : "?" + query)
+      flash("alert", "You need to sign in or sign up before continuing.")
+    end
+    ::Kurt::Controllers::Unauthorized.new("You need to sign in or sign up before continuing.", {{ base + "/sign_in" }})
+  end
+
+  # Signs *record* in: a new session id first, so an id someone planted
+  # before is worth nothing after; then the remember cookie when asked for,
+  # and the sign-in counted (tracking).
+  def sign_in(record : {{ model }}, remember : Bool = false) : Nil | ::Db::Errors::DBError
+    store = session
+    store.regenerate
+    store[{{ scope + "_id" }}] = record.id.to_s
+    store[{{ scope + "_last_request_at" }}] = Time.utc.to_unix.to_s
+    @__kurt_current_{{ scope.id }} = record
+    @__kurt_current_{{ scope.id }}_loaded = true
+    \{% if {{ model }}.has_method?(:track_sign_in) %}
+      record.track_sign_in(env.request.remote_address)!
+    \{% end %}
+    \{% if {{ model }}.has_method?(:remember_token) %}
+      if remember
+        record.remember_me!
+        env.set_cookie({{ "remember_" + scope + "_token" }}, record.remember_token, http_only: true, secure: ::Kurt::Controllers.secure_cookies?, max_age: record.remember_for, same_site: "Lax")
+      end
+    \{% end %}
+    nil
+  end
+
+  # Signs out: the session emptied, the remember cookie and its token void.
+  def sign_out(record : {{ model }}?) : Nil | ::Db::Errors::DBError
+    \{% if {{ model }}.has_method?(:remember_token) %}
+      if found = record
+        found.forget_me!
+      end
+      if env.cookies[{{ "remember_" + scope + "_token" }}]?
+        env.set_cookie({{ "remember_" + scope + "_token" }}, "", http_only: true, max_age: 1, expires: Time.unix(0))
+      end
+    \{% end %}
+    if store = session?
+      store.clear
+    end
+    @__kurt_current_{{ scope.id }} = nil
+    @__kurt_current_{{ scope.id }}_loaded = true
+    nil
+  end
+
+  # Where signing in leads: the page `authenticate_{{ scope.id }}!` sent the
+  # visitor away from, or the home page. Override to change it.
+  def after_sign_in_path_for(record : {{ model }}) : String
+    if (store = session?) && (back = store[{{ scope + "_return_to" }}]?)
+      store.delete({{ scope + "_return_to" }})
+      return back
+    end
+    "/"
+  end
+
+  def after_sign_out_path_for(record : {{ model }}?) : String
+    "/"
+  end
+end
+
+# Whether cookies are sent over HTTPS only: in production.
+pub def secure_cookies? : Bool
+  production?
+end
+
+# The routes of an authentication scope: `authentication_for "users"` in
+# config/routes.iyi. They lead to the controllers `kurt`
+# writes for the scope (`UserSessionsController` and the rest), or to the
+# application's own copies of them; `kurt routes` lists them. `path: "auth"`
+# puts them under /auth instead of /users (then `authentication_helpers User,
+# path: "/auth"` too), for an application whose `resources "users"` has
+# POST /users already.
+pub macro authentication_for(name, path = nil)
+  __kurt_auth_routes_{{ name.id }}(router)
 end
 
 # The routing macros below are written inside a function that has a local
@@ -607,7 +860,7 @@ end
 # The default answers for the errors actions hand up. Register the
 # application's own pages for a type before calling this: pages are tried
 # in the order they were registered.
-pub def install_error_pages(router : Router, login_path : String = "/login") : Nil
+pub def install_error_pages(router : Router, login_path : String = "/users/sign_in") : Nil
   install_health_check(router)
   router.error NotFound do |env, err|
     env.response.status_code = 404
@@ -637,14 +890,36 @@ pub def install_error_pages(router : Router, login_path : String = "/login") : N
       env.response.content_type = "application/json"
       %({"error":"unauthorized"})
     else
-      env.redirect(login_path, 302)
+      env.redirect(err.location || login_path, 302)
       ""
+    end
+  end
+
+  router.error TooManyRequests do |env, err|
+    env.response.status_code = 429
+    env.response.headers["Retry-After"] = "60"
+    if json_request?(env)
+      env.response.content_type = "application/json"
+      %({"error":"too many requests"})
+    else
+      page("Too many requests", "<h1>Too many requests</h1><p>" + escape(err.message) + "</p>")
     end
   end
 
   router.error Forbidden do |env, err|
     env.response.status_code = 403
     page("Forbidden", "<h1>Forbidden</h1><p>" + escape(err.message) + "</p>")
+  end
+
+  router.error DeliveryError do |env, err|
+    LOG.write("mail not sent: " + err.message)
+    env.response.status_code = 503
+    if json_request?(env)
+      env.response.content_type = "application/json"
+      %({"error":"mail could not be sent"})
+    else
+      page("Unavailable", "<h1>Mail could not be sent</h1><p>Please try again shortly.</p>")
+    end
   end
 
   router.error DBError do |env, err|

@@ -40,6 +40,11 @@ pub class Field
     @kind == "references"
   end
 
+  # `avatar:attachment`: no column, a `has_one_attached`.
+  def attachment? : Bool
+    @kind == "attachment"
+  end
+
   def iyi_type : String
     case @kind
     when "string", "text"     then "String"
@@ -78,6 +83,7 @@ pub def normalize_kind(kind : String) : String?
   when "bool", "boolean"                                then "bool"
   when "time", "datetime", "timestamp"                  then "time"
   when "references", "reference", "belongs_to", "ref"   then "references"
+  when "attachment", "file", "image"                    then "attachment"
   else                                                       nil
   end
 end
@@ -93,7 +99,7 @@ pub def parse_fields(args : Array(String)) : Array(Field) | String
     return "`" + name + "` is a column Kurt writes itself" if ["id", "created_at", "updated_at"].includes?(name)
     raw = parts.size > 1 ? parts[1] : "string"
     kind = normalize_kind(raw)
-    return "unknown type `" + raw + "` in " + arg + ": use string, text, int, float, bool, time or references" if kind.nil?
+    return "unknown type `" + raw + "` in " + arg + ": use string, text, int, float, bool, time, references or attachment" if kind.nil?
     fields << Field.new(name, kind)
   end
   fields
@@ -153,6 +159,8 @@ pub def model_file(names : Names, fields : Array(Field), known : Array(String)) 
     end
   end
   parts << relations unless relations.empty?
+  attached = fields.select(&.attachment?).map { |f| "  has_one_attached :" + f.name + "\n" }.join
+  parts << attached unless attached.empty?
   # Text fields and links must be filled in; the rest is up to you.
   required = fields.select { |f| f.kind == "string" || (f.reference? && known.includes?(camelize(f.name))) }
   unless required.empty?
@@ -197,7 +205,7 @@ pub def create_table_migration(names : Names, fields : Array(Field), postgres : 
   id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
   stamp = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT now()" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
   columns = ["  id " + id]
-  fields.each { |field| columns << "  " + field.column + " " + field.sql_type(postgres) }
+  fields.each { |field| columns << "  " + field.column + " " + field.sql_type(postgres) unless field.attachment? }
   columns << "  created_at " + stamp
   columns << "  updated_at " + stamp
   out = "-- up\nCREATE TABLE " + names.plural + " (\n" + columns.join(",\n") + "\n);\n"
@@ -234,7 +242,9 @@ end
 
 pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String) : String
   view = names.plural + "/"
-  permitted = fields.map { |field| ":" + field.column }.join(", ")
+  permitted = fields.reject(&.attachment?).map { |field| ":" + field.column }.join(", ")
+  # A file chosen in the form, attached when the record saves.
+  uploads = fields.select(&.attachment?).map { |f| "    @" + names.singular + "." + f.name + " = uploaded_file(:" + names.singular + ", :" + f.name + ")\n" }.join
   # The records a form's selects offer, loaded for the actions that show it.
   list_filters = ""
   list_methods = ""
@@ -274,7 +284,7 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
     # POST /#{names.plural}
     def create
       @#{names.singular} = #{names.model}.new(#{names.singular}_params)
-      if @#{names.singular}.save!
+  #{uploads}    if @#{names.singular}.save!
         redirect_to path_to(@#{names.singular}), notice: "#{names.human} was created."
       else
         render "#{view}new", status: 422
@@ -288,7 +298,7 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
 
     # PATCH /#{names.plural}/:id
     def update
-      if @#{names.singular}.update(#{names.singular}_params)!
+  #{uploads}    if @#{names.singular}.update(#{names.singular}_params)!
         redirect_to path_to(@#{names.singular}), notice: "#{names.human} was updated."
       else
         render "#{view}edit", status: 422
@@ -315,6 +325,15 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
   IYI
 end
 
+# An attachment on the show page: the image, or a link to the file; nothing
+# when none is attached. `url?` and not `!`: a template has no `!`.
+def attachment_cell(record : String, field : Field, daisy : Bool) : String?
+  return nil unless field.attachment?
+  look = daisy ? " class=\"max-h-64 rounded-box\"" : " style=\"max-width: 16rem\""
+  link = daisy ? " class=\"link\"" : ""
+  "<% if (file = " + record + "." + field.name + ".attachment).is_a?(Attachment) %><% if file.image? %><img src=\"<%= file.url %>\" alt=\"<%= file.filename %>\"" + look + "><% else %><a" + link + " href=\"<%= file.url %>\"><%= file.filename %></a><% end %><% end %>"
+end
+
 # What a reference shows its record by: *labels* maps a model to its first
 # text column ("User" => "name"), read from db/schema.json; a model with
 # none is shown by its id.
@@ -332,54 +351,59 @@ def reference_cell(record : String, field : Field, labels : Hash(String, String)
   "<% if (" + field.name + " = " + record + "." + field.name + "?).is_a?(" + camelize(field.name) + ") %><%= " + field.name + "." + label + " %><% end %>"
 end
 
-def input_for(names : Names, field : Field, labels : Hash(String, String) = {} of String => String) : String
-  value = "<%= @" + names.singular + "." + field.column + " %>"
-  id = names.singular + "_" + field.column
-  name = names.singular + "[" + field.column + "]"
-  label = "    <label for=\"" + id + "\">" + field.label + "</label>\n"
+# The builder call that draws *field*'s input: `f.text_field :title`, a
+# select of the referenced records, a checkbox for a bool.
+def field_input(names : Names, field : Field, labels : Hash(String, String)) : String
   if shown_by = reference_label(field, labels)
     target = camelize(field.name)
-    return label + "    <select id=\"" + id + "\" name=\"" + name + "\">\n" +
-      "      <option value=\"\">Select a " + humanize(field.name).downcase + "</option>\n" +
-      "      <% @" + pluralize(underscore(target)) + ".each do |option| %>\n" +
-      "      <option value=\"<%= option.id %>\"<%= option.id == @" + names.singular + "." + field.column + " ? \" selected\" : \"\" %>><%= option." + shown_by + " %></option>\n" +
-      "      <% end %>\n    </select>\n"
+    return "<%= f.select :" + field.column + ", @" + pluralize(underscore(target)) + ".map { |option| {option." + shown_by + ", option.id} }, prompt: \"Select a " + humanize(field.name).downcase + "\" %>"
   end
   case field.kind
-  when "text"
-    label + "    <textarea id=\"" + id + "\" name=\"" + name + "\" rows=\"8\">" + value + "</textarea>\n"
-  when "int", "references"
-    label + "    <input id=\"" + id + "\" type=\"number\" name=\"" + name + "\" value=\"" + value + "\">\n"
-  when "float"
-    label + "    <input id=\"" + id + "\" type=\"number\" step=\"any\" name=\"" + name + "\" value=\"" + value + "\">\n"
-  when "bool"
-    "    <label class=\"check\">\n      <input type=\"hidden\" name=\"" + name + "\" value=\"0\">\n      <input id=\"" + id + "\" type=\"checkbox\" name=\"" + name + "\" value=\"1\"<%= @" + names.singular + "." + field.column + " ? \" checked\" : \"\" %>>\n      " + field.label + "\n    </label>\n"
-  when "time"
-    label + "    <input id=\"" + id + "\" type=\"datetime-local\" name=\"" + name + "\" value=\"<%= @" + names.singular + "." + field.column + ".to_s(\"%Y-%m-%dT%H:%M\") %>\">\n"
+  when "attachment"        then "<%= f.file_field :" + field.name + " %>"
+  when "text"              then "<%= f.text_area :" + field.column + ", rows: 8 %>"
+  when "int", "references" then "<%= f.number_field :" + field.column + " %>"
+  when "float"             then "<%= f.number_field :" + field.column + ", step: \"any\" %>"
+  when "bool"              then "<%= f.check_box :" + field.column + " %>"
+  when "time"              then "<%= f.datetime_field :" + field.column + " %>"
   else
-    label + "    <input id=\"" + id + "\" type=\"text\" name=\"" + name + "\" value=\"" + value + "\">\n"
+    field.column.includes?("email") ? "<%= f.email_field :" + field.column + " %>" : "<%= f.text_field :" + field.column + " %>"
   end
 end
 
+# What kept the record from being saved, above the form.
+def error_summary(names : Names, daisy : Bool) : String
+  record = "@" + names.singular
+  if daisy
+    "<% if " + record + ".errors.any? %>\n<div role=\"alert\" class=\"alert alert-error mb-6\">\n  <div>\n    <p class=\"font-semibold\"><%= pluralize(" + record + ".errors.size, \"problem\") %> kept this " + names.human.downcase + " from being saved:</p>\n    <ul class=\"list-disc ml-5\">\n    <% " + record + ".errors.full_messages.each do |message| %>\n      <li><%= message %></li>\n    <% end %>\n    </ul>\n  </div>\n</div>\n<% end %>\n\n"
+  else
+    "<% if " + record + ".errors.any? %>\n<div class=\"errors\" role=\"alert\">\n  <p><%= pluralize(" + record + ".errors.size, \"problem\") %> kept this " + names.human.downcase + " from being saved:</p>\n  <ul>\n  <% " + record + ".errors.full_messages.each do |message| %>\n    <li><%= message %></li>\n  <% end %>\n  </ul>\n</div>\n<% end %>\n\n"
+  end
+end
+
+# _form.eiy: `form_with model: @post`, one field per column. The builder
+# names the fields (`post[title]`), fills them from the record, marks the
+# ones that did not validate, and posts to /posts or, once saved, patches
+# /posts/:id.
 pub def form_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
   return daisy_form_view(names, fields, labels) if daisy
-  out = "<% if @" + names.singular + ".errors.any? %>\n<div class=\"errors\" role=\"alert\">\n  <p><%= @" + names.singular + ".errors.size %> problem(s) kept this " + names.human.downcase + " from being saved:</p>\n  <ul>\n  <% @" + names.singular + ".errors.full_messages.each do |message| %>\n    <li><%= message %></li>\n  <% end %>\n  </ul>\n</div>\n<% end %>\n\n"
-  out += "<form method=\"post\" action=\"<%= @" + names.singular + ".persisted? ? path_to(@" + names.singular + ") : \"/" + names.plural + "\" %>\" class=\"form\">\n"
-  out += "  <%= raw(csrf_field) %>\n"
-  out += "  <% if @" + names.singular + ".persisted? %><input type=\"hidden\" name=\"_method\" value=\"patch\"><% end %>\n"
+  html = error_summary(names, false)
+  multipart = fields.any?(&.attachment?) ? ", multipart: true" : ""
+  html += "<% form_with model: @" + names.singular + multipart + ", class: \"form\" do |f| %>\n"
   fields.each do |field|
-    out += "  <div class=\"field" + "<%= @" + names.singular + ".errors.on(\"" + field.column + "\").empty? ? \"\" : \" field-error\" %>\">\n"
-    out += input_for(names, field, labels)
-    out += "  </div>\n"
+    if field.kind == "bool" && reference_label(field, labels).nil?
+      html += "  <div class=\"field\">\n    <label class=\"check\">" + field_input(names, field, labels) + " " + field.label + "</label>\n  </div>\n"
+    else
+      html += "  <div class=\"field\">\n    <%= f.label :" + field.column + " %>\n    " + field_input(names, field, labels) + "\n  </div>\n"
+    end
   end
-  out += "  <div class=\"actions\">\n    <button type=\"submit\" class=\"button\">Save " + names.human.downcase + "</button>\n  </div>\n</form>\n"
-  out
+  html += "  <div class=\"actions\">\n    <%= f.submit class: \"button\" %>\n  </div>\n<% end %>\n"
+  html
 end
 
 pub def index_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
   return daisy_index_view(names, fields, labels) if daisy
-  shown = fields.reject { |f| f.kind == "text" }
-  shown = fields if shown.empty?
+  shown = fields.reject { |f| f.kind == "text" || f.attachment? }
+  shown = fields.reject(&.attachment?) if shown.empty?
   out = "<% content_for \"title\" do %>" + humanize(names.plural) + "<% end -%>\n"
   out += "<div class=\"page-header\">\n  <h1>" + humanize(names.plural) + "</h1>\n  <%= link_to \"New " + names.human.downcase + "\", \"/" + names.plural + "/new\", class: \"button\" %>\n</div>\n\n"
   out += "<% if @" + names.plural + ".empty? %>\n<p class=\"empty\">No " + humanize(names.plural).downcase + " yet.</p>\n<% else %>\n"
@@ -404,7 +428,7 @@ pub def show_view(names : Names, fields : Array(Field), labels : Hash(String, St
   out = "<% content_for \"title\" do %>" + names.human + " <%= @" + names.singular + ".id %><% end -%>\n"
   out += "<div class=\"page-header\">\n  <h1>" + names.human + " <%= @" + names.singular + ".id %></h1>\n</div>\n\n<dl class=\"details\">\n"
   fields.each do |f|
-    shown = reference_cell("@" + names.singular, f, labels)
+    shown = reference_cell("@" + names.singular, f, labels) || attachment_cell("@" + names.singular, f, false)
     shown ||= f.kind == "text" ? "<div class=\"prose\"><%= @" + names.singular + "." + f.column + " %></div>" : "<%= @" + names.singular + "." + f.column + " %>"
     out += "  <dt>" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</dt>\n  <dd>" + shown + "</dd>\n"
   end
@@ -446,6 +470,19 @@ end
 # Tailwind CSS and daisyUI (the default; `kurt new NAME --css none` skips it)
 # ---------------------------------------------------------------------------
 
+# The classes form_with's builder writes (forms.iyi): they are in no view,
+# so Tailwind is told about them.
+pub FORM_CLASSES_SOURCE = "@source inline(\"input input-error select select-error textarea textarea-error checkbox checkbox-error file-input file-input-error btn btn-primary fieldset-legend w-full\");"
+
+# app.css with the form builder's classes, for an application made before
+# them; nil when it has them.
+pub def with_form_classes(css : String) : String?
+  return nil if css.includes?(FORM_CLASSES_SOURCE)
+  anchor = "@source \"../../views/**/*.eiy\";"
+  return nil unless css.includes?(anchor)
+  css.sub(anchor, anchor + "\n" + FORM_CLASSES_SOURCE)
+end
+
 # app/assets/tailwind/app.css: what `kurt dev` and `kurt build` compile into
 # public/assets/app.css with the Tailwind CLI. The classes are read from the
 # views; daisyUI's two files sit next to this one.
@@ -456,6 +493,7 @@ pub def tailwind_css : String
      with the classes the views in app/views use. */
   @import "tailwindcss" source(none);
   @source "../../views/**/*.eiy";
+  #{FORM_CLASSES_SOURCE}
 
   /* Two themes: light, and dracula as the dark one. Dracula is used when the
      system is in dark mode; data-theme="light" or "dracula" on <html> picks one. */
@@ -474,61 +512,25 @@ pub def tailwind_css : String
   CSS
 end
 
-# " input-error" when the field did not validate, else "".
-def error_class(names : Names, field : Field, kind : String) : String
-  "<%= @" + names.singular + ".errors.on(\"" + field.column + "\").empty? ? \"\" : \" " + kind + "-error\" %>"
-end
-
-def daisy_input_for(names : Names, field : Field, labels : Hash(String, String)) : String
-  record = "@" + names.singular
-  value = "<%= " + record + "." + field.column + " %>"
-  id = names.singular + "_" + field.column
-  name = names.singular + "[" + field.column + "]"
-  # A label tied to its input, styled as daisyUI's legend: screen readers
-  # name the field by it.
-  legend = "      <label class=\"fieldset-legend\" for=\"" + id + "\">" + field.label + "</label>\n"
-  if shown_by = reference_label(field, labels)
-    target = camelize(field.name)
-    return "      <label class=\"fieldset-legend\" for=\"" + id + "\">" + humanize(field.name) + "</label>\n" +
-      "      <select id=\"" + id + "\" name=\"" + name + "\" class=\"select w-full" + error_class(names, field, "select") + "\">\n" +
-      "        <option value=\"\">Select a " + humanize(field.name).downcase + "</option>\n" +
-      "        <% @" + pluralize(underscore(target)) + ".each do |option| %>\n" +
-      "        <option value=\"<%= option.id %>\"<%= option.id == " + record + "." + field.column + " ? \" selected\" : \"\" %>><%= option." + shown_by + " %></option>\n" +
-      "        <% end %>\n      </select>\n"
-  end
-  case field.kind
-  when "text"
-    legend + "      <textarea id=\"" + id + "\" name=\"" + name + "\" rows=\"8\" class=\"textarea w-full" + error_class(names, field, "textarea") + "\">" + value + "</textarea>\n"
-  when "int", "references"
-    legend + "      <input id=\"" + id + "\" type=\"number\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  when "float"
-    legend + "      <input id=\"" + id + "\" type=\"number\" step=\"any\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  when "bool"
-    "      <label class=\"label\">\n        <input type=\"hidden\" name=\"" + name + "\" value=\"0\">\n        <input id=\"" + id + "\" type=\"checkbox\" name=\"" + name + "\" value=\"1\" class=\"checkbox\"<%= " + record + "." + field.column + " ? \" checked\" : \"\" %>>\n        " + field.label + "\n      </label>\n"
-  when "time"
-    legend + "      <input id=\"" + id + "\" type=\"datetime-local\" name=\"" + name + "\" value=\"<%= " + record + "." + field.column + ".to_s(\"%Y-%m-%dT%H:%M\") %>\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  else
-    legend + "      <input id=\"" + id + "\" type=\"text\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full" + error_class(names, field, "input") + "\">\n"
-  end
-end
-
 def daisy_form_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
-  record = "@" + names.singular
-  out = "<% if " + record + ".errors.any? %>\n<div role=\"alert\" class=\"alert alert-error mb-6\">\n  <div>\n    <p class=\"font-semibold\"><%= " + record + ".errors.size %> problem(s) kept this " + names.human.downcase + " from being saved:</p>\n    <ul class=\"list-disc ml-5\">\n    <% " + record + ".errors.full_messages.each do |message| %>\n      <li><%= message %></li>\n    <% end %>\n    </ul>\n  </div>\n</div>\n<% end %>\n\n"
-  out += "<form method=\"post\" action=\"<%= " + record + ".persisted? ? path_to(" + record + ") : \"/" + names.plural + "\" %>\" class=\"card bg-base-100 shadow-sm\">\n"
-  out += "  <div class=\"card-body\">\n"
-  out += "    <%= raw(csrf_field) %>\n"
-  out += "    <% if " + record + ".persisted? %><input type=\"hidden\" name=\"_method\" value=\"patch\"><% end %>\n"
+  html = error_summary(names, true)
+  multipart = fields.any?(&.attachment?) ? ", multipart: true" : ""
+  html += "<% form_with model: @" + names.singular + multipart + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n"
+  html += "  <div class=\"card-body\">\n"
   fields.each do |field|
-    out += "    <fieldset class=\"fieldset\">\n" + daisy_input_for(names, field, labels) + "    </fieldset>\n"
+    if field.kind == "bool" && reference_label(field, labels).nil?
+      html += "    <fieldset class=\"fieldset\">\n      <label class=\"label\">" + field_input(names, field, labels) + " " + field.label + "</label>\n    </fieldset>\n"
+    else
+      html += "    <fieldset class=\"fieldset\">\n      <%= f.label :" + field.column + " %>\n      " + field_input(names, field, labels) + "\n    </fieldset>\n"
+    end
   end
-  out += "    <div class=\"card-actions justify-end mt-4\">\n      <button type=\"submit\" class=\"btn btn-primary\">Save " + names.human.downcase + "</button>\n    </div>\n  </div>\n</form>\n"
-  out
+  html += "    <div class=\"card-actions justify-end mt-4\">\n      <%= f.submit %>\n    </div>\n  </div>\n<% end %>\n"
+  html
 end
 
 def daisy_index_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
-  shown = fields.reject { |f| f.kind == "text" }
-  shown = fields if shown.empty?
+  shown = fields.reject { |f| f.kind == "text" || f.attachment? }
+  shown = fields.reject(&.attachment?) if shown.empty?
   title = humanize(names.plural)
   out = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
   out += "<div class=\"flex items-center justify-between gap-4 mb-6\">\n  <h1 class=\"text-3xl font-bold\">" + title + "</h1>\n  <%= link_to \"New " + names.human.downcase + "\", \"/" + names.plural + "/new\", class: \"btn btn-primary\" %>\n</div>\n\n"
@@ -555,7 +557,7 @@ def daisy_show_view(names : Names, fields : Array(Field), labels : Hash(String, 
   out += "<h1 class=\"text-3xl font-bold mb-6\">" + names.human + " <%= " + record + ".id %></h1>\n\n"
   out += "<div class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body\">\n    <dl class=\"grid gap-4\">\n"
   fields.each do |f|
-    shown = reference_cell(record, f, labels)
+    shown = reference_cell(record, f, labels) || attachment_cell(record, f, true)
     shown ||= f.kind == "text" ? "<div class=\"whitespace-pre-wrap\"><%= " + record + "." + f.column + " %></div>" : "<%= " + record + "." + f.column + " %>"
     out += "      <div>\n        <dt class=\"text-sm font-semibold text-base-content/60\">" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</dt>\n        <dd>" + shown + "</dd>\n      </div>\n"
   end
@@ -656,311 +658,170 @@ def daisy_layout_view(app : String) : String
 end
 
 # ---------------------------------------------------------------------------
-# Authentication: `kurt generate authentication`, after Rails 8's generator.
-# Users with an email address and a bcrypt password, sign-in and sign-out
-# through the cookie session, sign-up, and sign-in required everywhere
-# unless a controller says `allow_unauthenticated_access`.
+# Authentication: the password fields a users scaffold gets when
+# `kurt generate authentication` runs after it (authentication_generators.iyi).
 # ---------------------------------------------------------------------------
 
-pub AUTH_PASSWORD = "password123"
-
-pub def auth_label(column : String) : String
-  humanize(column)
+# One labelled field of a sign-in or sign-up form, through the form
+# builder: `<%= f.email_field :email_address, required: true %>`.
+pub def auth_input(field : String, label : String, kind : String, extra : String, daisy : Bool) : String
+  call = "<%= f." + kind + "_field :" + field + (extra.empty? ? "" : ", " + extra) + " %>"
+  if daisy
+    "    <fieldset class=\"fieldset\">\n      <%= f.label :" + field + ", \"" + label + "\" %>\n      " + call + "\n    </fieldset>\n"
+  else
+    "  <div class=\"field\">\n    <%= f.label :" + field + ", \"" + label + "\" %>\n    " + call + "\n  </div>\n"
+  end
 end
 
-# A new User: the address it signs in with, its password's digest.
-pub def auth_user_model(login : String) : String
+# ---------------------------------------------------------------------------
+# Mailers: `kurt generate mailer User welcome`
+# ---------------------------------------------------------------------------
+
+# `user` or `UserMailer` -> "user_mailer".
+pub def mailer_file_name(name : String) : String
+  base = underscore(name)
+  base.ends_with?("_mailer") ? base : base + "_mailer"
+end
+
+pub def application_mailer : String
   <<-IYI
-  class User < ApplicationRecord
-  #{auth_user_lines(login)}end
+  # The parent of every mailer. `default from:` is who mail is from unless a
+  # mailer says otherwise (MAIL_FROM when this line is taken out).
+  class ApplicationMailer < Mailer
+    default from: "from@example.com"
+  end
 
   IYI
 end
 
-# What a User gets for signing in; also put into a User that exists.
-pub def auth_user_lines(login : String) : String
+pub def mailer_class(name : String, methods : Array(String)) : String
+  file = mailer_file_name(name)
+  html = "class " + camelize(file) + " < ApplicationMailer\n"
+  html += "  @greeting : String = \"\"\n"
+  methods.each do |method|
+    html += "\n  # " + camelize(file) + "." + method + ".deliver_now!\n"
+    html += "  # Its text and HTML: app/views/" + file + "/" + method + ".text.eiy and .html.eiy\n"
+    html += "  def " + method + "\n    @greeting = \"Hi\"\n    mail to: \"to@example.org\", subject: \"" + humanize(method) + "\"\n  end\n"
+  end
+  html + "end\n"
+end
+
+pub def mailer_text_view(name : String, method : String) : String
+  file = mailer_file_name(name)
+  "<%= @greeting %>,\n\nThis is " + camelize(file) + "#" + method + ": app/views/" + file + "/" + method + ".text.eiy\n"
+end
+
+pub def mailer_html_view(name : String, method : String) : String
+  file = mailer_file_name(name)
+  "<h1>" + camelize(file) + "#" + method + "</h1>\n\n<p><%= @greeting %>, find me in app/views/" + file + "/" + method + ".html.eiy</p>\n"
+end
+
+pub def mailer_layout_html : String
+  <<-EIY
+  <!DOCTYPE html>
+  <html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+  </head>
+  <body style="font-family: system-ui, sans-serif; line-height: 1.5; color: #1f2328">
+    <%= content %>
+  </body>
+  </html>
+
+  EIY
+end
+
+pub def mailer_layout_text : String
+  "<%= content %>\n"
+end
+
+pub def mailer_test(name : String, methods : Array(String)) : String
+  klass = camelize(mailer_file_name(name))
+  html = "# Mail is not sent in tests: `deliver_now` keeps it in `deliveries`.\nclear_deliveries\n"
+  methods.each do |method|
+    html += "\n# " + method + "\n"
+    html += "mail = " + klass + "." + method + "\n"
+    html += "assert mail.to == [\"to@example.org\"]\n"
+    html += "assert mail.subject == \"" + humanize(method) + "\"\n"
+    html += "assert mail.body.includes?(\"Hi\")\n"
+    html += "mail.deliver_now\n"
+    html += "assert deliveries.last.subject == \"" + humanize(method) + "\"\n"
+  end
+  html
+end
+
+# ---------------------------------------------------------------------------
+# Jobs: `kurt generate job Welcome`
+# ---------------------------------------------------------------------------
+
+# `welcome` or `WelcomeJob` -> "welcome_job".
+pub def job_file_name(name : String) : String
+  base = underscore(name)
+  base.ends_with?("_job") ? base : base + "_job"
+end
+
+pub def application_job : String
   <<-IYI
-    has_secure_password
+  # The parent of every job. `queue_as :default` and `retry_attempts 5` here
+  # apply to all of them; a job may say otherwise.
+  class ApplicationJob < Job
+  end
 
-    validates :#{login}, presence: true, format: /\\A[^@\\s]+@[^@\\s]+\\z/, uniqueness: true
-    validates :password, length: {minimum: 8}
+  IYI
+end
 
-    before_validation :normalize_#{login}
+pub def job_class(name : String) : String
+  klass = camelize(job_file_name(name))
+  <<-IYI
+  class #{klass} < ApplicationJob
+    queue_as :default
 
-    # Addresses are kept trimmed and lowercase, so "Ada@Example.com " signs in.
-    def normalize_#{login}
-      @#{login} = #{login}.strip.downcase
+    # #{klass}.perform_later(...)! enqueues it; the worker runs this. Answer an
+    # error (hand it up with `!`) and the job is tried again later.
+    def perform(note : String)
+      nil
     end
+  end
 
   IYI
 end
 
-pub def auth_users_migration(login : String, postgres : Bool) : String
+pub def job_test(name : String) : String
+  klass = camelize(job_file_name(name))
+  <<-IYI
+  # Jobs wait in the kurt_jobs table; `perform_enqueued_jobs` runs them here.
+  clear_jobs.as(Nil)
+  #{klass}.perform_later("hello").as(Int64)
+  assert enqueued_jobs.as(Array).size == 1
+  assert perform_enqueued_jobs == 1
+  assert enqueued_jobs.as(Array).empty?
+
+  IYI
+end
+
+# The queue's table: times are Unix seconds, which compare the same on
+# both databases.
+pub def jobs_table_sql(postgres : Bool) : String
   id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
-  time = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
-  <<-SQL
-  -- up
-  CREATE TABLE users (
-    id #{id},
-    #{login} TEXT NOT NULL DEFAULT '',
-    password_digest TEXT NOT NULL DEFAULT '',
-    created_at #{time},
-    updated_at #{time}
-  );
-  CREATE UNIQUE INDEX users_#{login} ON users (#{login});
-
-  -- down
-  DROP TABLE users;
-
-  SQL
+  int = postgres ? "BIGINT" : "INTEGER"
+  "CREATE TABLE kurt_jobs (\n  id " + id + ",\n  queue TEXT NOT NULL DEFAULT 'default',\n  job_class TEXT NOT NULL,\n  arguments TEXT NOT NULL DEFAULT '[]',\n" +
+    "  attempts " + int + " NOT NULL DEFAULT 0,\n  run_at " + int + " NOT NULL,\n  locked_at " + int + ",\n  locked_by TEXT,\n  failed_at " + int + ",\n" +
+    "  last_error TEXT,\n  created_at " + int + " NOT NULL\n);\nCREATE INDEX kurt_jobs_due ON kurt_jobs (run_at);\n"
 end
 
-# For a users table that exists: the digest, and the address when it has none.
-pub def auth_columns_migration(login : String, add_login : Bool) : String
-  up = [] of String
-  down = [] of String
-  if add_login
-    up << "ALTER TABLE users ADD COLUMN " + login + " TEXT NOT NULL DEFAULT '';"
-    down << "ALTER TABLE users DROP COLUMN " + login + ";"
-  end
-  up << "ALTER TABLE users ADD COLUMN password_digest TEXT NOT NULL DEFAULT '';"
-  up << "CREATE UNIQUE INDEX users_" + login + " ON users (" + login + ");"
-  down.unshift("DROP INDEX users_" + login + ";")
-  down << "ALTER TABLE users DROP COLUMN password_digest;"
-  "-- up\n" + up.join("\n") + "\n\n-- down\n" + down.join("\n") + "\n"
+# The table attachments are kept in (storage.iyi).
+pub def attachments_migration(postgres : Bool) : String
+  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres ? "BIGINT" : "INTEGER"
+  "-- up\nCREATE TABLE kurt_attachments (\n  id " + id + ",\n  record_type TEXT NOT NULL,\n  record_id " + int + " NOT NULL,\n  name TEXT NOT NULL,\n" +
+    "  key TEXT NOT NULL,\n  filename TEXT NOT NULL,\n  content_type TEXT NOT NULL,\n  byte_size " + int + " NOT NULL,\n  created_at " + int + " NOT NULL\n);\n" +
+    "CREATE UNIQUE INDEX kurt_attachments_key ON kurt_attachments (key);\n" +
+    "CREATE INDEX kurt_attachments_record ON kurt_attachments (record_type, record_id, name);\n\n-- down\nDROP TABLE kurt_attachments;\n"
 end
 
-# Put into ApplicationController: the rule, and who is signed in.
-pub def auth_application_lines : String
-  <<-IYI
-    before_action :require_authentication
-
-    @current_user : User? = nil
-    @current_user_loaded : Bool = false
-
-    # The signed-in user, or nil; views ask it too:
-    # `<% if user = current_user? %>`.
-    def current_user? : User?
-      unless @current_user_loaded
-        @current_user_loaded = true
-        if id = session_user_id
-          found = User.find?(id)
-          @current_user = found.is_a?(User) ? found : nil
-        end
-      end
-      @current_user
-    end
-
-    # Every action needs a signed-in user unless its controller says
-    # `allow_unauthenticated_access`. A page sends the visitor to /login,
-    # and back to it after signing in.
-    def require_authentication
-      return nil if current_user?
-      if (store = session?) && env.request.method == "GET"
-        store["return_to"] = env.request.path
-      end
-      Unauthorized.new
-    end
-
-  IYI
-end
-
-pub def sessions_controller(login : String) : String
-  <<-IYI
-  class SessionsController < ApplicationController
-    allow_unauthenticated_access only: [:new, :create]
-
-    # GET /login
-    def new
-      render "sessions/new"
-    end
-
-    # POST /login
-    def create
-      if user = User.authenticate_by("#{login}", params[:#{login}].strip.downcase, params[:password])!
-        back = session["return_to"]? || "/"
-        start_session_for(user)
-        redirect_to back, notice: "Signed in."
-      else
-        redirect_to "/login", alert: "Try another email address or password."
-      end
-    end
-
-    # DELETE /logout
-    def destroy
-      terminate_session
-      redirect_to "/login", notice: "Signed out."
-    end
-  end
-
-  IYI
-end
-
-pub def registrations_controller(fields : Array(String)) : String
-  permitted = (fields + ["password", "password_confirmation"]).map { |f| ":" + f }.join(", ")
-  <<-IYI
-  class RegistrationsController < ApplicationController
-    allow_unauthenticated_access
-
-    # GET /signup
-    def new
-      render "registrations/new"
-    end
-
-    # POST /signup
-    def create
-      @user = User.new(registration_params)
-      if @user.save!
-        start_session_for(@user)
-        redirect_to "/", notice: "Welcome!"
-      else
-        render "registrations/new", status: 422
-      end
-    end
-
-    private def registration_params : Hash(String, String)
-      params.require(:user).permit(#{permitted})
-    end
-  end
-
-  IYI
-end
-
-# One labelled input of a sign-in or sign-up form.
-pub def auth_input(id : String, name : String, label : String, type : String, value : String, extra : String, daisy : Bool) : String
-  if daisy
-    "    <fieldset class=\"fieldset\">\n      <label class=\"fieldset-legend\" for=\"" + id + "\">" + label + "</label>\n      <input id=\"" + id + "\" type=\"" + type + "\" name=\"" + name + "\" value=\"" + value + "\" class=\"input w-full\"" + extra + ">\n    </fieldset>\n"
-  else
-    "  <div class=\"field\">\n    <label for=\"" + id + "\">" + label + "</label>\n    <input id=\"" + id + "\" type=\"" + type + "\" name=\"" + name + "\" value=\"" + value + "\"" + extra + ">\n  </div>\n"
-  end
-end
-
-def auth_form(title : String, action : String, inputs : String, button : String, after : String, errors : String, daisy : Bool) : String
-  head = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
-  if daisy
-    head + "<div class=\"mx-auto max-w-sm\">\n  <h1 class=\"text-3xl font-bold mb-6\">" + title + "</h1>\n" + errors +
-      "  <form method=\"post\" action=\"" + action + "\" class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body\">\n    <%= raw(csrf_field) %>\n" + inputs +
-      "    <button type=\"submit\" class=\"btn btn-primary mt-4\">" + button + "</button>\n  </div>\n  </form>\n  <p class=\"mt-4 text-sm\">" + after + "</p>\n</div>\n"
-  else
-    head + "<h1>" + title + "</h1>\n" + errors + "<form method=\"post\" action=\"" + action + "\" class=\"form\">\n  <%= raw(csrf_field) %>\n" + inputs +
-      "  <div class=\"actions\"><button type=\"submit\" class=\"button\">" + button + "</button></div>\n</form>\n<p>" + after + "</p>\n"
-  end
-end
-
-pub def sessions_view(login : String, daisy : Bool) : String
-  link = daisy ? "class=\"link link-primary\" " : ""
-  inputs = auth_input(login, login, auth_label(login), "email", "", " required autofocus autocomplete=\"username\"", daisy) +
-           auth_input("password", "password", "Password", "password", "", " required maxlength=\"72\" autocomplete=\"current-password\"", daisy)
-  auth_form("Sign in", "/login", inputs, "Sign in", "No account yet? <a " + link + "href=\"/signup\">Sign up</a>", "", daisy)
-end
-
-pub def registrations_view(login : String, fields : Array(String), daisy : Bool) : String
-  link = daisy ? "class=\"link link-primary\" " : ""
-  inputs = ""
-  fields.each do |field|
-    type = field == login ? "email" : "text"
-    extra = field == login ? " required autocomplete=\"username\"" : ""
-    inputs += auth_input("user_" + field, "user[" + field + "]", auth_label(field), type, "<%= @user." + field + " %>", extra, daisy)
-  end
-  inputs += auth_input("user_password", "user[password]", "Password", "password", "", " required minlength=\"8\" maxlength=\"72\" autocomplete=\"new-password\"", daisy)
-  inputs += auth_input("user_password_confirmation", "user[password_confirmation]", "Password confirmation", "password", "", " required autocomplete=\"new-password\"", daisy)
-  box = daisy ? "  <div role=\"alert\" class=\"alert alert-error mb-6\">\n    <ul class=\"list-disc ml-5\">\n" : "<div class=\"errors\" role=\"alert\">\n  <ul>\n"
-  close = daisy ? "    </ul>\n  </div>\n" : "  </ul>\n</div>\n"
-  errors = "<% if @user.errors.any? %>\n" + box + "    <% @user.errors.full_messages.each do |message| %><li><%= message %></li><% end %>\n" + close + "<% end %>\n"
-  auth_form("Sign up", "/signup", inputs, "Create account", "Already have one? <a " + link + "href=\"/login\">Sign in</a>", errors, daisy)
-end
-
-# The layout's links: who is signed in and a sign-out button, or the way in.
-pub def auth_nav(daisy : Bool) : String
-  if daisy
-    "<% if current_user? %><li><%= button_to \"Sign out\", \"/logout\", method: :delete %></li><% else %><li><a href=\"/login\">Sign in</a></li><li><a href=\"/signup\">Sign up</a></li><% end %>"
-  else
-    "<% if current_user? %><%= button_to \"Sign out\", \"/logout\", method: :delete, class: \"link\" %><% else %><a href=\"/login\">Sign in</a><a href=\"/signup\">Sign up</a><% end %>"
-  end
-end
-
-pub def auth_routes : Array(String)
-  ["get \"/login\", SessionsController, :new",
-   "post \"/login\", SessionsController, :create",
-   "delete \"/logout\", SessionsController, :destroy",
-   "get \"/signup\", RegistrationsController, :new",
-   "post \"/signup\", RegistrationsController, :create"]
-end
-
-# A user for a test to be signed in as: every text column filled in, the
-# address one of its own (*tag*), so test files do not collide.
-pub def auth_tester(login : String, fields : Array(String), tag : String) : String
-  pairs = [] of String
-  (fields.includes?(login) ? fields : [login] + fields).each do |field|
-    value = field == login || field.includes?("email") ? "tester-" + tag + "@example.com" : "Tester"
-    pairs << "\"" + field + "\" => \"" + value + "\""
-  end
-  pairs << "\"password\" => \"" + AUTH_PASSWORD + "\""
-  pairs << "\"password_confirmation\" => \"" + AUTH_PASSWORD + "\""
-  "User.create({" + pairs.join(", ") + "}).as(User)"
-end
-
-# The line a test gets to be signed in for its requests.
-pub def auth_sign_in_line(login : String, fields : Array(String), tag : String) : String
-  "sign_in_as(" + auth_tester(login, fields, tag) + ")\n"
-end
-
-pub def sessions_test(login : String, fields : Array(String)) : String
-  email = "signin@example.com"
-  form = login + "=signin%40example.com"
-  <<-IYI
-  # Signing up, in and out through the session cookie, as a browser does.
-  # `kurt test` runs this against a freshly migrated test database.
-  app = chain([SessionHandler.new("kurt test session secret, at least 32 bytes"), RouteHandler.new(routes)])
-  #{auth_tester(login, fields, "signin").sub("tester-signin@example.com", email)}
-
-  # the cookie a response set, to send with the next request
-  def cookie_of(res) : String
-    found = ""
-    res.headers.each do |name, value|
-      found = value.split(";")[0] if name.downcase == "set-cookie"
-    end
-    found
-  end
-
-  def with_cookie(request, cookie : String)
-    request.headers["Cookie"] = cookie
-    request
-  end
-
-  assert dispatch(app, "GET", "/login").response.status_code == 200
-  assert dispatch(app, "GET", "/signup").response.status_code == 200
-
-  # a wrong password goes back to the form
-  res = dispatch(app, form_request("POST", "/login", "#{form}&password=wrong-password")).response
-  assert res.status_code == 303
-  assert res.headers["Location"]? == "/login"
-
-  # the right one signs in and leaves a session cookie
-  res = dispatch(app, form_request("POST", "/login", "#{form}&password=#{AUTH_PASSWORD}")).response
-  assert res.status_code == 303
-  assert res.headers["Location"]? == "/"
-  cookie = cookie_of(res)
-  assert !cookie.empty?
-
-  # signing out needs the cookie; without it, the way is to /login
-  assert dispatch(app, "DELETE", "/logout").response.status_code == 302
-  res = dispatch(app, with_cookie(http_request("DELETE", "/logout"), cookie)).response
-  assert res.status_code == 303
-  assert res.headers["Location"]? == "/login"
-
-  # signing up makes a user and signs them in
-  User.#{login}("new-user@example.com").delete_all.as(Int64)
-  res = dispatch(app, form_request("POST", "/signup", "user%5B#{login}%5D=New-User%40example.com&user%5Bpassword%5D=#{AUTH_PASSWORD}&user%5Bpassword_confirmation%5D=#{AUTH_PASSWORD}#{fields.reject { |f| f == login }.map { |f| "&user%5B" + f + "%5D=New" }.join}")).response
-  assert res.status_code == 303
-  assert !cookie_of(res).empty?
-  assert User.#{login}("new-user@example.com").count.as(Int64) == 1   # kept lowercase
-
-  # a password too short is refused, and the form comes back
-  res = dispatch(app, form_request("POST", "/signup", "user%5B#{login}%5D=short%40example.com&user%5Bpassword%5D=short&user%5Bpassword_confirmation%5D=short")).response
-  assert res.status_code == 422
-
-  IYI
+pub def jobs_migration(postgres : Bool) : String
+  "-- up\n" + jobs_table_sql(postgres) + "\n-- down\nDROP TABLE kurt_jobs;\n"
 end
 
 # ---------------------------------------------------------------------------
@@ -1031,7 +892,9 @@ pub def application_config(secret : String) : String
   IYI
 end
 
-pub def application_controller : String
+# *daisy*: `form_with`'s fields get daisyUI's classes.
+pub def application_controller(daisy : Bool = false) : String
+  style = daisy ? "  # The classes form_with gives fields: daisyUI's input, select, btn...\n  form_style :daisyui\n" : ""
   <<-IYI
   # The parent of every controller: filters and helpers the whole
   # application shares.
@@ -1042,8 +905,14 @@ pub def application_controller : String
   #     Unauthorized.new unless session["user_id"]?
   #   end
   class ApplicationController < Controller
-  end
+  #{style}end
   IYI
+end
+
+# The line a Tailwind application's ApplicationController needs for
+# scaffolded forms to look right; nil when it has it already.
+pub def form_style_line(source : String) : String?
+  source.includes?("form_style") ? nil : "  form_style :daisyui\n"
 end
 
 pub def home_controller : String
@@ -1135,7 +1004,9 @@ pub def stylesheet : String
   .form input[type=text], .form input[type=number], .form input[type=datetime-local], .form textarea, .form select {
     font: inherit; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--radius); }
   .form .check { flex-direction: row; align-items: center; gap: .5rem; display: flex; }
-  .field-error input, .field-error textarea, .field-error select { border-color: var(--danger); }
+  .field-error input, .field-error textarea, .field-error select, .form [aria-invalid="true"] { border-color: var(--danger); }
+  .form input[type=email], .form input[type=password] {
+    font: inherit; padding: .45rem .6rem; border: 1px solid var(--line); border-radius: var(--radius); }
   .errors { border: 1px solid var(--danger); background: #ffebe9; border-radius: var(--radius); padding: .5rem 1rem; margin-bottom: 1rem; }
   .flash { padding: .5rem 1rem; border-radius: var(--radius); }
   .flash.notice { background: #dafbe1; color: var(--ok); }
@@ -1157,9 +1028,7 @@ end
 
 # A test of a scaffold, through the routes, without a socket. `kurt test`
 # runs it against a freshly migrated test database.
-# *sign_in*: the line that signs a test in, when the application has
-# `kurt generate authentication`.
-pub def scaffold_test(app : String, names : Names, fields : Array(Field), sign_in : String = "") : String
+pub def scaffold_test(app : String, names : Names, fields : Array(Field)) : String
   body = [] of String
   fields.each do |field|
     value = case field.kind
@@ -1180,7 +1049,6 @@ pub def scaffold_test(app : String, names : Names, fields : Array(Field), sign_i
   # the routes and without a socket.
   #{names.model}.delete_all.as(Int64)
   app = RouteHandler.new(routes)
-  #{sign_in}
   res = dispatch(app, "GET", "/#{names.plural}").response
   assert res.status_code == 200
   #{invalid}
@@ -1238,12 +1106,14 @@ pub def agents_md(app : String) : String
   - `kurt generate model Comment body:text post:references`
   - `kurt generate controller Pages about contact`
   - `kurt generate migration add_slug_to_posts`
+  - `kurt generate mailer User welcome`: app/mailers/user_mailer.iyi, its .text.eiy and .html.eiy views
+  - `kurt generate job Notify`: a background job; `kurt jobs` runs the worker alone
   - `kurt db:migrate`, `kurt db:rollback [STEPS]`, `kurt db:status`, `kurt db:reset` (then seeds)
   - `kurt db:seed`: run db/seeds.iyi (models, `find_or_create_by`, `!` works there).
   - `kurt test`: migrate a fresh test database and run every test/*_test.iyi. Each test file
     starts with test/fixtures/<table>.yml loaded (`ada:` then `column: value` lines; `user: ada`
-    sets user_id, `password:` sets password_digest) and reads a row as `users(:ada)`.
-    `sign_in_as(users(:ada))` signs the next requests in. `!` does not work at a test's top
+    sets user_id, `password:` sets encrypted_password) and reads a row as `users(:ada)`.
+    `sign_in(users(:ada))` signs the next requests in. `!` does not work at a test's top
     level: use `.as(User)`.
   - `kurt build`: a release binary in bin/#{app}, migrations inside. On the server:
     `KURT_ENV=production DATABASE_URL=... SESSION_SECRET=... ./bin/#{app} db:migrate`, then
@@ -1253,7 +1123,7 @@ pub def agents_md(app : String) : String
     GET route without parameters, the local pages they link to, each PATH, and public/. For a
     site with no server: GitHub Pages, Netlify, any web server.
 
-  Field types: string, text, int, float, bool, time, references.
+  Field types: string, text, int, float, bool, time, references, attachment.
 
   ## Models
 
@@ -1275,6 +1145,13 @@ pub def agents_md(app : String) : String
   - `Post.all`, `Post.find(id)` (NotFound when missing), `Post.find?(id)` (nil), `Post.first`, `Post.first?`, `Post.count`
   - `Post.where(published: true).order_desc(:id).paginate(page, per: 20).all`
   - one typed finder per field: `Post.title("Hello").first?`
+  - `Post.joins(:user).where("users.name", "Ada")`, `left_joins`, `distinct`, `select("posts.*, ...")`
+  - `Post.pluck(:title, String)`, `ids`, `sum(:views)`, `average`, `minimum(:at, Time)`, `maximum`
+  - `Post.group_by(:user_id).having("COUNT(*) > ?", [1]).counts` (also sums, averages...);
+    `group_by`, not `group`, and `or_where(other_query)`, not `.or`: both are iyi keywords
+  - `has_many tags : Tag, through: :taggings`
+  - `Post.insert_all([{title: "A"}, {title: "B"}])`, `User.upsert_all(rows, unique_by: :email)`: one
+    statement, no validations or callbacks; the ids written
   - `Post.includes(:user, :comments).all` loads associations with the rows (no N+1);
     `post.user` and `post.comments` then ask nothing more
   - `Post.create(title: "Hi")`, `post.save`, `post.destroy`, `post.increment(:comments_count)`
@@ -1286,7 +1163,7 @@ pub def agents_md(app : String) : String
   - `render "posts/index"` renders app/views/posts/index.eiy in layouts/application.eiy
     (`layout: "admin"`, `layout: false`). A template renders a partial with `render "_form.eiy"`.
   - An action calls models with `!`. The framework answers NotFound with 404, Invalid with 422,
-    Unauthorized with a redirect to /login (401 for JSON), Forbidden with 403, DBError with 503.
+    Unauthorized with a redirect to /users/sign_in (401 for JSON), Forbidden with 403, DBError with 503.
   - Strong parameters: forms send `post[title]`, and
     `params.require(:post).permit(:title, :body)` is the only way to the Hash a model takes
     (`Post.new(h)`, `post.update(h)`, `Post.create(h)`); values are converted to the field types,
@@ -1308,7 +1185,82 @@ pub def agents_md(app : String) : String
     holds that model (starting as a blank one) and its plural an Array of it (starting empty), so
     neither is ever nil. Any other instance variable is declared with its type:
     `@featured : Array(Post) = [] of Post`. Views read them as they are.
-  - Views see the action's locals and the controller's methods; forms print `<%= raw(csrf_field) %>`.
+  - Views see the action's locals and the controller's methods.
+
+  ## Authentication (after `kurt generate authentication`)
+
+  - `authentication :password, :registration, :recovery, :remember_me,
+    :validation` in app/models/user.iyi (also :confirmation, :lock, :tracking, :timeout;
+    their columns are in the users table), `authentication_for "users"` in config/routes.iyi,
+    `authentication_helpers User` in ApplicationController.
+  - `before_action :authenticate_user!` on a controller whose pages need a signed-in user;
+    `current_user` (User?), `user_signed_in?`, `sign_in(user)`, `sign_out(user)` in controllers and views.
+  - Pages: /users/sign_in, /users/sign_up, /users/edit, /users/password/new (`kurt routes` lists them).
+    Kurt ships their controllers and views; `kurt generate authentication:views` / `authentication:controllers` copy
+    them into app/ to change them.
+  - Tests: `sign_in(users(:ada))`; a fixture's `password:` becomes encrypted_password.
+
+  ## Mailers
+
+  ```iyi
+  class UserMailer < ApplicationMailer
+    def welcome(user : User)
+      @user = user
+      mail to: user.email, subject: "Welcome"
+    end
+  end
+  ```
+
+  - Views: app/views/user_mailer/welcome.text.eiy and/or welcome.html.eiy, inside
+    layouts/mailer.text.eiy and layouts/mailer.html.eiy (`<%= content %>`). The text is not escaped.
+  - Send: `UserMailer.welcome(user).deliver_now!`, or `deliver_later!` through a background job. SMTP_URL (`smtp://user:pass@host:587`) sends for
+    real; without it, test keeps mail in `deliveries` (`deliveries.last.subject`, `clear_deliveries`),
+    development prints it to the log, and production answers a DeliveryError (503).
+
+  ## Background jobs
+
+  - `kurt generate job Notify`: app/jobs/notify_job.iyi (`class NotifyJob < ApplicationJob` with
+    `def perform(post : Post, user : User)`), its test, and the kurt_jobs migration.
+  - `NotifyJob.perform_later(post, user)!` enqueues (`wait: 300`, `on: tx`); `perform_now` runs it here.
+    Arguments: String, Int32, Int64, Float64, Bool, Time, nil, arrays, models (kept by id).
+  - The worker runs inside the server (KURT_JOBS_IN_SERVER=0 turns it off) or alone: `kurt jobs`.
+    A job fails by answering an error (`!`); it is retried after attempts⁴ + 2 seconds, 5 times
+    (`retry_attempts 3`). A panic fails the job, not the worker.
+  - Mail: `UserMailer.welcome(user).deliver_later!`.
+  - Tests: `enqueued_jobs`, `perform_enqueued_jobs`, `failed_jobs`, `clear_jobs`.
+
+  ## File uploads
+
+  - `has_one_attached :avatar` (`content_types: [...]`, `max_size: bytes`), `has_many_attached :documents`;
+    `kurt generate attachments` writes the kurt_attachments migration (a scaffold field
+    `avatar:attachment` does it too).
+  - Form: `form_with model: @user, multipart: true` and `f.file_field :avatar`
+    (`multiple: true` for many). Controller: `@user.avatar = uploaded_file(:user, :avatar)` before
+    `save`/`update`; attached after the record saves, validated with it.
+  - `user.avatar.attachment` (Attachment?: url, filename, content_type, byte_size, image?),
+    `user.avatar.url?` in views, `attach(upload)`, `purge`. Files under storage/, served at
+    /files/<key>/<filename>.
+
+  ## Forms
+
+  ```erb
+  <% form_with model: @post do |f| %>
+    <%= f.label :title %>
+    <%= f.text_field :title %>
+    <%= f.text_area :body, rows: 8 %>
+    <%= f.check_box :published %>
+    <%= f.select :user_id, @users.map { |u| {u.name, u.id} }, prompt: "Select a user" %>
+    <%= f.submit %>
+  <% end %>
+  ```
+
+  - `form_with` is a `<% %>` tag, not `<%= %>`. It writes the CSRF field, names the fields
+    `post[title]`, fills them from the record, posts to /posts (or patches /posts/:id once saved),
+    and marks a field that did not validate (`aria-invalid`, and daisyUI's `input-error` with
+    `form_style :daisyui` in ApplicationController).
+  - Without a model: `form_with url: "/search", method: :get do |f|`; `scope: :user` names the fields `user[...]`.
+  - Also: `email_field`, `password_field`, `number_field`, `date_field`, `datetime_field`,
+    `hidden_field`, `file_field` (with `multipart: true`). Each takes HTML attributes (`required: true`).
 
   TXT
 end

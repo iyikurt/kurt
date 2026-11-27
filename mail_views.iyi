@@ -1,0 +1,53 @@
+# The program `mail` (mailers.iyi) runs at compile time:
+# `mail_views CALLER KIND VIEW LAYOUT` prints the iyi source that renders a
+# mail's text (KIND "text") or HTML ("html") part from `VIEW.KIND.eiy`,
+# inside `LAYOUT.KIND.eiy` when that exists and LAYOUT is not empty. A
+# relative VIEW or LAYOUT is beside CALLER, the mailer's file
+# (`../views/user_mailer/welcome`). A part with no view is `nil`; a mail with neither view is refused,
+# with the paths it looked for.
+#
+# A program and not a macro's own `file_exists?`, which may only look inside
+# Kurt's package; this is how iyi-web finds an application's templates.
+# Not a module: `run` finds it beside mailers.iyi.
+module kurt_mail_views
+
+import std/text
+import std/file
+
+def quote(text : String) : String
+  "\"" + text.gsub("\\", "\\\\").gsub("\"", "\\\"").gsub("#", "\\#") + "\""
+end
+
+args = Program.args
+raise "usage: mail_views CALLER KIND VIEW LAYOUT, not #{args.size} arguments" unless args.size == 4
+caller, kind, view, layout = args[0], args[1], args[2], args[3]
+dir = File.dirname(caller)
+
+def located(path : String, dir : String) : String
+  path.starts_with?("/") ? path : dir + "/" + path
+end
+
+view_path = view + "." + kind + ".eiy"
+layout_path = layout + "." + kind + ".eiy"
+has_view = File.exists?(located(view_path, dir))
+has_layout = !layout.empty? && File.exists?(located(layout_path, dir))
+
+if kind == "html" && !has_view && !File.exists?(located(view + ".text.eiy", dir))
+  raise "mail: no " + view + ".text.eiy or .html.eiy for " + caller
+end
+
+if !has_view
+  print "nil"
+elsif kind == "html"
+  if has_layout
+    print "::IyiWeb::Templates.render(" + quote(view_path) + ", " + quote(layout_path) + ")"
+  else
+    print "::IyiWeb::Templates.render(" + quote(view_path) + ")"
+  end
+else
+  code = "begin\n  __kurt_mail_text = ::Kurt::Mailers::TextBuffer.new\n  ::Std::Eiy::Eiy.embed(" + quote(view_path) + ", __kurt_mail_text)\n"
+  if has_layout
+    code += "  content = __kurt_mail_text.to_s\n  __kurt_mail_text = ::Kurt::Mailers::TextBuffer.new\n  ::Std::Eiy::Eiy.embed(" + quote(layout_path) + ", __kurt_mail_text)\n"
+  end
+  print code + "  __kurt_mail_text.to_s\nend"
+end

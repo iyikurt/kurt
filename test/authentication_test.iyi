@@ -1,0 +1,216 @@
+module test/authentication_test
+
+import std/text
+import std/time::{Time}
+import db/db/errors::{DBError}
+import datasource::{database, postgres?}
+import model::*
+import authentication::*
+
+class Account
+  property email : String
+  property encrypted_password : String
+  property name : String
+  property confirmed_at : Time?
+  property confirmation_sent_at : Time?
+  property remember_created_at : Time?
+  property failed_attempts : Int64
+  property locked_at : Time?
+  property sign_in_count : Int64
+  property current_sign_in_at : Time?
+  property last_sign_in_at : Time?
+  property current_sign_in_ip : String?
+  property last_sign_in_ip : String?
+
+  authentication :password, :registration, :recovery, :remember_me, :validation,
+    :confirmation, :lock, :tracking, :timeout, maximum_attempts: 3
+
+  derive model
+end
+
+# The fewest modules: no validation of the address, no lock.
+class Member
+  property email : String
+  property encrypted_password : String
+
+  authentication :password
+
+  derive model
+end
+
+NOTES = [] of String
+
+# Lines of the class's own after `authentication`: every one runs, and so do the
+# ones `authentication` wrote (normalizing the address, validation's checks).
+class Writer
+  property email : String
+  property encrypted_password : String
+  property name : String
+
+  authentication :password, :validation
+  before_validation :note
+  validates :name, presence: true
+  validates :name, length: {maximum: 5}
+
+  derive model
+
+  def note
+    NOTES << "note"
+  end
+end
+
+def setup : Nil | DBError
+  id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres? ? "BIGINT" : "INTEGER"
+  time = postgres? ? "TIMESTAMPTZ" : "DATETIME"
+  ["accounts", "members", "writers"].each { |t| database.exec("DROP TABLE IF EXISTS " + t)! }
+  database.exec("CREATE TABLE writers (id " + id + ", email TEXT NOT NULL DEFAULT '', encrypted_password TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '')")!
+  database.exec("CREATE TABLE accounts (id " + id + ", email TEXT NOT NULL DEFAULT '', encrypted_password TEXT NOT NULL DEFAULT '', name TEXT NOT NULL DEFAULT '', " +
+                "confirmed_at " + time + ", confirmation_sent_at " + time + ", remember_created_at " + time + ", failed_attempts " + int + " NOT NULL DEFAULT 0, locked_at " + time + ", " +
+                "sign_in_count " + int + " NOT NULL DEFAULT 0, current_sign_in_at " + time + ", last_sign_in_at " + time + ", current_sign_in_ip TEXT, last_sign_in_ip TEXT)")!
+  database.exec("CREATE UNIQUE INDEX accounts_email ON accounts (email)")!
+  database.exec("CREATE TABLE members (id " + id + ", email TEXT NOT NULL DEFAULT '', encrypted_password TEXT NOT NULL DEFAULT '')")!
+  nil
+end
+
+def run_all : Nil | DBError | NotFound | Invalid
+  setup!
+  assert Account.authentication?("lock")
+  assert !Member.authentication?("lock")
+
+  # validation: an address, unique; a password of 8 or more, confirmed
+  bad = Account.new(email: "nope", password: "short", password_confirmation: "other")
+  assert !bad.save!
+  assert bad.errors.on("email") == ["is invalid"]
+  assert bad.errors.on("password") == ["is too short (minimum is 8 characters)"]
+  assert bad.errors.on("password_confirmation") == ["doesn't match Password"]
+  blank = Account.new(email: "blank@example.com")
+  assert !blank.save!
+  assert blank.errors.on("password") == ["can't be blank"]
+
+  ada = Account.new(email: " Ada@Example.com ", password: "password123", password_confirmation: "password123")
+  assert ada.save!
+  assert ada.email == "ada@example.com"
+  assert ada.encrypted_password.starts_with?("$2")
+  assert ada.password.nil?
+  assert ada.valid_password?("password123")
+  assert !ada.valid_password?("password124")
+  taken = Account.new(email: "ADA@example.com", password: "password123")
+  assert !taken.save!
+  assert taken.errors.on("email") == ["has already been taken"]
+
+  # a form's fields, and an edit that leaves the password blank keeps it
+  ada.assign({"name" => "Ada", "password" => "", "password_confirmation" => ""})
+  assert ada.save!
+  assert ada.valid_password?("password123")
+
+  # confirmation: not until the address is confirmed
+  case result = Account.authenticate("ada@example.com", "password123")!
+  in AuthFailure then assert result.reason == "unconfirmed"
+  in Account then assert false
+  end
+  token = ada.confirmation_token
+  assert Account.confirm_by_token(token + "0")!.nil?
+  assert Account.confirm_by_token("1-1-abc")!.nil?
+  confirmed = Account.confirm_by_token(token)!.as(Account)
+  assert confirmed.confirmed?
+  assert Account.find(ada.id)!.confirmed?
+
+  # authenticate: by address and password; the same answer for an unknown address
+  signed = Account.authenticate(" ADA@example.com", "password123")!
+  assert signed.is_a?(Account)
+  case unknown = Account.authenticate("who@example.com", "password123")!
+  in AuthFailure then assert unknown.message == "Invalid email or password."
+  in Account then assert false
+  end
+
+  # lock: three wrong passwords lock the account, the second warns
+  assert Account.authenticate("ada@example.com", "wrong-one")!.as(AuthFailure).reason == "invalid"
+  assert Account.authenticate("ada@example.com", "wrong-two")!.as(AuthFailure).reason == "last_attempt"
+  assert Account.authenticate("ada@example.com", "wrong-three")!.as(AuthFailure).reason == "locked"
+  assert Account.authenticate("ada@example.com", "password123")!.as(AuthFailure).reason == "locked"
+  locked = Account.find(ada.id)!
+  assert locked.access_locked?
+  assert locked.failed_attempts == 3
+  unlock = locked.unlock_token
+  assert Account.unlock_by_token(unlock)!.is_a?(Account)
+  assert Account.unlock_by_token(unlock)!.nil?          # used: the lock it signed is gone
+  assert Account.authenticate("ada@example.com", "password123")!.is_a?(Account)
+  assert Account.find(ada.id)!.failed_attempts == 0
+
+  # recovery: a token good until the password changes
+  ada = Account.find(ada.id)!
+  reset = ada.reset_password_token
+  found = Account.with_reset_password_token(reset)!.as(Account)
+  assert !found.reset_password("short", "short")!
+  assert found.errors.on("password") == ["is too short (minimum is 8 characters)"]
+  found = Account.with_reset_password_token(reset)!.as(Account)
+  assert found.reset_password("new-password-1", "new-password-1")!
+  assert Account.with_reset_password_token(reset)!.nil?
+  assert Account.authenticate("ada@example.com", "new-password-1")!.is_a?(Account)
+
+  # remember_me: a cookie's token, void once forgotten
+  ada = Account.find(ada.id)!
+  assert ada.remember_me!
+  remember = ada.remember_token
+  assert Account.from_remember_token(remember)!.as(Account).id == ada.id
+  assert ada.forget_me!
+  assert Account.from_remember_token(remember)!.nil?
+
+  # tracking
+  ada.track_sign_in("10.0.0.1")!
+  ada.track_sign_in("10.0.0.2")!
+  tracked = Account.find(ada.id)!
+  assert tracked.sign_in_count == 2
+  assert tracked.current_sign_in_ip == "10.0.0.2"
+  assert tracked.last_sign_in_ip == "10.0.0.1"
+  assert Account.timeout_in == 1800
+
+  # tokens are signed: another purpose, another id or an expired one do not pass
+  assert token_valid?(sign_token("reset", 5_i64, now_unix + 60, "x"), "reset", 5_i64, "x")
+  assert !token_valid?(sign_token("reset", 5_i64, now_unix + 60, "x"), "confirm", 5_i64, "x")
+  assert !token_valid?(sign_token("reset", 5_i64, now_unix + 60, "x"), "reset", 6_i64, "x")
+  assert !token_valid?(sign_token("reset", 5_i64, now_unix - 1, "x"), "reset", 5_i64, "x")
+  assert token_id(sign_token("reset", 5_i64, now_unix - 1, "x")).nil?
+
+  # bcrypt reads 72 bytes: a longer password is refused, even without validation
+  huge = Member.new(email: "huge", password: "x" * 73)
+  assert !huge.save!
+  assert huge.errors.on("password") == ["is too long (maximum is 72 bytes)"]
+  # a form's hash, and update with a new password
+  from_form = Member.new({"email" => "form", "password" => "from a form", "password_confirmation" => "from a form"})
+  assert from_form.save!
+  assert from_form.valid_password?("from a form")
+  from_form.update(password: "another one", password_confirmation: "another one")!
+  assert Member.find(from_form.id)!.valid_password?("another one")
+
+  # the fewest modules: any address, signed in at once
+  bob = Member.create(email: "bob", password: "x")!
+  assert Member.authenticate("bob", "x")!.as(Member).id == bob.id
+
+  # authentication's own callbacks and validations, with the class's after them
+  w = Writer.new(email: " W@Example.com ", name: "far too long", password: "short")
+  assert !w.save!
+  assert w.email == "w@example.com"
+  assert NOTES == ["note"]
+  assert w.errors.on("name") == ["is too long (maximum is 5 characters)"]
+  assert w.errors.on("password") == ["is too short (minimum is 8 characters)"]
+  bad_address = Writer.new(email: "nope", name: "", password: "password123")
+  assert !bad_address.save!
+  assert bad_address.errors.on("email") == ["is invalid"]
+  assert bad_address.errors.on("name") == ["can't be blank"]
+
+  # rate limiting (off under KURT_ENV=test unless forced)
+  reset_rate_limits
+  3.times { assert !rate_limited?("1.2.3.4 sign_in", limit: 3, force: true) }
+  assert rate_limited?("1.2.3.4 sign_in", limit: 3, force: true)
+  assert !rate_limited?("5.6.7.8 sign_in", limit: 3, force: true)
+  nil
+end
+
+case failure = run_all
+in Nil then puts "authentication: all assertions passed" + (postgres? ? " (postgres)" : "")
+in DBError, NotFound, Invalid
+  STDERR.puts failure.message
+  exit 1
+end

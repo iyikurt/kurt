@@ -1,0 +1,281 @@
+# Form helpers, as Rails' `form_with`: a builder that writes each field's
+# label and input with the record's value, its name in the model's scope
+# (`post[title]`), and the error state from `record.errors`.
+#
+#   <% form_with model: @post do |f| %>
+#     <%= f.label :title %>
+#     <%= f.text_field :title %>
+#     <%= f.text_area :body, rows: 8 %>
+#     <%= f.check_box :published %>
+#     <%= f.select :user_id, @users.map { |u| {u.name, u.id} }, prompt: "Select a user" %>
+#     <%= f.submit %>
+#   <% end %>
+#
+# `form_with` itself is a macro of the controller's (controllers.iyi): it
+# prints the `<form>` tag, the CSRF field and, for a record that is saved
+# already, `_method=patch`, then the block, then `</form>`. A `<% %>` tag,
+# not `<%= %>`: the template writes the form as it goes.
+#
+# The builder's style decides the classes it adds: "plain" adds none, and
+# "daisyui" (what `kurt new` sets up with Tailwind) gives inputs daisyUI's
+# `input`, `select`, `textarea`, `checkbox` and `btn` classes, and a field
+# that did not validate its `input-error` (`select-error`...). Either way an
+# invalid field has `aria-invalid="true"`.
+module forms
+
+import std/text
+import std/html::{HTML}
+import std/time::{Time}
+import db/db/value::{DBValue}
+import web/iyi_web/templates::{SafeHTML}
+import model::{Errors}
+import helpers::{attributes_html}
+import inflector::{humanize, underscore}
+
+pub class FormBuilder
+  # The name fields are kept under: "post" makes `post[title]`; nil makes
+  # them bare (`title`).
+  getter scope : String?
+  getter action : String
+  # What the form sends: get, post, patch, put or delete.
+  getter method : String
+  getter style : String
+  @values : Hash(String, DBValue)
+  @errors : Errors?
+  @persisted : Bool
+  @model_name : String
+  @csrf : String
+  @html_class : String?
+  @multipart : Bool
+  @attrs : String
+
+  def initialize(@scope : String?, @action : String, @method : String, @style : String, @values : Hash(String, DBValue), @errors : Errors?, @persisted : Bool, @model_name : String, @csrf : String, @html_class : String? = nil, @multipart : Bool = false, @attrs : String = "")
+  end
+
+  def daisy? : Bool
+    @style == "daisyui"
+  end
+
+  # `post[title]`, or `title` with no scope.
+  def field_name(field : Symbol | String) : String
+    if scope = @scope
+      scope + "[" + field.to_s + "]"
+    else
+      field.to_s
+    end
+  end
+
+  # `post_title`: what a label's `for` points at.
+  def field_id(field : Symbol | String) : String
+    base = field.to_s.gsub("[", "_").gsub("]", "")
+    if scope = @scope
+      scope + "_" + base
+    else
+      base
+    end
+  end
+
+  # The field's value as the input shows it: "" for nil, a time as a
+  # datetime-local input reads it.
+  def value_of(field : Symbol | String) : String
+    text_of(@values[field.to_s]?)
+  end
+
+  def text_of(value : DBValue) : String
+    case value
+    when Nil  then ""
+    when Time then value.to_s("%Y-%m-%dT%H:%M")
+    else           value.to_s
+    end
+  end
+
+  # The messages validation left on *field*: empty when it passed.
+  def errors_on(field : Symbol | String) : Array(String)
+    if found = @errors
+      name = field.to_s
+      list = found.on(name)
+      # A select for `user_id` shows the messages of `user` too.
+      list = list + found.on(name[0, name.size - 3]) if name.ends_with?("_id")
+      list
+    else
+      [] of String
+    end
+  end
+
+  def error?(field : Symbol | String) : Bool
+    !errors_on(field).empty?
+  end
+
+  # The class an input gets: the one given, or the style's; with the
+  # style's error class when the field did not validate.
+  def classes(field : Symbol | String, kind : String, given : String?) : String?
+    base = given || (daisy? ? default_class(kind) : nil)
+    return base unless error?(field) && daisy?
+    error = kind + "-error"
+    base ? base + " " + error : error
+  end
+
+  def default_class(kind : String) : String?
+    case kind
+    when "input"    then "input w-full"
+    when "select"   then "select w-full"
+    when "textarea" then "textarea w-full"
+    when "checkbox" then "checkbox"
+    when "file"     then "file-input w-full"
+    when "btn"      then "btn btn-primary"
+    when "label"    then "fieldset-legend"
+    else                 nil
+    end
+  end
+
+  def invalid(field : Symbol | String) : String
+    error?(field) ? " aria-invalid=\"true\"" : ""
+  end
+
+  # The opening tag, the CSRF field and `_method`: what `form_with` prints
+  # before its block.
+  def open_tag : SafeHTML
+    verb = @method.downcase
+    form_method = verb == "get" ? "get" : "post"
+    html = "<form action=\"" + HTML.escape(@action) + "\" method=\"" + form_method + "\" accept-charset=\"UTF-8\""
+    html += " enctype=\"multipart/form-data\"" if @multipart
+    html += attributes_html(class: @html_class) + @attrs + ">"
+    html += @csrf if form_method == "post"
+    html += "<input type=\"hidden\" name=\"_method\" value=\"" + HTML.escape(verb) + "\">" unless verb == "get" || verb == "post"
+    SafeHTML.new(html)
+  end
+
+  def close_tag : SafeHTML
+    SafeHTML.new("</form>")
+  end
+
+  # `<label for="post_title">Title</label>`; the text is the field's name,
+  # humanized (`user_id` is "User"), unless given.
+  def label(field : Symbol | String, text : String? = nil, class klass : String? = nil, **attrs) : SafeHTML
+    shown = text || humanize(field.to_s)
+    SafeHTML.new("<label for=\"" + field_id(field) + "\"" + attributes_html(class: klass || (daisy? ? default_class("label") : nil)) + attributes_html(**attrs) + ">" + HTML.escape(shown) + "</label>")
+  end
+
+  # An `<input>` of *type* for *field*, with its value unless *value* is
+  # given; the rest of the attributes as given (`placeholder:`,
+  # `required: true`, `autocomplete: "email"`).
+  def input(type : String, field : Symbol | String, value : String? = nil, class klass : String? = nil, **attrs) : SafeHTML
+    shown = value || value_of(field)
+    SafeHTML.new("<input type=\"" + type + "\" name=\"" + HTML.escape(field_name(field)) + "\" id=\"" + HTML.escape(field_id(field)) + "\" value=\"" + HTML.escape(shown) + "\"" +
+                 attributes_html(class: classes(field, "input", klass)) + invalid(field) + attributes_html(**attrs) + ">")
+  end
+
+  def text_field(field : Symbol | String, **attrs) : SafeHTML
+    input("text", field, **attrs)
+  end
+
+  def email_field(field : Symbol | String, **attrs) : SafeHTML
+    input("email", field, **attrs)
+  end
+
+  def url_field(field : Symbol | String, **attrs) : SafeHTML
+    input("url", field, **attrs)
+  end
+
+  def search_field(field : Symbol | String, **attrs) : SafeHTML
+    input("search", field, **attrs)
+  end
+
+  def telephone_field(field : Symbol | String, **attrs) : SafeHTML
+    input("tel", field, **attrs)
+  end
+
+  # A number; `step: "any"` for a Float64 field.
+  def number_field(field : Symbol | String, **attrs) : SafeHTML
+    input("number", field, **attrs)
+  end
+
+  # Never shows the value: a password is not sent back to the browser.
+  def password_field(field : Symbol | String, **attrs) : SafeHTML
+    input("password", field, "", **attrs)
+  end
+
+  def date_field(field : Symbol | String, **attrs) : SafeHTML
+    raw = @values[field.to_s]?
+    input("date", field, raw.is_a?(Time) ? raw.to_s("%Y-%m-%d") : value_of(field), **attrs)
+  end
+
+  def datetime_field(field : Symbol | String, **attrs) : SafeHTML
+    input("datetime-local", field, **attrs)
+  end
+
+  def hidden_field(field : Symbol | String, value : String? = nil, **attrs) : SafeHTML
+    shown = value || value_of(field)
+    SafeHTML.new("<input type=\"hidden\" name=\"" + HTML.escape(field_name(field)) + "\" id=\"" + HTML.escape(field_id(field)) + "\" value=\"" + HTML.escape(shown) + "\"" + attributes_html(**attrs) + ">")
+  end
+
+  def text_area(field : Symbol | String, value : String? = nil, class klass : String? = nil, **attrs) : SafeHTML
+    shown = value || value_of(field)
+    SafeHTML.new("<textarea name=\"" + HTML.escape(field_name(field)) + "\" id=\"" + HTML.escape(field_id(field)) + "\"" +
+                 attributes_html(class: classes(field, "textarea", klass)) + invalid(field) + attributes_html(**attrs) + ">\n" + HTML.escape(shown) + "</textarea>")
+  end
+
+  # A checkbox sending "1", after a hidden "0" so that an unticked box
+  # still sends the field.
+  def check_box(field : Symbol | String, class klass : String? = nil, **attrs) : SafeHTML
+    raw = @values[field.to_s]?
+    checked = raw == true || raw == 1 || raw == 1_i64 || raw == "1" || raw == "true"
+    SafeHTML.new("<input type=\"hidden\" name=\"" + HTML.escape(field_name(field)) + "\" value=\"0\" autocomplete=\"off\">" +
+                 "<input type=\"checkbox\" name=\"" + HTML.escape(field_name(field)) + "\" id=\"" + HTML.escape(field_id(field)) + "\" value=\"1\"" +
+                 (checked ? " checked" : "") + attributes_html(class: classes(field, "checkbox", klass)) + invalid(field) + attributes_html(**attrs) + ">")
+  end
+
+  # A select of *choices*, `{label, value}` pairs:
+  # `f.select :user_id, @users.map { |u| {u.name, u.id} }, prompt: "Select a user"`.
+  # The option whose value is the field's is selected. `prompt:` (or
+  # `include_blank: true`) adds a first option with no value.
+  def select(field : Symbol | String, choices : Array(Tuple(L, V)), prompt : String? = nil, include_blank : Bool = false, class klass : String? = nil, **attrs) : SafeHTML forall L, V
+    pairs = choices.map { |pair| {pair[0].to_s, pair[1].to_s} }
+    select_tag(field, pairs, prompt, include_blank, klass, attributes_html(**attrs))
+  end
+
+  # A select whose labels are its values: `f.select :role, ["admin", "member"]`.
+  def select(field : Symbol | String, choices : Array(String), prompt : String? = nil, include_blank : Bool = false, class klass : String? = nil, **attrs) : SafeHTML
+    pairs = choices.map { |choice| {choice, choice} }
+    select_tag(field, pairs, prompt, include_blank, klass, attributes_html(**attrs))
+  end
+
+  def select_tag(field : Symbol | String, pairs : Array(Tuple(String, String)), prompt : String?, include_blank : Bool, klass : String?, extra : String) : SafeHTML
+    current = value_of(field)
+    html = "<select name=\"" + HTML.escape(field_name(field)) + "\" id=\"" + HTML.escape(field_id(field)) + "\"" +
+          attributes_html(class: classes(field, "select", klass)) + invalid(field) + extra + ">"
+    if text = prompt
+      html += "<option value=\"\">" + HTML.escape(text) + "</option>"
+    elsif include_blank
+      html += "<option value=\"\"></option>"
+    end
+    pairs.each do |pair|
+      html += "<option value=\"" + HTML.escape(pair[1]) + "\"" + (pair[1] == current ? " selected" : "") + ">" + HTML.escape(pair[0]) + "</option>"
+    end
+    SafeHTML.new(html + "</select>")
+  end
+
+  # A file input, for `has_one_attached`; the form needs `multipart: true`
+  # (`form_with model: @user, multipart: true`). `multiple: true` sends
+  # several (`user[documents][]`), for `has_many_attached`.
+  def file_field(field : Symbol | String, multiple : Bool = false, class klass : String? = nil, **attrs) : SafeHTML
+    name = field_name(field) + (multiple ? "[]" : "")
+    SafeHTML.new("<input type=\"file\" name=\"" + HTML.escape(name) + "\" id=\"" + HTML.escape(field_id(field)) + "\"" + (multiple ? " multiple" : "") +
+                 attributes_html(class: classes(field, "file", klass)) + invalid(field) + attributes_html(**attrs) + ">")
+  end
+
+  # The submit button: "Create Post" for a new record, "Update Post" for a
+  # saved one, unless *text* says otherwise.
+  def submit(text : String? = nil, class klass : String? = nil, **attrs) : SafeHTML
+    shown = text || ((@persisted ? "Update " : "Create ") + humanize(underscore(@model_name)))
+    SafeHTML.new("<button type=\"submit\" name=\"commit\"" + attributes_html(class: klass || (daisy? ? default_class("btn") : nil)) + attributes_html(**attrs) + ">" + HTML.escape(shown) + "</button>")
+  end
+end
+
+# The values a form shows for *record*: each column by name, and the id.
+pub def form_values(record : T) : Hash(String, DBValue) forall T
+  values = {} of String => DBValue
+  T.column_names.zip(record.attributes) { |name, value| values[name] = value }
+  values["id"] = record.id
+  values
+end

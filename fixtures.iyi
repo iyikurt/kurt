@@ -5,7 +5,7 @@
 #   ada:
 #     name: Ada
 #     email: ada@example.com
-#     password: secret123        # a table with password_digest gets its digest
+#     password: secret123        # a table with encrypted_password gets its digest
 #
 #   # test/fixtures/posts.yml
 #   welcome:
@@ -110,7 +110,9 @@ end
 # *value* as the column's type wants it; a String says what is wrong.
 def column_value(value : Any, column : Column) : DBValue | String
   return nil if value.null?
-  case column.type
+  # A column that allows NULL (`Time?`) converts as its type does.
+  kind = column.type.ends_with?("?") ? column.type[0, column.type.size - 1] : column.type
+  case kind
   when "Int64", "Int32"
     if number = value.as_i?
       return number
@@ -157,12 +159,12 @@ pub def fixture_rows(set : FixtureSet, tables : Array(Table), now : Time = Time.
       key, value = pair
       if column = table.columns.find { |c| c.name == key }
         converted = column_value(value, column)
-        return where + key + " " + converted if converted.is_a?(String) && column.type != "String"
+        return where + key + " " + converted if converted.is_a?(String) && column.type != "String" && column.type != "String?"
         columns << key
         values << converted
-      elsif key == "password" && names.includes?("password_digest")
+      elsif key == "password" && names.includes?("encrypted_password")
         password = value.as_s? || value.to_s
-        columns << "password_digest"
+        columns << "encrypted_password"
         values << Bcrypt.hash(password, 4)
       elsif names.includes?(key + "_id")
         label = value.as_s?

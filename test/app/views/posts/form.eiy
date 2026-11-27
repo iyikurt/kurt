@@ -1,0 +1,10 @@
+<% form_with model: @post, class: "card", data_turbo: false do |f| %>
+<%= f.label :title %>
+<%= f.text_field :title, placeholder: "A title" %>
+<%= f.text_area :title, rows: 3 %>
+<%= f.check_box :title %>
+<%= f.select :title, [{"One", "1"}, {"Hello <b>", "Hello <b>"}], prompt: "Pick" %>
+<%= f.password_field :title %>
+<%= f.submit %>
+<% end %>
+<% form_with url: "/login", scope: :session do |g| %><%= g.email_field :email, required: true %><%= g.submit "Sign in" %><% end %>
