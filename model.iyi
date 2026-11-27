@@ -1157,13 +1157,15 @@ end
 # ({minimum:, maximum:, is:, in: 3..20}), format (a regex), inclusion
 # ({in: [...]}) and uniqueness (true). `message:` replaces every message of
 # the line.
+#
+# Each line is a method of its own, named for its fields and the line it is
+# on; `derive model` calls every one, in the order they were written. (A
+# chain through `previous_def` lost the lines a macro wrote, `devise`'s, to
+# the lines written after it: a macro's methods are not among the type's
+# yet when the next line's macro looks.)
 pub macro validates(*fields, presence = nil, length = nil, format = nil, inclusion = nil, uniqueness = nil, message = nil)
-  def __kurt_validations(errors : ::Kurt::Model::Errors) : ::Db::Errors::DBError?
-    {% if @type.methods.any? { |m| m.name == "__kurt_validations" } %}
-      if failure = previous_def
-        return failure
-      end
-    {% end %}
+  {% line = @caller ? @caller.first.line_number : 0 %}
+  def __kurt_validations__{{ fields.map(&.id).join("__").id }}__l{{ line }}(errors : ::Kurt::Model::Errors) : ::Db::Errors::DBError?
     {% for field in fields %}
       {% name = field.id.stringify %}
       {% if presence %}
@@ -1192,14 +1194,11 @@ pub macro validates(*fields, presence = nil, length = nil, format = nil, inclusi
   end
 end
 
-# One callback chain: each line calls its methods after the earlier lines'.
+# One callback line: a method of its own, named for the hook and the
+# methods it calls; `derive model` calls every line of a hook in the order
+# they were written (see `validates` for why not `previous_def`).
 pub macro __kurt_callbacks(hook, names)
-  def __kurt_{{ hook.id }} : ::Db::Errors::DBError?
-    {% if @type.methods.any? { |m| m.name == "__kurt_" + hook.id.stringify } %}
-      if failure = previous_def
-        return failure
-      end
-    {% end %}
+  def __kurt_{{ hook.id }}__{{ names.map(&.id).join("__").id }} : ::Db::Errors::DBError?
     {% for name in names %}
       result = {{ name.id }}
       return result if result.is_a?(::Db::Errors::DBError)
@@ -1801,8 +1800,8 @@ pub macro model(declaration)
   # the model has it) and keeps what they found in `errors`. A DBError when a
   # check that asks the database (uniqueness) or a callback could not run.
   def __kurt_check : Bool | ::Db::Errors::DBError
-    \{% if @type.has_method?("__kurt_before_validation") %}
-      if failure = __kurt_before_validation
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_validation__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1810,14 +1809,18 @@ pub macro model(declaration)
     if pending = @__kurt_cast_errors
       pending.to_h.each { |field, messages| messages.each { |message| found.add(field, message) } }
     end
-    \{% if @type.has_method?("__kurt_validations") %}
-      if failure = __kurt_validations(found)
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_validations__") } %}
+      if failure = \{{ m.name.id }}(found)
         @__kurt_errors = found
         return failure
       end
     \{% end %}
     \{% if @type.has_method?("__kurt_password_checks") %}
       __kurt_password_checks(found)
+    \{% end %}
+    # has_one_attached's checks (storage.iyi), one per attachment.
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_check_") } %}
+      \{{ m.name.id }}(found)
     \{% end %}
     \{% if @type.has_method?("validate") %}
       validate(found)
@@ -1866,8 +1869,8 @@ pub macro model(declaration)
     @__kurt_on = on
     defer (@__kurt_on = nil)
     return false unless __kurt_check!
-    \{% if @type.has_method?("__kurt_before_save") %}
-      if failure = __kurt_before_save
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_save__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1878,8 +1881,8 @@ pub macro model(declaration)
       __kurt_digest_password
     \{% end %}
     if new_record?
-      \{% if @type.has_method?("__kurt_before_create") %}
-        if failure = __kurt_before_create
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_create__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
@@ -1887,26 +1890,33 @@ pub macro model(declaration)
         @created_at = ::Kurt::Model.now
       {% end %}
       @id = ::Kurt::Model.insert_row(self.class.table_name, self.class.column_names, attributes, on)!
-      \{% if @type.has_method?("__kurt_after_create") %}
-        if failure = __kurt_after_create
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_create__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
     else
-      \{% if @type.has_method?("__kurt_before_update") %}
-        if failure = __kurt_before_update
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_update__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
       ::Kurt::Model.update_row(self.class.table_name, self.class.column_names, attributes, @id, on)!
-      \{% if @type.has_method?("__kurt_after_update") %}
-        if failure = __kurt_after_update
+      \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_update__") } %}
+        if failure = \{{ m.name.id }}
           return failure
         end
       \{% end %}
     end
-    \{% if @type.has_method?("__kurt_after_save") %}
-      if failure = __kurt_after_save
+    # Files waiting to be attached (has_one_attached), now that the record
+    # has an id.
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_attach_") } %}
+      if failure = \{{ m.name.id }}
+        return failure
+      end
+    \{% end %}
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_save__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1940,8 +1950,8 @@ pub macro model(declaration)
   def __kurt_destroy(on : ::Kurt::Model::Transaction?) : self | ::Kurt::Model::NotFound | ::Db::Errors::DBError
     @__kurt_on = on
     defer (@__kurt_on = nil)
-    \{% if @type.has_method?("__kurt_before_destroy") %}
-      if failure = __kurt_before_destroy
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_before_destroy__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
@@ -1952,8 +1962,13 @@ pub macro model(declaration)
     \{% end %}
     gone = ::Kurt::Model.delete_row(self.class.table_name, @id, on)!
     return ::Kurt::Model::NotFound.new({{ declaration[:name] }}) if gone == 0
-    \{% if @type.has_method?("__kurt_after_destroy") %}
-      if failure = __kurt_after_destroy
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_purge_") } %}
+      if failure = \{{ m.name.id }}
+        return failure
+      end
+    \{% end %}
+    \{% for m in @type.methods.select { |m| m.name.starts_with?("__kurt_after_destroy__") } %}
+      if failure = \{{ m.name.id }}
         return failure
       end
     \{% end %}
