@@ -15,15 +15,14 @@ def run : Nil | DBError
   bool = postgres? ? "BOOLEAN NOT NULL DEFAULT FALSE" : "INTEGER NOT NULL DEFAULT 0"
   stamp = postgres? ? "TIMESTAMP" : "TEXT"
   ["authors", "books"].each { |t| db.exec("DROP TABLE IF EXISTS " + t)! }
-  db.exec("CREATE TABLE authors (id " + id + ", name TEXT NOT NULL, email TEXT NOT NULL, admin " + bool + ", password_digest TEXT NOT NULL DEFAULT '', created_at " + stamp + ", updated_at " + stamp + ")")!
+  db.exec("CREATE TABLE authors (id " + id + ", name TEXT NOT NULL, email TEXT NOT NULL, admin " + bool + ", encrypted_password TEXT NOT NULL DEFAULT '', created_at " + stamp + ", updated_at " + stamp + ")")!
   db.exec("CREATE TABLE books (id " + id + ", title TEXT NOT NULL, price " + int + ", author_id " + int + " NOT NULL, published_at " + stamp + ")")!
   tables = [
     Table.new("authors", [Column.new("id", "", "Int64"), Column.new("name", "", "String"), Column.new("email", "", "String"),
-                          Column.new("admin", "", "Bool"), Column.new("password_digest", "", "String"),
+                          Column.new("admin", "", "Bool"), Column.new("encrypted_password", "", "String"),
                           Column.new("created_at", "", "Time"), Column.new("updated_at", "", "Time")]),
     Table.new("books", [Column.new("id", "", "Int64"), Column.new("title", "", "String"), Column.new("price", "", "Int64"),
                         Column.new("author_id", "", "Int64"), Column.new("published_at", "", "Time?")]),
-    Table.new("members", [Column.new("id", "", "Int64"), Column.new("email", "", "String"), Column.new("encrypted_password", "", "String")]),
   ]
 
   # ids: the same every run, below 2^30, different per label
@@ -41,12 +40,10 @@ def run : Nil | DBError
   assert rows[0].values[1] == "1984"                       # a number in a text column is its text
   assert rows[0].values[3] == fixture_id("ada")            # author: ada
   authors = fixture_rows(sets[0], tables).as(Array(FixtureRow))
-  assert authors[0].columns.includes?("password_digest")   # password: becomes a digest
+  assert authors[0].columns.includes?("encrypted_password")   # password: becomes a digest
   assert !authors[0].columns.includes?("password")
   assert authors[0].columns.includes?("created_at")        # timestamps filled in
   assert rows[0].values[4].is_a?(Time)                      # a column that allows NULL converts too
-  members = fixture_rows(parse_fixtures("members", "members.yml", "ada:\n  email: a@b.c\n  password: secret123\n").as(FixtureSet), tables).as(Array(FixtureRow))
-  assert members[0].columns == ["id", "email", "encrypted_password"]   # kurt generate authentication's column
 
   # what is wrong is said, with the file and the label
   bad = parse_fixtures("books", "books.yml", "x:\n  nope: 1\n").as(FixtureSet)
@@ -66,7 +63,7 @@ def run : Nil | DBError
   end
   assert db.scalar("SELECT COUNT(*) FROM books").as(Int64) == 2
   assert db.query_one("SELECT name FROM authors WHERE id = " + fixture_id("bob").to_s, as: String).as(String) == "Bob: the second"
-  digest = db.query_one("SELECT password_digest FROM authors WHERE id = " + fixture_id("ada").to_s, as: String).as(String)
+  digest = db.query_one("SELECT encrypted_password FROM authors WHERE id = " + fixture_id("ada").to_s, as: String).as(String)
   assert Bcrypt.verify("secret123", digest)
   admin = db.query_one("SELECT admin FROM authors WHERE id = " + fixture_id("ada").to_s, as: Bool).as(Bool)
   assert admin

@@ -87,7 +87,7 @@ end
 pub def test_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import web/iyi_web/router::{RouteHandler}",
    "import web/iyi_web/harness::*", "import web/iyi_web/handler::{chain}", "import web/iyi_web/session::{SessionHandler}",
-   "import kurt/model::*", "import kurt/controllers::{sign_in_as, sign_in, sign_out}", "import app/models::*", "import app/routes::*",
+   "import kurt/model::*", "import kurt/controllers::{sign_in, sign_out}", "import app/models::*", "import app/routes::*",
    "import kurt/mailers::{deliveries, clear_deliveries, Message}", "import app/mailers::*",
    "import kurt/jobs::{enqueued_jobs, failed_jobs, clear_jobs, make_jobs_due}", "import app/jobs::*",
    "import app/fixtures::*"]

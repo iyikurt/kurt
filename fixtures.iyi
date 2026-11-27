@@ -5,7 +5,7 @@
 #   ada:
 #     name: Ada
 #     email: ada@example.com
-#     password: secret123        # a table with encrypted_password (or password_digest) gets its digest
+#     password: secret123        # a table with encrypted_password gets its digest
 #
 #   # test/fixtures/posts.yml
 #   welcome:
@@ -162,10 +162,9 @@ pub def fixture_rows(set : FixtureSet, tables : Array(Table), now : Time = Time.
         return where + key + " " + converted if converted.is_a?(String) && column.type != "String" && column.type != "String?"
         columns << key
         values << converted
-      elsif key == "password" && (names.includes?("encrypted_password") || names.includes?("password_digest"))
+      elsif key == "password" && names.includes?("encrypted_password")
         password = value.as_s? || value.to_s
-        # kurt generate authentication's column, or has_secure_password's.
-        columns << (names.includes?("encrypted_password") ? "encrypted_password" : "password_digest")
+        columns << "encrypted_password"
         values << Bcrypt.hash(password, 4)
       elsif names.includes?(key + "_id")
         label = value.as_s?

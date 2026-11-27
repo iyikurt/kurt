@@ -497,9 +497,7 @@ def gen_scaffold(app : String, names : Names, fields : Array(Field)) : Nil
   add_route("resources \"" + names.plural + "\", " + names.controller)
   add_nav(names)
   ensure_attachments_table if fields.any?(&.attachment?)
-  test = scaffold_test(app, names, fields.reject(&.attachment?), auth_sign_in(names.plural))
-  # With authentication, the signed-in tester is one of the users.
-  test = test.gsub("User.count.as(Int64) == 0", "User.count.as(Int64) == 1") if names.model == "User" && auth_app?
+  test = scaffold_test(app, names, fields.reject(&.attachment?))
   write("test/" + names.plural + "_test.iyi", test)
 end
 
@@ -570,47 +568,6 @@ end
 # generate authentication
 # ---------------------------------------------------------------------------
 
-AUTH_MARKER = "app/controllers/sessions_controller.iyi"
-
-def auth_app? : Bool
-  File.exists?(AUTH_MARKER)
-end
-
-# The users table's text columns (not the digest), from db/schema.json or,
-# before it is migrated, from its create migration.
-def user_text_columns : Array(String)
-  skip = ["id", "password_digest", "created_at", "updated_at"]
-  if table = find(read_schema, "users")
-    return table.columns.select { |c| c.type == "String" || c.type == "String?" }.map(&.name).reject { |n| skip.includes?(n) }
-  end
-  found = [] of String
-  return found unless Dir.exists?("db/migrations")
-  file = Dir.entries("db/migrations").sorted.find { |f| f.ends_with?("_create_users.sql") }
-  return found if file.nil?
-  File.read("db/migrations/" + file).lines.each do |line|
-    parts = line.strip.split(" ")
-    next if parts.size < 2 || skip.includes?(parts[0]) || parts[0] == "--"
-    type = parts[1].upcase
-    found << parts[0] if type.starts_with?("TEXT") || type.starts_with?("VARCHAR")
-  end
-  found
-end
-
-# The column a user signs in with: email_address, or an email column the
-# users table has.
-def auth_login(columns : Array(String)) : String
-  return "email_address" if columns.includes?("email_address")
-  return "email" if columns.includes?("email")
-  "email_address"
-end
-
-# The line that signs a generated test in; empty without authentication.
-def auth_sign_in(tag : String) : String
-  return "" unless auth_app?
-  columns = user_text_columns
-  auth_sign_in_line(auth_login(columns), columns, tag)
-end
-
 def insert_after_line(path : String, line_start : String, text : String) : Bool
   return false unless File.exists?(path)
   source = File.read(path)
@@ -646,7 +603,6 @@ def gen_authentication(app : String, extra : Array(String)) : Nil
   if File.exists?(model_file)
     model = File.read(model_file)
     fail(model_file + " has `authentication` already") if auth_modules_of(model)
-    fail(model_file + " uses has_secure_password, the authentication Kurt generated before; take it out (and SessionsController, RegistrationsController, their views and routes) first") if model.includes?("has_secure_password")
     insert_after_line(model_file, "class User", auth_model_line(modules))
     existing = [] of String
     if table = find(read_schema, "users")

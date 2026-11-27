@@ -69,17 +69,6 @@ class Pin
   derive model
 end
 
-# has_secure_password over password_digest.
-class Person
-  property email_address : String
-  property password_digest : String
-
-  has_secure_password
-  validates :password, length: {minimum: 8}
-
-  derive model
-end
-
 # A callback that writes in the save's own transaction.
 class Account
   property name : String
@@ -339,7 +328,6 @@ def setup : Nil | DBError
   int = postgres? ? "BIGINT" : "INTEGER"
   bool = postgres? ? "BOOLEAN NOT NULL DEFAULT FALSE" : "INTEGER NOT NULL DEFAULT 0"
   ["comments", "posts", "users", "members", "likes", "accounts", "people", "pins"].each { |t| db.exec("DROP TABLE IF EXISTS " + t)! }
-  db.exec("CREATE TABLE people (id " + id + ", email_address TEXT NOT NULL, password_digest TEXT NOT NULL DEFAULT '')")!
   db.exec("CREATE TABLE pins (id " + id + ", post_id " + int + " NOT NULL)")!
   db.exec("CREATE TABLE likes (id " + id + ", comment_id " + int + " NOT NULL)")!
   db.exec("CREATE TABLE accounts (id " + id + ", name TEXT NOT NULL)")!
@@ -563,45 +551,6 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert Like.count! == 0                         # delete_all under each comment
   assert CALLS == ["comment destroyed", "comment destroyed"]
   assert Comment.find(keep.id)!.body == "other"   # another post's comment stays
-
-  # has_secure_password
-  nopass = Person.new(email_address: "p@example.com")
-  assert !nopass.valid?
-  assert nopass.errors.on("password") == ["can't be blank"]
-  short = Person.new(email_address: "p@example.com", password: "short")
-  assert !short.valid?
-  assert short.errors.on("password") == ["is too short (minimum is 8 characters)"]
-  mismatch = Person.new(email_address: "p@example.com", password: "long enough", password_confirmation: "different")
-  assert !mismatch.valid?
-  assert mismatch.errors.on("password_confirmation") == ["doesn't match Password"]
-  huge = Person.new(email_address: "p@example.com", password: "x" * 73)
-  assert !huge.valid?
-  assert huge.errors.on("password").includes?("is too long (maximum is 72 bytes)")
-
-  pat = Person.create(email_address: "pat@example.com", password: "correct horse", password_confirmation: "correct horse")!
-  assert pat.password_digest.starts_with?("$2b$")
-  assert !pat.password_digest.includes?("correct horse")
-  assert pat.password.nil?                        # not kept once saved
-  assert pat.authenticate("correct horse")
-  assert !pat.authenticate("wrong horse")
-  case found = Person.authenticate_by("email_address", "pat@example.com", "correct horse")
-  in Person then assert found.id == pat.id
-  in Nil, DBError then assert false
-  end
-  assert Person.authenticate_by("email_address", "pat@example.com", "wrong horse")!.nil?
-  assert Person.authenticate_by("email_address", "nobody@example.com", "correct horse")!.nil?
-
-  # an edit form's empty password keeps the old one; a new one replaces it
-  digest = pat.password_digest
-  pat.update({"email_address" => "pat@example.com", "password" => "", "password_confirmation" => ""})!
-  assert pat.errors.empty?
-  assert Person.find(pat.id)!.password_digest == digest
-  pat.update(password: "battery staple", password_confirmation: "battery staple")!
-  assert Person.find(pat.id)!.authenticate("battery staple")
-  assert !Person.find(pat.id)!.authenticate("correct horse")
-  from_form = Person.new({"email_address" => "form@example.com", "password" => "from a form", "password_confirmation" => "from a form"})
-  assert from_form.save!
-  assert from_form.authenticate("from a form")
 
   # includes: associations load with the rows, one query each
   Comment.delete_all!

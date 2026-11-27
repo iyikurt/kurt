@@ -97,11 +97,11 @@ class OpenController < ApplicationController
 end
 
 class PublicController < ApplicationController
-  before_action :require_authentication
-  allow_unauthenticated_access
+  before_action :require_badge!
+  skip_before_action :require_badge!
 
-  def require_authentication
-    Unauthorized.new
+  def require_badge : Unauthorized?
+    Unauthorized.new unless params[:badge] == "yes"
   end
 
   def index
@@ -180,7 +180,7 @@ assert res.body == "<html><body><ul></ul>\n</body></html>\n"
 # the filter stops create without the token: Unauthorized -> /login
 res = dispatch(app, form_request("POST", "/posts", "post%5Btitle%5D=Hello")).response
 assert res.status_code == 302
-assert res.headers["Location"]? == "/login"
+assert res.headers["Location"]? == "/users/sign_in"
 assert Post.count.as(Int64) == 0
 
 # invalid: 422 and the form again, with the message
@@ -219,7 +219,7 @@ res = dispatch(app, form_request("POST", "/posts/1/delete", "token=secret")).res
 assert res.status_code == 303
 assert Post.count.as(Int64) == 0
 
-# skip_before_action and allow_unauthenticated_access
+# skip_before_action: for one action, and for every one (with a filter written with `!`)
 assert dispatch(app, "GET", "/open").response.body == "open"
 assert dispatch(app, "GET", "/closed").response.status_code == 302
 assert dispatch(app, "GET", "/public").response.body == "public"

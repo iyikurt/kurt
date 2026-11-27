@@ -1244,16 +1244,8 @@ pub macro after_destroy(*names)
 end
 
 # ---------------------------------------------------------------------------
-# Passwords: `has_secure_password`, as in Rails, over a `password_digest`
-# column. bcrypt, from std/password.
-#
-#   class User < ApplicationRecord
-#     has_secure_password
-#   end
-#
-#   user = User.create(email_address: "ada@example.com", password: "s3cret-pass", password_confirmation: "s3cret-pass")!
-#   user.authenticate("s3cret-pass")                                   # true
-#   User.authenticate_by("email_address", "ada@example.com", "s3cret-pass")!   # the user, or nil
+# Passwords: bcrypt, from std/password, for `authentication :password`
+# (authentication.iyi).
 # ---------------------------------------------------------------------------
 
 # bcrypt's cost: the lowest in tests, where every user hashes a password.
@@ -1270,107 +1262,12 @@ pub def verify_password(attempt : String, digest : String) : Bool
   Bcrypt.verify(attempt, digest)
 end
 
-# What `authenticate_by` checks a password against when no record has the
+# What `authenticate` checks a password against when no record has the
 # value, so that a miss takes as long as a wrong password.
 DUMMY_DIGEST = "$2b$11$xIbZPOBwibM7ga01aso2t.tTpKxzprSE7YWt7sJ/ZxxJyVCPjfeUe"   # Bcrypt.hash("kurt: no such user", 11)
 
 pub def dummy_digest : String
   DUMMY_DIGEST
-end
-
-# Rails' rules: required while there is no digest yet, at most 72 bytes
-# (all bcrypt reads), and the confirmation, when one was given, the same.
-pub def check_password(errors : Errors, password : String?, confirmation : String?, digest : String) : Nil
-  if password.nil? || password.empty?
-    errors.add("password", "can't be blank") if digest.empty?
-    return
-  end
-  errors.add("password", "is too long (maximum is 72 bytes)") if password.bytesize > 72
-  if confirmation && confirmation != password
-    errors.add("password_confirmation", "doesn't match Password")
-  end
-end
-
-pub macro has_secure_password
-  @[::Db::Serializable::DBField(ignore: true)]
-  @__kurt_password : String? = nil
-
-  @[::Db::Serializable::DBField(ignore: true)]
-  @__kurt_password_confirmation : String? = nil
-
-  # The password being set: nil once it has been saved as the digest is
-  # not; it is never read back from the database.
-  def password : String?
-    @__kurt_password
-  end
-
-  # An empty password is no password, as in Rails: an edit form left blank
-  # keeps the old one.
-  def password=(value : String?) : String?
-    @__kurt_password = value && !value.empty? ? value : nil
-  end
-
-  def password_confirmation : String?
-    @__kurt_password_confirmation
-  end
-
-  def password_confirmation=(value : String?) : String?
-    @__kurt_password_confirmation = value
-  end
-
-  # `User.new(email_address: "...", password: "...")` and `User.create(...)`.
-  def self.new(*, password : String, password_confirmation : String? = nil, **fields)
-    record = new(**fields)
-    record.password = password
-    record.password_confirmation = password_confirmation
-    record
-  end
-
-  # `user.update(password: "...", password_confirmation: "...")`.
-  def update(*, password : String, password_confirmation : String? = nil, **fields)
-    self.password = password
-    @__kurt_password_confirmation = password_confirmation
-    update(**fields)
-  end
-
-  def __kurt_password_checks(errors : ::Kurt::Model::Errors) : Nil
-    ::Kurt::Model.check_password(errors, @__kurt_password, @__kurt_password_confirmation, password_digest)
-  end
-
-  # Turns a password that was set into the digest, just before the write.
-  def __kurt_digest_password : Nil
-    if plain = @__kurt_password
-      @password_digest = ::Kurt::Model.digest_password(plain) unless plain.empty?
-    end
-    @__kurt_password = nil
-    @__kurt_password_confirmation = nil
-  end
-
-  # A form's `password` and `password_confirmation`. Empty ones are kept as
-  # they came: on an edit form, an empty password leaves the old one.
-  def __kurt_assign_password(attributes : Hash(String, String)) : Nil
-    if raw = attributes["password"]?
-      self.password = raw
-    end
-    if raw = attributes["password_confirmation"]?
-      @__kurt_password_confirmation = raw
-    end
-  end
-
-  # True when *attempt* is this record's password.
-  def authenticate(attempt : String) : Bool
-    ::Kurt::Model.verify_password(attempt, password_digest)
-  end
-
-  # The record whose *column* is *value* and whose password *password* is;
-  # nil otherwise. A miss checks a password too, so it takes as long.
-  def self.authenticate_by(column : String, value : String, password : String) : self | Nil | ::Db::Errors::DBError
-    if record = query.where(column, value).first?!
-      return record.authenticate(password) ? record : nil
-    end
-    ::Kurt::Model.verify_password(password, ::Kurt::Model.dummy_digest)
-    nil
-  end
 end
 
 # Maps the class to its table. Writes, from the fields above it:

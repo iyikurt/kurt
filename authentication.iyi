@@ -271,11 +271,6 @@ pub macro authentication(*modules, authentication_key = :email, password_length 
     ::Kurt::Model.verify_password(attempt, encrypted_password)
   end
 
-  # has_secure_password's name for it.
-  def authenticate(attempt : String) : Bool
-    valid_password?(attempt)
-  end
-
   # Addresses are kept trimmed and lowercase, so "Ada@Example.com " signs in.
   def __kurt_auth_normalize
     @{{ key }} = {{ key }}.strip.downcase
@@ -318,15 +313,6 @@ pub macro authentication(*modules, authentication_key = :email, password_length 
       return ::Kurt::Authentication::AuthFailure.new("unconfirmed") unless record.confirmed?
     {% end %}
     record
-  end
-
-  # has_secure_password's form: the record, or nil.
-  def self.authenticate_by(column : String, value : String, password : String) : self | Nil | ::Db::Errors::DBError
-    if record = query.where(column, value).first?!
-      return record.valid_password?(password) ? record : nil
-    end
-    ::Kurt::Model.verify_password(password, ::Kurt::Model.dummy_digest)
-    nil
   end
 
   {% if names.includes?("validation") %}

@@ -658,16 +658,9 @@ def daisy_layout_view(app : String) : String
 end
 
 # ---------------------------------------------------------------------------
-# Authentication: what is left of the generator Kurt had before the
-# one in authentication_generators.iyi: the password fields a users
-# scaffold gets, and the sign-in line of tests in applications made with it.
+# Authentication: the password fields a users scaffold gets when
+# `kurt generate authentication` runs after it (authentication_generators.iyi).
 # ---------------------------------------------------------------------------
-
-pub AUTH_PASSWORD = "password123"
-
-pub def auth_label(column : String) : String
-  humanize(column)
-end
 
 # One labelled field of a sign-in or sign-up form, through the form
 # builder: `<%= f.email_field :email_address, required: true %>`.
@@ -678,24 +671,6 @@ pub def auth_input(field : String, label : String, kind : String, extra : String
   else
     "  <div class=\"field\">\n    <%= f.label :" + field + ", \"" + label + "\" %>\n    " + call + "\n  </div>\n"
   end
-end
-
-# A user for a test to be signed in as: every text column filled in, the
-# address one of its own (*tag*), so test files do not collide.
-pub def auth_tester(login : String, fields : Array(String), tag : String) : String
-  pairs = [] of String
-  (fields.includes?(login) ? fields : [login] + fields).each do |field|
-    value = field == login || field.includes?("email") ? "tester-" + tag + "@example.com" : "Tester"
-    pairs << "\"" + field + "\" => \"" + value + "\""
-  end
-  pairs << "\"password\" => \"" + AUTH_PASSWORD + "\""
-  pairs << "\"password_confirmation\" => \"" + AUTH_PASSWORD + "\""
-  "User.create({" + pairs.join(", ") + "}).as(User)"
-end
-
-# The line a test gets to be signed in for its requests.
-pub def auth_sign_in_line(login : String, fields : Array(String), tag : String) : String
-  "sign_in_as(" + auth_tester(login, fields, tag) + ")\n"
 end
 
 # ---------------------------------------------------------------------------
@@ -1053,9 +1028,7 @@ end
 
 # A test of a scaffold, through the routes, without a socket. `kurt test`
 # runs it against a freshly migrated test database.
-# *sign_in*: the line that signs a test in, when the application has
-# `kurt generate authentication`.
-pub def scaffold_test(app : String, names : Names, fields : Array(Field), sign_in : String = "") : String
+pub def scaffold_test(app : String, names : Names, fields : Array(Field)) : String
   body = [] of String
   fields.each do |field|
     value = case field.kind
@@ -1076,7 +1049,6 @@ pub def scaffold_test(app : String, names : Names, fields : Array(Field), sign_i
   # the routes and without a socket.
   #{names.model}.delete_all.as(Int64)
   app = RouteHandler.new(routes)
-  #{sign_in}
   res = dispatch(app, "GET", "/#{names.plural}").response
   assert res.status_code == 200
   #{invalid}
@@ -1140,7 +1112,7 @@ pub def agents_md(app : String) : String
   - `kurt db:seed`: run db/seeds.iyi (models, `find_or_create_by`, `!` works there).
   - `kurt test`: migrate a fresh test database and run every test/*_test.iyi. Each test file
     starts with test/fixtures/<table>.yml loaded (`ada:` then `column: value` lines; `user: ada`
-    sets user_id, `password:` sets password_digest) and reads a row as `users(:ada)`.
+    sets user_id, `password:` sets encrypted_password) and reads a row as `users(:ada)`.
     `sign_in(users(:ada))` signs the next requests in. `!` does not work at a test's top
     level: use `.as(User)`.
   - `kurt build`: a release binary in bin/#{app}, migrations inside. On the server:
@@ -1191,7 +1163,7 @@ pub def agents_md(app : String) : String
   - `render "posts/index"` renders app/views/posts/index.eiy in layouts/application.eiy
     (`layout: "admin"`, `layout: false`). A template renders a partial with `render "_form.eiy"`.
   - An action calls models with `!`. The framework answers NotFound with 404, Invalid with 422,
-    Unauthorized with a redirect to /login (401 for JSON), Forbidden with 403, DBError with 503.
+    Unauthorized with a redirect to /users/sign_in (401 for JSON), Forbidden with 403, DBError with 503.
   - Strong parameters: forms send `post[title]`, and
     `params.require(:post).permit(:title, :body)` is the only way to the Hash a model takes
     (`Post.new(h)`, `post.update(h)`, `Post.create(h)`); values are converted to the field types,

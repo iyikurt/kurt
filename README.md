@@ -661,7 +661,7 @@ place, `install_error_pages`:
 |---|---|
 | `NotFound` | 404 |
 | `Invalid` | 422 with the list of errors (from `Post.create(...)!`; a scaffold form draws its own with `if post.save!`) |
-| `Unauthorized` | A redirect to the sign-in page (`/users/sign_in` from `authenticate_user!`, else `/login`); 401 for JSON |
+| `Unauthorized` | A redirect to the sign-in page, `/users/sign_in`; 401 for JSON |
 | `TooManyRequests` | 429, with `Retry-After` |
 | `Forbidden` | 403 |
 | `DBError` | 503; the details go only to the log |
@@ -1105,7 +1105,7 @@ kurt generate authentication:controllers  # app/controllers/user_sessions_contro
 A copy in the application is used instead of Kurt's; delete it to go back.
 Kurt's own are written into `.kurt/build/authentication/` at every build.
 
-In tests, `sign_in(users(:ada))` (or `sign_in_as`) makes the following
+In tests, `sign_in(users(:ada))` makes the following
 requests as that user, and `sign_out` undoes it. It works only with
 `KURT_ENV=test`, which `kurt test` sets. A fixture's `password:` becomes
 its `encrypted_password`.
@@ -1113,11 +1113,6 @@ its `encrypted_password`.
 Not yet: signing in with another service (OAuth), confirming a changed address,
 more than one model signing in from the same session at once, and sessions
 stored in the database so they can be ended remotely.
-
-Applications made with Kurt's earlier generator keep working:
-`has_secure_password`, `authenticate_by`, `sign_in_as` and
-`allow_unauthenticated_access` are still there. `kurt generate
-authentication` refuses to run over them.
 
 ## Seeds and test fixtures
 
@@ -1146,7 +1141,7 @@ comes back. A test reads a record by its label: `users(:ada)`.
 ada:
   name: Ada
   email: ada@example.com
-  password: password123      # becomes encrypted_password (or password_digest): a bcrypt digest
+  password: password123      # becomes encrypted_password: a bcrypt digest
 
 # test/fixtures/posts.yml
 welcome:

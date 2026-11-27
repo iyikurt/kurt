@@ -173,6 +173,17 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert !token_valid?(sign_token("reset", 5_i64, now_unix - 1, "x"), "reset", 5_i64, "x")
   assert token_id(sign_token("reset", 5_i64, now_unix - 1, "x")).nil?
 
+  # bcrypt reads 72 bytes: a longer password is refused, even without validation
+  huge = Member.new(email: "huge", password: "x" * 73)
+  assert !huge.save!
+  assert huge.errors.on("password") == ["is too long (maximum is 72 bytes)"]
+  # a form's hash, and update with a new password
+  from_form = Member.new({"email" => "form", "password" => "from a form", "password_confirmation" => "from a form"})
+  assert from_form.save!
+  assert from_form.valid_password?("from a form")
+  from_form.update(password: "another one", password_confirmation: "another one")!
+  assert Member.find(from_form.id)!.valid_password?("another one")
+
   # the fewest modules: any address, signed in at once
   bob = Member.create(email: "bob", password: "x")!
   assert Member.authenticate("bob", "x")!.as(Member).id == bob.id

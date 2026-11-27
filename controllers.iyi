@@ -244,35 +244,6 @@ pub class Controller
     false
   end
 
-  # The signed-in user's id, kept in the session by `start_session_for`;
-  # nil when nobody is signed in. In a test, the one `sign_in_as` named.
-  def session_user_id : Int64?
-    if forced = ::Kurt::Controllers.test_user_id("User")
-      return forced
-    end
-    store = session?
-    return nil if store.nil?
-    raw = store["user_id"]?
-    raw ? raw.to_i64? : nil
-  end
-
-  # Signs *user* in: a new session id first, so an id someone planted
-  # before the login is worth nothing after it.
-  def start_session_for(user : T) : Nil forall T
-    store = session
-    store.regenerate
-    store["user_id"] = user.id.to_s
-    nil
-  end
-
-  # Signs out: the session is emptied and its cookie deleted.
-  def terminate_session : Nil
-    if store = session?
-      store.clear
-    end
-    nil
-  end
-
   # A link: `<%= link_to "Edit", path_to(post) + "/edit", class: "btn" %>`.
   # The text is escaped; a SafeHTML one (an icon, `raw(...)`) is not. Other
   # attributes follow: `target: "_blank"`, `data_turbo: false`.
@@ -318,7 +289,7 @@ pub class Controller
     FormBuilder.new(name.empty? ? nil : name, action, verb, form_style, form_values(model), model.errors, saved, T.model_name, csrf_field, html_class, multipart, attrs)
   end
 
-  # A form with no record: `form_with url: "/login" do |f|`; fields are
+  # A form with no record: `form_with url: "/search" do |f|`; fields are
   # bare (`email`) unless `scope:` names one.
   def __kurt_form_builder(model : Nil, url : String?, method : Symbol | String | Nil, scope : Symbol | String | Nil, html_class : String?, multipart : Bool, attrs : String) : FormBuilder
     verb = method ? method.to_s : "post"
@@ -433,7 +404,7 @@ pub macro before_action(name, only = nil, except = nil)
 end
 
 # Leaves out a filter a parent class set, for every action or only some:
-# `skip_before_action :require_authentication, only: [:new, :create]`.
+# `skip_before_action :authenticate_user!, only: [:new, :create]`.
 pub macro skip_before_action(name, only = nil, except = nil)
   def __kurt_skip?(filter : String, action : String) : Bool
     {% if @type.methods.any? { |m| m.name == "__kurt_skip?" } %}
@@ -452,53 +423,34 @@ pub macro skip_before_action(name, only = nil, except = nil)
   end
 end
 
-# Pages anyone may see once `kurt generate authentication` has made sign-in
-# the rule: `allow_unauthenticated_access only: [:index, :show]`, or every
-# action of the controller without arguments.
-pub macro allow_unauthenticated_access(only = nil, except = nil)
-  ::Kurt::Controllers.skip_before_action(:require_authentication, {{ only }}, {{ except }})
-end
-
-# Who `sign_in_as` signed in for the test process: "User:5", ":5" for a
-# bare id (any model), "" for nobody.
+# Who `sign_in` signed in for the test process: "User:5", or "" for
+# nobody.
 TEST_USER = Mutex.new { "" }
 
 # In a test, makes every request after it signed in as *user*, without a
 # sign-in form or a cookie. Refused anywhere but KURT_ENV=test, which
 # `kurt test` sets: a server never runs this.
-pub def sign_in_as(user : T) : Nil forall T
-  force_test_user(T.model_name + ":" + user.id.to_s)
-end
-
-pub def sign_in_as(id : Int64) : Nil
-  force_test_user(":" + id.to_s)
-end
-
-# `sign_in_as`, by the name controllers use for it.
 pub def sign_in(user : T) : Nil forall T
-  sign_in_as(user)
-end
-
-def force_test_user(who : String) : Nil
-  raise "sign_in_as is for tests, and KURT_ENV is " + env unless env == "test"
+  raise "sign_in is for tests, and KURT_ENV is " + env unless env == "test"
+  who = T.model_name + ":" + user.id.to_s
   TEST_USER.update { |_| who }
   nil
 end
 
-# Undoes `sign_in_as`.
+# Undoes `sign_in`.
 pub def sign_out : Nil
   TEST_USER.update { |_| "" }
   nil
 end
 
-# The id `sign_in_as` signed in as a *model*, in a test; nil anywhere else.
+# The id `sign_in` signed in as a *model*, in a test; nil anywhere else.
 pub def test_user_id(model : String) : Int64?
   return nil unless env == "test"
   who = TEST_USER.get { |value| value }
   return nil unless who.is_a?(String)
   return nil if who.empty?
   name, _, id = who.partition(":")
-  return nil unless name.empty? || name == model
+  return nil unless name == model
   id.to_i64?
 end
 
@@ -908,7 +860,7 @@ end
 # The default answers for the errors actions hand up. Register the
 # application's own pages for a type before calling this: pages are tried
 # in the order they were registered.
-pub def install_error_pages(router : Router, login_path : String = "/login") : Nil
+pub def install_error_pages(router : Router, login_path : String = "/users/sign_in") : Nil
   install_health_check(router)
   router.error NotFound do |env, err|
     env.response.status_code = 404
