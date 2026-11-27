@@ -1,17 +1,32 @@
-<p align="center"><img src="kurt.svg" alt="Kurt" width="160"></p>
+<p align="center">
+  <img src="kurt.svg" alt="Kurt" width="160">
+  <p align="center">
+    An MVC web framework for <a href="https://iyi.dev">iyi</a>.<br>
+    Models, controllers, views and generators, compiled to one native binary.
+  </p>
+  <p align="center">
+    <img src="https://img.shields.io/badge/iyi-0.21+-BE0E29?style=for-the-badge" alt="iyi 0.21+">
+    <img src="https://img.shields.io/badge/version-0.1.0-960720?style=for-the-badge" alt="version 0.1.0">
+    <img src="https://img.shields.io/badge/license-MIT-FDA4AF?style=for-the-badge&labelColor=2A0A12" alt="MIT license">
+  </p>
+</p>
 
-# Kurt
+## Features
 
-Kurt is an MVC web framework for [iyi](https://iyi.dev). It builds on two
-libraries:
-- [iyi-web](https://github.com/sdogruyol/iyi-web): HTTP, routing,
-  templates, sessions and CSRF.
-- [db](https://github.com/iyilang/db): SQL, connection pools and
-  transactions.
+- **Models** — a class per table, its fields read from the schema; validations, callbacks,
+  associations (`has_many :through` too), `joins`, `pluck`, calculations, `insert_all` and `upsert_all`.
+- **Controllers and views** — REST routes from one line, filters, strong parameters,
+  `.eiy` templates that escape by default, `form_with` and view helpers.
+- **Authentication** — `kurt generate authentication`: sign-up, sign-in, password reset,
+  remember me, confirmation, locking, with signed tokens and rate limiting.
+- **Mail and jobs** — mailers with text and HTML templates over SMTP, and background jobs on a
+  database queue with retries; `deliver_later` joins the two.
+- **File uploads** — `has_one_attached`, `has_many_attached`, disk storage and served files.
+- **SQLite and PostgreSQL** — the same application on either, with SQL migrations.
+- **Tooling** — generators, `kurt dev` with hot reload, `kurt test` with fixtures, Tailwind CSS and
+  daisyUI with no Node, `kurt build` for one release binary, `kurt export` for a static site.
 
-Kurt adds the conventions on top: models, controllers, migrations,
-generators and a CLI. An application compiles ahead of time to one native
-binary.
+## Quick Start
 
 ```sh
 kurt new blog
@@ -21,7 +36,38 @@ kurt db:migrate
 kurt dev            # http://localhost:3000/posts
 ```
 
-Requirements:
+Kurt builds on two libraries:
+- [iyi-web](https://github.com/sdogruyol/iyi-web): HTTP, routing,
+  templates, sessions and CSRF.
+- [db](https://github.com/iyilang/db): SQL, connection pools and
+  transactions.
+
+## Credits
+
+Kurt's design and most of its API come from
+[Ruby on Rails](https://rubyonrails.org). Each part follows a Rails library:
+
+| Kurt | After |
+|---|---|
+| Models, queries, validations, callbacks, associations | Active Record |
+| Controllers, filters, strong parameters | Action Controller |
+| Views, `form_with` | Action View |
+| Mailers | Action Mailer |
+| Background jobs | Active Job |
+| File uploads | Active Storage |
+| `kurt generate authentication` | [Devise](https://github.com/heartcombo/devise)'s design |
+
+Kurt keeps Rails' names where iyi allows them, so that someone who knows
+Rails knows Kurt. It differs where iyi does:
+- Errors are values that `!` hands up, not exceptions.
+- Types are checked when the application compiles.
+- `group` and `.or` are iyi keywords, so Kurt uses `group_by` and
+  `or_where`.
+
+Kurt is not part of the Rails project and is not endorsed by it.
+
+## Requirements
+
 - iyi 0.21.0 or later (tested with 0.22.0).
 - A C compiler (`cc`); on Windows, the Visual C++ build tools iyi links with.
 - SQLite (macOS ships it; on Windows `make install` fetches it).
