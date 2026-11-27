@@ -382,6 +382,33 @@ Post.where(published: true).or_where(Post.where(user_id: 5)).all!
   hash keyed by the group's value. `group_by(:user_id).count` counts the
   groups.
 
+### Bulk writes
+
+```iyi
+Post.insert_all([{title: "A", user_id: 1}, {title: "B", user_id: 1}])!     # Array(Int64): the new ids
+User.upsert_all([{email: "ada@example.com", name: "Ada"},
+                 {email: "bob@example.com", name: "Bob"}], unique_by: :email)!
+```
+
+- Each is one `INSERT ... VALUES (...), (...) RETURNING id`, on SQLite
+  and PostgreSQL alike. No model is made, and no validation or callback
+  runs.
+- `insert_all` skips a row that would break a unique index
+  (`ON CONFLICT DO NOTHING`). With `skip_duplicates: false`, such a row
+  makes the statement fail.
+- `upsert_all` inserts the rows, and updates every other column of a row
+  whose `unique_by` columns (`:email`, or `[:account_id, :email]`) match
+  one there already (`ON CONFLICT (...) DO UPDATE`). The row keeps its id
+  and `created_at`. `unique_by` needs a unique index on those columns.
+- The rows are named tuples of one shape, or hashes with the same keys
+  (`Hash(String, DBValue)`). `created_at` and `updated_at` are filled when
+  the table has them and the rows do not.
+- Both take `on: tx`.
+- The answer has the ids of the rows written. A row skipped, or left alone
+  because only its key was given, is not among them.
+- The databases limit how many values one statement binds (SQLite 32,766;
+  PostgreSQL 65,535). Split a larger batch.
+
 ### has_many :through
 
 ```iyi

@@ -997,6 +997,77 @@ pub def increment_column(table : String, column : String, by : Int64, id : Int64
   write_rows("UPDATE " + table + " SET " + column + " = " + column + " + ? WHERE id = ?", args, on)
 end
 
+# ---------------------------------------------------------------------------
+# Bulk writes: many rows in one statement, without models, validations or
+# callbacks, as Rails' insert_all and upsert_all.
+# ---------------------------------------------------------------------------
+
+# The columns and values of *rows* (named tuples of one shape, or hashes
+# with the same keys), with `created_at` and `updated_at` filled when the
+# table has them and the rows do not.
+def bulk_rows(rows : Array(R), columns : Array(String)) : Tuple(Array(String), Array(DBValue)) | DBError forall R
+  names = [] of String
+  values = [] of DBValue
+  {% if R <= NamedTuple %}
+    {% for key in R.keys %}
+      names << {{ key.stringify }}
+    {% end %}
+  {% else %}
+    rows[0].each_key { |key| names << key }
+  {% end %}
+  names.each do |name|
+    return DBError.new("insert_all: no column " + name) unless columns.includes?(name) || name == "id"
+  end
+  stamps = ["created_at", "updated_at"].select { |c| columns.includes?(c) && !names.includes?(c) }
+  now = Time.utc
+  rows.each do |row|
+    {% if R <= NamedTuple %}
+      {% for key in R.keys %}
+        values << row[{{ key.symbolize }}].as(DBValue)
+      {% end %}
+    {% else %}
+      return DBError.new("insert_all: every row needs the same keys as the first") unless row.size == names.size
+      names.each do |name|
+        return DBError.new("insert_all: a row has no " + name) unless row.has_key?(name)
+        values << row[name].as(DBValue)
+      end
+    {% end %}
+    stamps.each { |_| values << now }
+  end
+  {names + stamps, values}
+end
+
+# INSERT ... VALUES (...), (...) RETURNING id: the ids of the rows written.
+# *conflict* is the ON CONFLICT clause, or "".
+def bulk_write(table : String, names : Array(String), values : Array(DBValue), conflict : String, on : Transaction?) : Array(Int64) | DBError
+  marks = "(" + names.map { |_| "?" }.join(", ") + ")"
+  count = names.empty? ? 0 : values.size // names.size
+  sql = "INSERT INTO " + table + " (" + names.join(", ") + ") VALUES " + (Array.new(count) { marks }).join(", ") + conflict + " RETURNING id"
+  if tx = on
+    tx.connection.query_all(placeholders(sql), args: values, as: Int64)
+  else
+    database.query_all(placeholders(sql), args: values, as: Int64)
+  end
+end
+
+pub def insert_all(table : String, columns : Array(String), rows : Array(R), skip_duplicates : Bool, on : Transaction?) : Array(Int64) | DBError forall R
+  return [] of Int64 if rows.empty?
+  names, values = bulk_rows(rows, columns)!
+  bulk_write(table, names, values, skip_duplicates ? " ON CONFLICT DO NOTHING" : "", on)
+end
+
+pub def upsert_all(table : String, columns : Array(String), rows : Array(R), unique_by : Array(String), on : Transaction?) : Array(Int64) | DBError forall R
+  return [] of Int64 if rows.empty?
+  names, values = bulk_rows(rows, columns)!
+  unique_by.each do |key|
+    return DBError.new("upsert_all: unique_by " + key + " is not among the rows' columns") unless names.includes?(key)
+  end
+  # A row that is there already keeps its id and created_at, and takes the rest.
+  changed = names.reject { |n| unique_by.includes?(n) || n == "id" || n == "created_at" }
+  action = changed.empty? ? " DO NOTHING" : " DO UPDATE SET " + changed.map { |n| n + " = excluded." + n }.join(", ")
+  bulk_write(table, names, values, " ON CONFLICT (" + unique_by.join(", ") + ")" + action, on)
+end
+
 # An UPDATE or DELETE, in *on* when there is one; how many rows it touched.
 def write_rows(sql : String, args : Array(DBValue), on : Transaction?) : Int64 | DBError
   if tx = on
@@ -1645,6 +1716,26 @@ pub macro model(declaration)
     record = new(**fields)
     return ::Kurt::Model::Invalid.new({{ declaration[:name] }}, record.errors) unless record.save(on: on)!
     record
+  end
+
+  # Many rows in one INSERT, without validations or callbacks: the ids of
+  # the rows written. A row that would break a unique index is skipped
+  # (ON CONFLICT DO NOTHING) unless `skip_duplicates: false`, which makes it
+  # an error. `created_at` and `updated_at` are filled when not given.
+  #
+  #   Post.insert_all([{title: "A", user_id: 1}, {title: "B", user_id: 1}])!
+  def self.insert_all(rows : Array(R), skip_duplicates : Bool = true, on : ::Kurt::Model::Transaction? = nil) : Array(Int64) | ::Db::Errors::DBError forall R
+    ::Kurt::Model.insert_all(table_name, column_names, rows, skip_duplicates, on)
+  end
+
+  # Inserts the rows, or updates the ones whose *unique_by* columns match a
+  # row there already (ON CONFLICT ... DO UPDATE), in one statement; their
+  # ids. *unique_by* needs a unique index on those columns.
+  #
+  #   User.upsert_all([{email: "ada@example.com", name: "Ada"}], unique_by: :email)!
+  def self.upsert_all(rows : Array(R), unique_by : Symbol | Array(Symbol), on : ::Kurt::Model::Transaction? = nil) : Array(Int64) | ::Db::Errors::DBError forall R
+    keys = unique_by.is_a?(Symbol) ? [unique_by.to_s] : unique_by.map(&.to_s)
+    ::Kurt::Model.upsert_all(table_name, column_names, rows, keys, on)
   end
 
   # The first row with these *fields*, or a new one created with them, so

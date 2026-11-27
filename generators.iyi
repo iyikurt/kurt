@@ -1146,6 +1146,8 @@ pub def agents_md(app : String) : String
   - `Post.group_by(:user_id).having("COUNT(*) > ?", [1]).counts` (also sums, averages...);
     `group_by`, not `group`, and `or_where(other_query)`, not `.or`: both are iyi keywords
   - `has_many tags : Tag, through: :taggings`
+  - `Post.insert_all([{title: "A"}, {title: "B"}])`, `User.upsert_all(rows, unique_by: :email)`: one
+    statement, no validations or callbacks; the ids written
   - `Post.includes(:user, :comments).all` loads associations with the rows (no N+1);
     `post.user` and `post.comments` then ask nothing more
   - `Post.create(title: "Hi")`, `post.save`, `post.destroy`, `post.increment(:comments_count)`

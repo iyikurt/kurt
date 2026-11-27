@@ -297,8 +297,38 @@ def run_queries : Nil | DBError | NotFound | Invalid
   assert Note.where(views: 10).where(writer_id: ada.id).or_where(Note.where(views: 5)).count! == 2
   assert Note.joins(:writer).where("writers.name", "Ada").or_where(Note.joins(:writer).where("writers.name", "Bob")).count! == 3
 
+  # insert_all: one statement, ids back; a duplicate is skipped
+  database.exec("CREATE UNIQUE INDEX tags_name ON tags (name)")!
+  ids = Tag.insert_all([{name: "green"}, {name: "red"}, {name: "gold"}])!
+  assert ids.size == 2                                  # red was there
+  assert Tag.where(name: "green").first!.id == ids[0]
+  assert Tag.count! == 4
+  assert Tag.insert_all([{name: "red"}], skip_duplicates: false).is_a?(DBError)
+  assert Tag.insert_all([] of NamedTuple(name: String))!.empty?
+  assert Tag.insert_all([{nope: "x"}]).is_a?(DBError)
+  # hashes work too
+  assert Tag.insert_all([{"name" => "pink"} of String => DBValue])!.size == 1
+  # timestamps are filled in
+  User.insert_all([{name: "Bulk", email: "bulk@example.com", admin: false}])!
+  assert User.email("bulk@example.com").count! == 1
+
+  # upsert_all: new rows inserted, existing ones updated, by a unique column
+  database.exec("CREATE UNIQUE INDEX writers_name ON writers (name)")!
+  before = Writer.where(name: "Ada").first!.id
+  upserted = Note.upsert_all([{id: one.id, title: "One!", writer_id: ada.id, views: 11, score: 1.5},
+                              {id: 9999_i64, title: "New", writer_id: bob.id, views: 1, score: 0.5}], unique_by: :id)!
+  assert upserted.size == 2
+  assert Note.find(one.id)!.title == "One!"
+  assert Note.find(one.id)!.views == 11
+  assert Note.find(9999_i64)!.title == "New"
+  same = Writer.upsert_all([{name: "Ada"}, {name: "Dee"}], unique_by: :name)!
+  assert same.size == 1                               # only the key given: a row there is left alone (DO NOTHING) and not returned
+  assert Writer.where(name: "Ada").first!.id == before
+  assert Writer.count! == 4
+  assert Writer.upsert_all([{name: "X"}], unique_by: :nope).is_a?(DBError)
+
   # delete_all through a join
-  assert Remark.joins("INNER JOIN notes ON notes.id = remarks.note_id").where("notes.title", "One").delete_all! == 2
+  assert Remark.joins("INNER JOIN notes ON notes.id = remarks.note_id").where("notes.title", "One!").delete_all! == 2
   assert Remark.count! == 1
   nil
 end
