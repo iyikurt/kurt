@@ -1,4 +1,4 @@
-# View helpers, as in Rails, for the templates in app/views:
+# View helpers for the templates in app/views:
 #
 #   <%= link_to "Posts", "/posts", class: "btn" %>
 #   <%= button_to "Delete", path_to(post), method: :delete, confirm: "Delete this post?" %>
@@ -48,7 +48,7 @@ pub def number_with_delimiter(number : Int32 | Int64, delimiter : String = ",") 
   (number < 0 ? "-" : "") + groups.join(delimiter)
 end
 
-# How long ago *from* was, in Rails' words: "less than a minute",
+# How long ago *from* was, in words: "less than a minute",
 # "5 minutes", "about 2 hours", "3 days", "about 1 month", "over 1 year".
 pub def time_ago_in_words(from : Time, now : Time = Time.utc) : String
   distance_of_time_in_words(from, now)
@@ -111,7 +111,7 @@ pub def attributes_html(**attrs) : String
       out += " " + name
     elsif value == false
       # data-turbo="false" means something; a plain attribute set to false
-      # (disabled: false) is left out, as in Rails.
+      # (disabled: false) is left out.
       out += " " + name + "=\"false\"" if name.starts_with?("data-")
     elsif !value.nil?
       out += " " + name + "=\"" + HTML.escape(value.to_s) + "\""

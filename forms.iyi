@@ -1,4 +1,4 @@
-# Form helpers, as Rails' `form_with`: a builder that writes each field's
+# Form helpers, `form_with`: a builder that writes each field's
 # label and input with the record's value, its name in the model's scope
 # (`post[title]`), and the error state from `record.errors`.
 #

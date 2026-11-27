@@ -6,7 +6,7 @@ import db/db/errors::{DBError}
 import datasource::{database, postgres?}
 import model::*
 import jobs::*
-import generators::{jobs_table_sql}
+import cmd/kurt/generators::{jobs_table_sql}
 
 pub class Person
   property name : String

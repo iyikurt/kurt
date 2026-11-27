@@ -85,7 +85,7 @@ end
 
 CALLS = [] of String
 
-# Rails-style validations and callbacks.
+# Validations and callbacks.
 class Member
   property name : String
   property email : String
@@ -364,7 +364,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert ali.persisted?
   ayse = User.create(name: "Ayse", email: "ayse@example.com", admin: true)!
 
-  # save answers a Bool and keeps the reasons on the record, as in Rails
+  # save answers a Bool and keeps the reasons on the record
   draft = User.new(name: "", email: "x@example.com")
   assert draft.errors.empty?                    # nothing has run yet
   assert draft.save! == false
@@ -460,7 +460,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert Post.where(user_id: ali.id).delete_all! == 0
   assert Post.where(user_id: 2).delete_all! == 2
 
-  # validates: every rule, with Rails' messages
+  # validates: every rule, with its messages
   bad = Member.new(name: "", email: "nope", role: "guest", nickname: "x")
   assert !bad.valid?
   assert bad.errors.on("name") == ["can't be blank"]
@@ -474,7 +474,7 @@ def run_all : Nil | DBError | NotFound | Invalid
   assert Member.new(name: "root", email: "r@b.co", role: "admin", user_id: 1).valid? == false   # validate still runs
   CALLS.clear
 
-  # callbacks, in Rails' order; before_validation normalises before the checks
+  # callbacks, in order; before_validation normalises before the checks
   ayse = Member.new(name: "Ayse", email: "  AYSE@Example.COM ", role: "member", user_id: 1)
   assert ayse.save!
   assert ayse.email == "ayse@example.com"

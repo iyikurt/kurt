@@ -10,7 +10,7 @@
 #     belongs_to user : User         # relations go ABOVE the derive: a
 #     has_many comments : Comment    # derive reads the declarations above it
 #
-#     validates :title, presence: true   # Rails' validations and callbacks,
+#     validates :title, presence: true   # validations and callbacks,
 #     before_save :set_slug              # also above the derive
 #
 #     derive model
@@ -325,7 +325,7 @@ pub class Query(T)
   end
 
   # GROUP BY: `group_by(:user_id)`; with `counts`, `sums`... for a value
-  # per group. (Rails' `group`: in iyi, `group` is the task group.)
+  # per group. (Not `group`: in iyi, `group` is the task group.)
   def group_by(*columns : Symbol | String) : Query(T)
     @preloaded = nil
     list = @groups || [] of String
@@ -345,7 +345,7 @@ pub class Query(T)
   end
 
   # The rows of either query: `Post.where(published: true).or_where(Post.where(user_id: 5))`,
-  # Rails' `.or` (in iyi, `.or` is the error recovery). Each side's
+  # not `.or` (in iyi, `.or` is the error recovery). Each side's
   # conditions stay together; joins, order and the rest are this query's.
   def or_where(other : Query(T)) : Query(T)
     @preloaded = nil
@@ -1005,7 +1005,7 @@ end
 
 # ---------------------------------------------------------------------------
 # Bulk writes: many rows in one statement, without models, validations or
-# callbacks, as Rails' insert_all and upsert_all.
+# callbacks.
 # ---------------------------------------------------------------------------
 
 # The columns and values of *rows* (named tuples of one shape, or hashes
@@ -1076,7 +1076,7 @@ def write_rows(sql : String, args : Array(DBValue), on : Transaction?) : Int64 |
 end
 
 # ---------------------------------------------------------------------------
-# Validations and callbacks, as in Rails, written in the class body:
+# Validations and callbacks, written in the class body:
 #
 #   class User < ApplicationRecord
 #     validates :name, presence: true, length: {maximum: 60}
@@ -1745,7 +1745,7 @@ pub macro model(declaration)
 
   # Validates, then inserts a new record or updates a persisted one. False
   # when validation failed, with the reasons in `errors`; a DBError when the
-  # database did. As in Rails:
+  # database did:
   #
   #   if post.save!                 # `!` hands a DBError up (503)
   #     redirect_to path_to(post), notice: "Saved."
@@ -1753,7 +1753,7 @@ pub macro model(declaration)
   #     render "posts/edit", status: 422
   #   end
   #
-  # Callbacks run in Rails' order: before_validation, (validation),
+  # Callbacks run in this order: before_validation, (validation),
   # before_save, before_create or before_update, (the write), after_create or
   # after_update, after_save.
   #
@@ -1978,8 +1978,7 @@ end
 # each with its callbacks and its own dependents; `dependent: :delete_all`
 # deletes their rows in one statement, without loading them.
 #
-# `through:` reaches them across another table, as Rails' has_many
-# :through:
+# `through:` reaches them across another table:
 #
 #   class Post < ApplicationRecord
 #     has_many taggings : Tagging

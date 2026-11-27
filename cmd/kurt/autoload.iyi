@@ -1,5 +1,4 @@
-# Turns an application's files into iyi modules, the way Rails' autoloader
-# turns them into constants. The files a person writes have no module
+# Turns an application's files into iyi modules. The files a person writes have no module
 # header and no imports:
 #
 #   app/models/post.iyi
@@ -31,7 +30,7 @@
 # Why one module for all models: `import` forms a DAG (SPEC.md R-1), and a
 # User has many Posts while a Post belongs to a User. In one module they may
 # name each other freely.
-module autoload
+module cmd/kurt/autoload
 
 import std/text
 import inflector::{pluralize, underscore}
@@ -243,8 +242,7 @@ end
 
 ANNOTATION = "# Columns of "
 
-# The comment at the top of a model file listing its table's columns, as
-# Rails' annotate gem writes it: the fields are declared from the schema, so
+# The comment at the top of a model file listing its table's columns: the fields are declared from the schema, so
 # this is where a reader sees them. Rewritten by `kurt db:migrate`;
 # nothing compiles it.
 pub def annotate(text : String, tables : Array(Table)) : String

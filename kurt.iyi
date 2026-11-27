@@ -1,4 +1,4 @@
-# Kurt: a Rails-like layer for iyi, over iyi-web and db.
+# Kurt: an MVC web framework for iyi, over iyi-web and db.
 #
 # An application imports the modules it uses:
 #
@@ -12,6 +12,8 @@
 # `kurt new` writes an application that does this already; see README.md.
 module kurt
 
+import version
+
 pub def version : String
-  "0.2.0"
+  ::Kurt::Version::VERSION
 end

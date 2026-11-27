@@ -1,4 +1,4 @@
-# A request's parameters, and Rails' strong parameters over them:
+# A request's parameters, and strong parameters over them:
 #
 #   private def post_params : Hash(String, String)
 #     params.require(:post).permit(:title, :body, :published)
@@ -9,7 +9,7 @@
 # `require(:post)` reads the `post[...]` fields a form sends; `permit` keeps
 # the named ones and is the only way to the `Hash(String, String)` a model
 # is assigned from. So handing a model the parameters unfiltered is not a
-# runtime error, as Rails' ForbiddenAttributesError is: it does not compile.
+# runtime error: it does not compile.
 #
 # Nothing here knows about HTTP; the controller builds one from the path,
 # the form body and the query string.

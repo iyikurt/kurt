@@ -140,7 +140,7 @@ end
 
 # Sign-in attempts counted per client and action, in fixed windows: what
 # keeps one address from trying passwords across many accounts, which
-# lock (per account) does not. Off in test, as Rails' rate_limit is.
+# lock (per account) does not. Off in test.
 WINDOWS = Mutex.new { {} of String => Tuple(Int64, Int32) }
 
 # True when *key* (an address and an action) has made more than *limit*

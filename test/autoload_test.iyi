@@ -1,7 +1,7 @@
 module test/autoload_test
 
 import std/text
-import autoload::*
+import cmd/kurt/autoload::*
 import schema::{Table, Column}
 import std/yaml::{Any}
 import fixtures::{FixtureSet, Fixture, fixture_id}

@@ -1,0 +1,6 @@
+# The one place Kurt's version is written: `kurt version`, `Kurt.version`,
+# and the release `kurt new` requires in an application's iyi.mod. Tag the
+# commit that changes it as v<VERSION>.
+module version
+
+pub VERSION = "0.2.0"

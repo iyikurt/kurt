@@ -165,7 +165,7 @@ agents (Codex, Cursor, Copilot, Gemini CLI and others) read it from the
 project root on their own. Claude Code reads `CLAUDE.md`, which imports it.
 
 `kurt dev`, `kurt test` and `kurt build` turn these files into real iyi
-modules under `.kurt/build/` ([autoload.iyi](autoload.iyi)). That
+modules under `.kurt/build/` ([cmd/kurt/autoload.iyi](cmd/kurt/autoload.iyi)). That
 directory is generated; never edit it.
 
 - **Models:** all of them go into one `app/models` module. Each gets
@@ -425,7 +425,7 @@ Post.where(published: true).or_where(Post.where(user_id: 5)).all!
 - `select` changes the columns read. `all` still makes models, so a
   selection has to give every field the model has (`posts.*, ...`). For
   other values use `pluck`.
-- Two Rails names are reserved words in iyi: `group` (the task group) is
+- Two names are reserved words in iyi: `group` (the task group) is
   `group_by`, and `.or` (error recovery) is `or_where`.
 - Grouped `counts`, `sums`, `averages`, `minimums` and `maximums` answer a
   hash keyed by the group's value. `group_by(:user_id).count` counts the
@@ -714,7 +714,7 @@ Templates have no `!` and no `.or`. An association is narrowed with
 
 ### Forms
 
-`form_with` builds a form from a record, as in Rails. It is a `<% %>` tag,
+`form_with` builds a form from a record. It is a `<% %>` tag,
 not `<%= %>`: the form is written as the template runs.
 
 ```erb
@@ -747,7 +747,7 @@ not `<%= %>`: the form is written as the template runs.
 | `label :title, "Text"` | `<label for="post_title">`; the text defaults to the humanized field (`user_id` is "User") |
 | `text_field`, `email_field`, `password_field`, `number_field`, `url_field`, `search_field`, `telephone_field`, `date_field`, `datetime_field`, `hidden_field` | an `<input>` of that type; `password_field` never shows the value |
 | `text_area :body, rows: 8` | a `<textarea>` |
-| `check_box :published` | a hidden `0` and a checkbox `1`, as Rails does |
+| `check_box :published` | a hidden `0` and a checkbox `1` |
 | `select :role, ["admin", "member"]` or `select :user_id, [{"Ada", 1}]` | a `<select>`; `prompt:` or `include_blank: true` adds an empty first option |
 | `file_field :avatar` | a file input |
 | `submit "Save"` | a submit button |
@@ -957,7 +957,7 @@ NotifyJob.perform_now(@post, user)                       # here, without the que
 - `perform`'s arguments are kept as JSON: `String`, `Int32`, `Int64`,
   `Float64`, `Bool`, `Time`, nil (for a `String?` argument), arrays of
   these, and models. A model is kept as its id and found again when the
-  job runs, as Rails' GlobalID does. A record deleted in between fails the
+  job runs. A record deleted in between fails the
   job.
 - Each public `perform` gets `perform_later` and `perform_now` as class
   methods.
@@ -1316,20 +1316,20 @@ The model, fixture, authentication, jobs and storage tests pass on both SQLite a
 | `helpers.iyi` | view helpers |
 | `forms.iyi` | `form_with`'s form builder |
 | `authentication.iyi` | `authentication :...` in a model: passwords, signed tokens, lock, tracking; the sign-in rate limit |
-| `authentication_generators.iyi` | `kurt generate authentication`, and the controllers, views, mails and routes Kurt ships |
+| `cmd/kurt/authentication_generators.iyi` | `kurt generate authentication`, and the controllers, views, mails and routes Kurt ships |
 | `storage.iyi` | `has_one_attached`, `has_many_attached`, disk storage, `/files/...` |
 | `jobs.iyi` | `Job`, `perform_later`, the `kurt_jobs` queue, the worker loop |
 | `mailers.iyi`, `mail_views.iyi` | mailers, `deliveries`, SMTP; the program that finds a mail's views at compile time |
 | `json_writer.iyi` | the JSON that `json(data)` writes |
-| `exporter.iyi` | `kurt export`'s routes, output files and links |
+| `cmd/kurt/exporter.iyi` | `kurt export`'s routes, output files and links |
 | `migrator.iyi` | timestamped SQL migrations |
 | `release.iyi` | the release binary's `db:migrate` / `db:status` commands |
 | `fixtures.iyi` | reads `test/fixtures/*.yml` and loads them into the test database |
 | `datasource.iyi` | connection pool, placeholder dialect |
 | `environment.iyi` | `KURT_ENV`, `DATABASE_URL` |
 | `inflector.iyi` | plural/singular, `underscore`, `camelize` |
-| `generators.iyi` | the files `new` and `generate` write |
-| `autoload.iyi` | modules from the headerless application files |
+| `cmd/kurt/generators.iyi` | the files `new` and `generate` write |
+| `cmd/kurt/autoload.iyi` | modules from the headerless application files |
 | `schema.iyi` | `db/schema.json`: reading tables, SQL → iyi type mapping |
 | `cmd/kurt.iyi` | the CLI |
 

@@ -1,7 +1,7 @@
 module test/exporter_test
 
 import std/text
-import exporter::*
+import cmd/kurt/exporter::*
 
 assert exportable?("/")
 assert exportable?("/guide")

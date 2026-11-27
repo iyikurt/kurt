@@ -13,7 +13,7 @@ import datasource::{database, postgres?}
 import model::*
 import controllers::*
 import storage::*
-import generators::{attachments_migration}
+import cmd/kurt/generators::{attachments_migration}
 
 pub class Profile
   property name : String

@@ -1,4 +1,4 @@
-# File uploads, as Rails' Active Storage, kept on disk: a model declares
+# File uploads, kept on disk: a model declares
 # its attachments, a form sends the files, and the application serves them.
 #
 #   class User < ApplicationRecord

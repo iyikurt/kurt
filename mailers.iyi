@@ -1,4 +1,4 @@
-# Mailers, as Rails' Action Mailer: a class per kind of mail, a method per
+# Mailers: a class per kind of mail, a method per
 # mail, and its text and HTML from templates.
 #
 #   # app/mailers/user_mailer.iyi
@@ -462,7 +462,7 @@ pub class Mailer
     end
   end
 
-  # Each public method a mailer writes is a class method too, as in Rails:
+  # Each public method a mailer writes is a class method too:
   # `UserMailer.welcome(user)` is `UserMailer.new.welcome(user)`.
   macro inherited
     macro finished

@@ -140,7 +140,7 @@ pub class Controller
   end
 
   # The query string, the form body and the path's parameters, in one
-  # place, a path parameter first, then the body, as Rails' `params`:
+  # place, a path parameter first, then the body:
   #
   #   Post.find(params[:id])                   # "" when missing
   #   params[:q]?                              # nil when missing
@@ -327,7 +327,7 @@ pub class Controller
   end
 end
 
-# A form, as Rails' `form_with`, in a template's `<% %>` tag:
+# A form in a template's `<% %>` tag:
 #
 #   <% form_with model: @post do |f| %>
 #     <%= f.label :title %>
@@ -459,7 +459,7 @@ end
 # A name ending in `.eiy` is a path relative to the calling file, which is
 # how a template renders a partial: `<%= render "_form.eiy" %>`.
 #
-# A partial takes locals and collections, as in Rails:
+# A partial takes locals and collections:
 #
 #   <%= render "_form.eiy", post: @post %>             # `post` in the partial
 #   <%= render "_post.eiy", collection: @posts %>      # once per post, as `post`
@@ -701,7 +701,7 @@ end
 # action the controller does not define is not registered either, so a
 # controller with only `index` and `show` needs no `only:`.
 #
-# A block nests resources under one of these, as in Rails:
+# A block nests resources under one of these:
 #
 #   resources "posts", PostsController do
 #     resources "comments", CommentsController     # /posts/:post_id/comments
@@ -934,7 +934,7 @@ pub def install_error_pages(router : Router, login_path : String = "/users/sign_
   nil
 end
 
-# GET /up, for load balancers and deploy tools, as in Rails 8: 200 "OK"
+# GET /up, for load balancers and deploy tools: 200 "OK"
 # when the application is up and its database answers, 503 when not.
 pub def install_health_check(router : Router, path : String = "/up") : Nil
   router.get path, summary: "health check" do |env|

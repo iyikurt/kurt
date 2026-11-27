@@ -10,6 +10,7 @@
 module cmd/kurt
 
 import std/text
+import version
 import std/dir::{Dir}
 import std/time::{Time}
 import std/random::{Random}
@@ -26,15 +27,15 @@ import db/db/errors::{DBError}
 import environment::{database_url, postgres_url?}
 import migrator::{migrate, rollback, status, MigrationError, Migration}
 import inflector::{underscore, camelize}
-import generators::*
-import authentication_generators::*
-import autoload::*
+import cmd/kurt/generators::*
+import cmd/kurt/authentication_generators::*
+import cmd/kurt/autoload::*
 import schema::{Table, introspect, to_json, parse, find}
 import fixtures::{FixtureSet, read_fixture_sets}
-import exporter::{get_paths, output_file, local_links}
+import cmd/kurt/exporter::{get_paths, output_file, local_links}
 import inflector::{pluralize, singularize}
 
-VERSION = "0.2.0"
+VERSION = ::Kurt::Version::VERSION
 
 # What iyi writes for `-o NAME`: NAME.exe and NAME.pdb on Windows (given
 # the .exe, which a NAME with a dot in it is not given), NAME and
@@ -131,7 +132,7 @@ def framework_path : String?
   end
   if exe = Process.executable
     root = File.dirname(File.dirname(File.real_path(exe)))
-    return root if File.exists?(root + "/model.iyi") && File.exists?(root + "/generators.iyi")
+    return root if File.exists?(root + "/model.iyi") && File.exists?(root + "/cmd/kurt/generators.iyi")
   end
   nil
 end

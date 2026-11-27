@@ -1,4 +1,4 @@
-# Fixtures, as in Rails: rows for the test database, written as YAML in
+# Fixtures: rows for the test database, written as YAML in
 # test/fixtures/<table>.yml, one entry per label.
 #
 #   # test/fixtures/users.yml
@@ -65,7 +65,7 @@ pub class FixtureRow
   end
 end
 
-# A label's id: a hash of the label (FNV-1a), below 2^30 as in Rails, the
+# A label's id: a hash of the label (FNV-1a), below 2^30, the
 # same on every run and in every table.
 pub def fixture_id(label : String) : Int64
   hash = 2166136261_u64

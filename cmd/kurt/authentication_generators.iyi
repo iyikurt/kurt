@@ -6,7 +6,7 @@
 # they are the application's to change.
 #
 # Each function answers a file's text, as generators.iyi's do.
-module authentication_generators
+module cmd/kurt/authentication_generators
 
 import std/text
 import inflector::{pluralize, singularize, underscore, camelize, humanize}

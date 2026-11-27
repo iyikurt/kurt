@@ -1,7 +1,7 @@
 module test/authentication_generators_test
 
 import std/text
-import authentication_generators::*
+import cmd/kurt/authentication_generators::*
 
 # the scopes of config/routes.iyi, with a path when given
 assert auth_for_scopes("root HomeController, :index\nauthentication_for \"users\"\n  authentication_for \"admins\", path: \"staff\"\n") == [{"users", nil}, {"admins", "staff"}]

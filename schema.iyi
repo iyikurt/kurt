@@ -1,7 +1,6 @@
 # The database's tables and columns, as `db/schema.json`: what
 # `kurt db:migrate` reads back from the database after migrating, and what
-# the autoloader declares a model's fields from. Rails' db/schema.rb, for
-# the same reason: a column is written once, in its migration, and a build
+# the autoloader declares a model's fields from: a column is written once, in its migration, and a build
 # needs no database to know it.
 #
 #   {

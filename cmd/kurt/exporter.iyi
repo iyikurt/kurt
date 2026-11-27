@@ -5,7 +5,7 @@
 #   /            dist/index.html
 #   /guide       dist/guide/index.html     (served as /guide by static hosts)
 #   /llms.txt    dist/llms.txt
-module exporter
+module cmd/kurt/exporter
 
 import std/text
 

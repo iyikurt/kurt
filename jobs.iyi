@@ -1,5 +1,4 @@
-# Background jobs, as Rails' Active Job over a database queue (Solid
-# Queue's idea): a job class with `perform`, enqueued with `perform_later`
+# Background jobs over a database queue: a job class with `perform`, enqueued with `perform_later`
 # into the `kurt_jobs` table, and a worker that takes them.
 #
 #   # app/jobs/welcome_job.iyi
@@ -15,7 +14,7 @@
 #
 # Arguments are kept as JSON: String, Int32, Int64, Float64, Bool, Time,
 # nil, arrays of these, and models, which are kept as their id and read
-# again when the job runs (Rails' GlobalID).
+# again when the job runs.
 #
 # The worker runs inside the server (unless KURT_JOBS_IN_SERVER=0) or on
 # its own (`kurt jobs`, `./bin/app jobs`). The queue is the `kurt_jobs`
@@ -24,7 +23,7 @@
 # share it - and runs it in a task of its own, so a job that panics is
 # reported and does not take the worker down. A job fails when `perform`
 # answers an error (`!` hands one up); it is tried again later, after
-# 3, 18, 83, 258... seconds (attempts⁴ + 2, Rails' polynomially longer),
+# 3, 18, 83, 258... seconds (attempts⁴ + 2),
 # until its attempts (5 unless `retry_attempts` says) are spent. Then it is
 # kept with `failed_at` and its last error.
 module jobs
