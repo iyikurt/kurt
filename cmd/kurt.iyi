@@ -34,7 +34,7 @@ import fixtures::{FixtureSet, read_fixture_sets}
 import exporter::{get_paths, output_file, local_links}
 import inflector::{pluralize, singularize}
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 
 # What iyi writes for `-o NAME`: NAME.exe and NAME.pdb on Windows (given
 # the .exe, which a NAME with a dot in it is not given), NAME and

@@ -862,7 +862,7 @@ pub PACKAGE = "github.com/iyikurt/kurt"
 # An application's iyi.mod: Kurt at *version* (the kurt command's own), its
 # files importing it as `kurt/...`. *framework*, a Kurt checkout, replaces
 # the release (KURT_PATH, for working on Kurt itself).
-pub def mod_file(app : String, framework : String?, version : String = "0.1.0") : String
+pub def mod_file(app : String, framework : String?, version : String = "0.2.0") : String
   out = "# Dependencies. `iyi get -u` moves them to their latest releases.\nmodule " + app + "\n\n"
   out += "require " + PACKAGE + " v" + version + " as kurt\n"
   out += "require github.com/sdogruyol/iyi-web v0.7.0 as web\n"
