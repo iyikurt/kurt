@@ -1,0 +1,832 @@
+# What `kurt generate authentication` writes, and the controllers, views,
+# mailer and routes Kurt ships for a `devise_for "users"` scope. The build
+# writes the shipped ones into .kurt/build/devise/ for every one the
+# application has no copy of; `kurt generate devise:views` and
+# `kurt generate devise:controllers` copy them into the application, where
+# they are the application's to change, as `rails g devise:views` does.
+#
+# Each function answers a file's text, as generators.iyi's do.
+module devise_generators
+
+import std/text
+import inflector::{pluralize, singularize, underscore, camelize, humanize}
+
+# The modules `kurt generate authentication` gives a new model, as Devise's
+# generator does; the rest are named on the command line.
+pub DEFAULT_MODULES = ["database_authenticatable", "registerable", "recoverable", "rememberable", "validatable"]
+pub OPTIONAL_MODULES = ["confirmable", "lockable", "trackable", "timeoutable"]
+
+# The columns Devise's modules keep, beyond the address and the digest.
+pub DEVISE_COLUMNS = ["encrypted_password", "confirmed_at", "confirmation_sent_at", "remember_created_at", "failed_attempts",
+                      "locked_at", "sign_in_count", "current_sign_in_at", "last_sign_in_at", "current_sign_in_ip", "last_sign_in_ip"]
+
+# One `devise_for` scope: "users", the User model, its modules.
+pub class DeviseScope
+  getter plural : String
+  getter singular : String
+  getter model : String
+  getter modules : Array(String)
+  # The column a user signs in with.
+  getter key : String
+  # The text columns sign-up asks for besides the address: `name`.
+  getter fields : Array(String)
+
+  # Where its pages are, when not /users: `devise_for "users", path: "auth"`.
+  getter base : String?
+
+  def initialize(@plural : String, @modules : Array(String), @key : String = "email", @fields : Array(String) = [] of String, @base : String? = nil)
+    @singular = singularize(@plural)
+    @model = camelize(@singular)
+  end
+
+  def has?(name : String) : Bool
+    @modules.includes?(name)
+  end
+
+  def path : String
+    "/" + (@base || @plural)
+  end
+
+  # UserSessionsController, UserPasswordsController...
+  def controller(kind : String) : String
+    camelize(@singular) + camelize(kind) + "Controller"
+  end
+
+  def controller_file(kind : String) : String
+    @singular + "_" + kind + "_controller.iyi"
+  end
+
+  def mailer : String
+    camelize(@singular) + "DeviseMailer"
+  end
+
+  def mailer_file : String
+    @singular + "_devise_mailer.iyi"
+  end
+
+  # The controllers its modules need: sessions always.
+  def kinds : Array(String)
+    found = ["sessions"]
+    found << "registrations" if has?("registerable")
+    found << "passwords" if has?("recoverable")
+    found << "confirmations" if has?("confirmable")
+    found << "unlocks" if has?("lockable")
+    found
+  end
+
+  # Whether it sends mail: reset, confirmation or unlock instructions.
+  def mails? : Bool
+    has?("recoverable") || has?("confirmable") || has?("lockable")
+  end
+end
+
+# The scopes `devise_for "users"` lines in config/routes.iyi name, with
+# their `path: "auth"` when they have one.
+pub def devise_for_scopes(routes : String) : Array(Tuple(String, String?))
+  found = [] of Tuple(String, String?)
+  routes.lines.each do |line|
+    stripped = line.strip
+    next unless stripped.starts_with?("devise_for ")
+    rest = stripped[11, stripped.size - 11].strip
+    next unless rest.starts_with?("\"") || rest.starts_with?(":")
+    name = rest.lchop('"').lchop(':')
+    stop = name.index('"') || name.index(',') || name.index(' ') || name.size
+    next if name[0, stop].empty?
+    base = nil
+    if at = rest.index("path:")
+      value = rest[at + 5, rest.size - at - 5].strip.lchop(':').lchop('"').lchop('/')
+      cut = value.index('"') || value.index(',') || value.index(' ') || value.size
+      base = value[0, cut] unless value[0, cut].empty?
+    end
+    found << {name[0, stop], base}
+  end
+  found
+end
+
+# The routes line and the ApplicationController line for a scope.
+pub def devise_for_line(scope : DeviseScope) : String
+  base = scope.base
+  "devise_for \"" + scope.plural + "\"" + (base ? ", path: \"" + base + "\"" : "")
+end
+
+pub def devise_helpers_line(scope : DeviseScope) : String
+  base = scope.base
+  "  devise_helpers " + scope.model + (base ? ", path: \"/" + base + "\"" : "") + "\n"
+end
+
+# The `devise :a, :b` line(s) of a model, joined: nil when it has none.
+def devise_line(model : String) : String?
+  lines = model.lines
+  lines.each_with_index do |line, index|
+    stripped = line.strip
+    next unless stripped.starts_with?("devise ")
+    joined = stripped
+    at = index
+    while joined.ends_with?(",") && at + 1 < lines.size
+      at += 1
+      joined += " " + lines[at].strip
+    end
+    return joined
+  end
+  nil
+end
+
+# The modules a model's `devise` line names.
+pub def devise_modules_of(model : String) : Array(String)?
+  line = devise_line(model)
+  return nil if line.nil?
+  found = [] of String
+  line[7, line.size - 7].split(",").each do |part|
+    item = part.strip
+    found << item[1, item.size - 1] if item.starts_with?(":") && !item.includes?(" ")
+  end
+  found
+end
+
+# `authentication_key: :email_address`, or "email".
+pub def devise_key_of(model : String) : String
+  line = devise_line(model) || ""
+  at = line.index("authentication_key:")
+  return "email" if at.nil?
+  rest = line[at + 19, line.size - at - 19].strip.lchop(':').lchop('"')
+  stop = rest.index(',') || rest.index('"') || rest.index(' ') || rest.size
+  rest[0, stop]
+end
+
+# ---------------------------------------------------------------------------
+# The model, its migration
+# ---------------------------------------------------------------------------
+
+pub def devise_model_line(modules : Array(String)) : String
+  "  devise " + modules.map { |m| ":" + m }.join(", ") + "\n"
+end
+
+pub def devise_model(modules : Array(String)) : String
+  rest = OPTIONAL_MODULES - modules
+  note = rest.empty? ? "" : "  # Devise's modules. Also there: " + rest.map { |m| ":" + m }.join(", ") + ", whose columns\n  # the users table has already.\n"
+  "class User < ApplicationRecord\n" + note + devise_model_line(modules) + "end\n"
+end
+
+def devise_column_sql(name : String, postgres : Bool) : String
+  time = postgres ? "TIMESTAMPTZ" : "DATETIME"
+  int = postgres ? "BIGINT NOT NULL DEFAULT 0" : "INTEGER NOT NULL DEFAULT 0"
+  case name
+  when "encrypted_password"                             then "TEXT NOT NULL DEFAULT ''"
+  when "failed_attempts", "sign_in_count"              then int
+  when "current_sign_in_ip", "last_sign_in_ip"         then "TEXT"
+  else                                                      time
+  end
+end
+
+# A users table with every module's columns: turning a module on later
+# needs no migration.
+pub def devise_users_migration(key : String, postgres : Bool) : String
+  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  stamp = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT now()" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+  columns = ["  id " + id, "  " + key + " TEXT NOT NULL DEFAULT ''"]
+  DEVISE_COLUMNS.each { |c| columns << "  " + c + " " + devise_column_sql(c, postgres) }
+  columns << "  created_at " + stamp
+  columns << "  updated_at " + stamp
+  "-- up\nCREATE TABLE users (\n" + columns.join(",\n") + "\n);\nCREATE UNIQUE INDEX users_" + key + " ON users (" + key + ");\n\n-- down\nDROP TABLE users;\n"
+end
+
+# For a users table that exists: the columns it lacks.
+pub def devise_columns_migration(key : String, existing : Array(String), postgres : Bool) : String
+  up = [] of String
+  down = [] of String
+  unless existing.includes?(key)
+    up << "ALTER TABLE users ADD COLUMN " + key + " TEXT NOT NULL DEFAULT '';"
+    down << "ALTER TABLE users DROP COLUMN " + key + ";"
+  end
+  DEVISE_COLUMNS.each do |c|
+    next if existing.includes?(c)
+    up << "ALTER TABLE users ADD COLUMN " + c + " " + devise_column_sql(c, postgres) + ";"
+    down << "ALTER TABLE users DROP COLUMN " + c + ";"
+  end
+  up << "CREATE UNIQUE INDEX users_" + key + " ON users (" + key + ");"
+  down.unshift("DROP INDEX users_" + key + ";")
+  "-- up\n" + up.join("\n") + "\n\n-- down\n" + down.join("\n") + "\n"
+end
+
+# The layout's links: who is signed in and a sign-out button, or the way in.
+pub def devise_nav(scope : DeviseScope, daisy : Bool) : String
+  s = scope.singular
+  if daisy
+    "<% if " + s + "_signed_in? %><li><a href=\"" + scope.path + "/edit\">Account</a></li><li><%= button_to \"Sign out\", \"" + scope.path + "/sign_out\", method: :delete %></li><% else %><li><a href=\"" + scope.path + "/sign_in\">Sign in</a></li>" +
+      (scope.has?("registerable") ? "<li><a href=\"" + scope.path + "/sign_up\">Sign up</a></li>" : "") + "<% end %>"
+  else
+    "<% if " + s + "_signed_in? %><a href=\"" + scope.path + "/edit\">Account</a><%= button_to \"Sign out\", \"" + scope.path + "/sign_out\", method: :delete, class: \"link\" %><% else %><a href=\"" + scope.path + "/sign_in\">Sign in</a>" +
+      (scope.has?("registerable") ? "<a href=\"" + scope.path + "/sign_up\">Sign up</a>" : "") + "<% end %>"
+  end
+end
+
+# The classes Kurt's sign-in and other views use: those views are in
+# .kurt/build until `kurt generate devise:views` copies them, so Tailwind,
+# which reads app/views, is told about them.
+pub DEVISE_CLASSES_SOURCE = "@source inline(\"mx-auto max-w-sm text-3xl font-bold mb-6 mt-4 mt-6 card card-body bg-base-100 shadow-sm fieldset label alert alert-error font-semibold list-disc ml-5 flex flex-col gap-1 text-sm link link-primary btn btn-primary btn-ghost text-error\");"
+
+# app.css with those classes; nil when it has them, or is not Tailwind's.
+pub def with_devise_classes(css : String) : String?
+  return nil if css.includes?(DEVISE_CLASSES_SOURCE)
+  anchor = "@source \"../../views/**/*.eiy\";"
+  return nil unless css.includes?(anchor)
+  css.sub(anchor, anchor + "\n" + DEVISE_CLASSES_SOURCE)
+end
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
+
+# The function `devise_for "users"` calls: every route of the scope's
+# modules, as Devise draws them.
+pub def devise_routes_source(scope : DeviseScope) : String
+  p = scope.path
+  rows = [] of Tuple(String, String, String, String)
+  rows << {"get", p + "/sign_in", "sessions", "new"}
+  rows << {"post", p + "/sign_in", "sessions", "create"}
+  rows << {"delete", p + "/sign_out", "sessions", "destroy"}
+  if scope.has?("registerable")
+    rows << {"get", p + "/sign_up", "registrations", "new"}
+    rows << {"post", p, "registrations", "create"}
+    rows << {"get", p + "/edit", "registrations", "edit"}
+    rows << {"patch", p, "registrations", "update"}
+    rows << {"put", p, "registrations", "update"}
+    rows << {"delete", p, "registrations", "destroy"}
+  end
+  if scope.has?("recoverable")
+    rows << {"get", p + "/password/new", "passwords", "new"}
+    rows << {"post", p + "/password", "passwords", "create"}
+    rows << {"get", p + "/password/edit", "passwords", "edit"}
+    rows << {"patch", p + "/password", "passwords", "update"}
+    rows << {"put", p + "/password", "passwords", "update"}
+  end
+  if scope.has?("confirmable")
+    rows << {"get", p + "/confirmation/new", "confirmations", "new"}
+    rows << {"post", p + "/confirmation", "confirmations", "create"}
+    rows << {"get", p + "/confirmation", "confirmations", "show"}
+  end
+  if scope.has?("lockable")
+    rows << {"get", p + "/unlock/new", "unlocks", "new"}
+    rows << {"post", p + "/unlock", "unlocks", "create"}
+    rows << {"get", p + "/unlock", "unlocks", "show"}
+  end
+  html = "import web/iyi_web/router::{Router}\n\n# The routes `devise_for \"" + scope.plural + "\"` draws, written by kurt from " + scope.model + "'s modules.\n"
+  html += "pub def __kurt_devise_routes_" + scope.plural + "(router : Router) : Nil\n"
+  rows.each { |r| html += "  " + r[0] + " \"" + r[1] + "\", " + scope.controller(r[2]) + ", :" + r[3] + "\n" }
+  html + "  nil\nend\n"
+end
+
+# ---------------------------------------------------------------------------
+# Controllers
+# ---------------------------------------------------------------------------
+
+# How a shipped controller renders *view* ("sessions/new"): from the
+# application's views when it is a copy in app/controllers (*paths* nil),
+# or by the absolute paths the build chose (its own copy of the view or
+# Kurt's, and the application's layout).
+def devise_render(view : String, paths : Hash(String, String)?, status : Int32? = nil) : String
+  tail = status ? ", status: " + status.to_s : ""
+  if found = paths
+    "render_file \"" + found[view] + "\", \"" + found["layout"] + "\"" + tail
+  else
+    "render \"devise/" + view + "\"" + tail
+  end
+end
+
+# What every one of the scope's controllers has: the record its views
+# draw (`resource`), its name and paths, its modules.
+def devise_common(scope : DeviseScope) : String
+  <<-IYI
+    # The #{scope.model} the views draw.
+    def resource : #{scope.model}
+      @#{scope.singular}
+    end
+
+    def resource_name : String
+      "#{scope.singular}"
+    end
+
+    # Where the scope's pages are: #{scope.path}/sign_in, #{scope.path}/password...
+    def scope_path : String
+      "#{scope.path}"
+    end
+
+    def devise_module?(name : String) : Bool
+      #{scope.model}.devise?(name)
+    end
+
+    # What sign-up and the account page ask for besides the address and
+    # the password.
+    def sign_up_fields : Array(String)
+      #{scope.fields.inspect} of String
+    end
+
+  IYI
+end
+
+# The client a rate limit counts: its address, and the action.
+def devise_limit(scope : DeviseScope, action : String) : String
+  "    if rate_limited?((env.request.remote_address || \"\") + \" " + scope.path + action + "\")\n      return TooManyRequests.new\n    end\n"
+end
+
+pub def devise_controller(kind : String, scope : DeviseScope, paths : Hash(String, String)? = nil) : String
+  case kind
+  when "sessions"      then devise_sessions_controller(scope, paths)
+  when "registrations" then devise_registrations_controller(scope, paths)
+  when "passwords"     then devise_passwords_controller(scope, paths)
+  when "confirmations" then devise_confirmations_controller(scope, paths)
+  else                      devise_unlocks_controller(scope, paths)
+  end
+end
+
+def devise_sessions_controller(scope : DeviseScope, paths : Hash(String, String)?) : String
+  s = scope.singular
+  remember = scope.has?("rememberable") ? ", remember: form[:remember_me] == \"1\"" : ""
+  <<-IYI
+  # Signing in and out, as Devise's SessionsController.
+  class #{scope.controller("sessions")} < ApplicationController
+    skip_before_action :authenticate_#{s}!
+
+  #{devise_common(scope)}  # GET #{scope.path}/sign_in
+    def new
+      #{devise_render("sessions/new", paths)}
+    end
+
+    # POST #{scope.path}/sign_in: ten tries a minute from one address.
+    def create
+  #{devise_limit(scope, "/sign_in")}    form = params.require(:#{s})
+      @#{s}.assign({"#{scope.key}" => form[:#{scope.key}]})
+      case found = #{scope.model}.authenticate(form[:#{scope.key}], form[:password])!
+      in #{scope.model}
+        sign_in(found#{remember})!
+        redirect_to after_sign_in_path_for(found), notice: "Signed in successfully."
+      in AuthFailure
+        flash("alert", found.message)
+        #{devise_render("sessions/new", paths, 422)}
+      end
+    end
+
+    # DELETE #{scope.path}/sign_out
+    def destroy
+      sign_out(current_#{s})!
+      redirect_to after_sign_out_path_for(nil), notice: "Signed out successfully."
+    end
+  end
+
+  IYI
+end
+
+def devise_registrations_controller(scope : DeviseScope, paths : Hash(String, String)?) : String
+  s = scope.singular
+  created = if scope.has?("confirmable")
+              "      token = @#{s}.confirmation_token\n      @#{s}.save!\n      #{scope.mailer}.confirmation_instructions(@#{s}, token).deliver_now!\n" +
+                "      redirect_to \"/\", notice: \"A message with a confirmation link has been sent to your email address. Please follow the link to activate your account.\"\n"
+            else
+              "      sign_in(@#{s})!\n      redirect_to after_sign_in_path_for(@#{s}), notice: \"Welcome! You have signed up successfully.\"\n"
+            end
+  <<-IYI
+  # Signing up, and the signed-in user's account: as Devise's
+  # RegistrationsController.
+  class #{scope.controller("registrations")} < ApplicationController
+    skip_before_action :authenticate_#{s}!, only: [:new, :create]
+    before_action :authenticate_#{s}!, only: [:edit, :update, :destroy]
+
+  #{devise_common(scope)}  # GET #{scope.path}/sign_up
+    def new
+      #{devise_render("registrations/new", paths)}
+    end
+
+    # POST #{scope.path}
+    def create
+      @#{s} = #{scope.model}.new(sign_up_params)
+      if @#{s}.save!
+  #{created}    else
+        #{devise_render("registrations/new", paths, 422)}
+      end
+    end
+
+    # GET #{scope.path}/edit
+    def edit
+      if found = current_#{s}
+        @#{s} = found
+      end
+      #{devise_render("registrations/edit", paths)}
+    end
+
+    # PATCH #{scope.path}: changes need the current password.
+    def update
+      if found = current_#{s}
+        @#{s} = found
+      end
+      current = params.require(:#{s})[:current_password]
+      unless @#{s}.valid_password?(current)
+        @#{s}.assign(account_update_params)
+        @#{s}.errors.add("current_password", current.empty? ? "can't be blank" : "is invalid")
+        return #{devise_render("registrations/edit", paths, 422)}
+      end
+      if @#{s}.update(account_update_params)!
+        # A new password signs the session in again, under a new id.
+        sign_in(@#{s})!
+        redirect_to "/", notice: "Your account has been updated successfully."
+      else
+        #{devise_render("registrations/edit", paths, 422)}
+      end
+    end
+
+    # DELETE #{scope.path}
+    def destroy
+      if found = current_#{s}
+        found.destroy!
+      end
+      sign_out(nil)!
+      redirect_to after_sign_out_path_for(nil), notice: "Bye! Your account has been successfully cancelled. We hope to see you again soon."
+    end
+
+    private def sign_up_params : Hash(String, String)
+      params.require(:#{s}).permit(["#{scope.key}", "password", "password_confirmation"] + sign_up_fields)
+    end
+
+    private def account_update_params : Hash(String, String)
+      params.require(:#{s}).permit(["#{scope.key}", "password", "password_confirmation"] + sign_up_fields)
+    end
+  end
+
+  IYI
+end
+
+def devise_passwords_controller(scope : DeviseScope, paths : Hash(String, String)?) : String
+  s = scope.singular
+  after = if scope.has?("confirmable")
+            "        if @#{s}.confirmed?\n          sign_in(@#{s})!\n          redirect_to \"/\", notice: \"Your password has been changed successfully. You are now signed in.\"\n        else\n          redirect_to scope_path + \"/sign_in\", notice: \"Your password has been changed successfully.\"\n        end\n"
+          else
+            "        sign_in(@#{s})!\n        redirect_to \"/\", notice: \"Your password has been changed successfully. You are now signed in.\"\n"
+          end
+  <<-IYI
+  # Forgotten passwords, as Devise's PasswordsController: a mail with a link
+  # that is good for six hours and until the password changes.
+  class #{scope.controller("passwords")} < ApplicationController
+    skip_before_action :authenticate_#{s}!
+
+    @reset_password_token : String = ""
+
+  #{devise_common(scope)}  # GET #{scope.path}/password/new
+    def new
+      #{devise_render("passwords/new", paths)}
+    end
+
+    # POST #{scope.path}/password: the same answer whether the address has
+    # an account or not.
+    def create
+  #{devise_limit(scope, "/password")}    if found = #{scope.model}.find_for_authentication(params.require(:#{s})[:#{scope.key}])!
+        #{scope.mailer}.reset_password_instructions(found, found.reset_password_token).deliver_now!
+      end
+      redirect_to scope_path + "/sign_in", notice: "If your email address exists in our database, you will receive a password recovery link at your email address in a few minutes."
+    end
+
+    # GET #{scope.path}/password/edit?reset_password_token=...
+    def edit
+      @reset_password_token = params[:reset_password_token]
+      #{devise_render("passwords/edit", paths)}
+    end
+
+    # PATCH #{scope.path}/password
+    def update
+      form = params.require(:#{s})
+      @reset_password_token = form[:reset_password_token]
+      if found = #{scope.model}.with_reset_password_token(@reset_password_token)!
+        @#{s} = found
+        if @#{s}.reset_password(form[:password], form[:password_confirmation])!
+  #{after}      else
+          #{devise_render("passwords/edit", paths, 422)}
+        end
+      else
+        redirect_to scope_path + "/password/new", alert: "Reset password token is invalid or has expired."
+      end
+    end
+  end
+
+  IYI
+end
+
+def devise_confirmations_controller(scope : DeviseScope, paths : Hash(String, String)?) : String
+  s = scope.singular
+  <<-IYI
+  # Confirming an address, as Devise's ConfirmationsController.
+  class #{scope.controller("confirmations")} < ApplicationController
+    skip_before_action :authenticate_#{s}!
+
+  #{devise_common(scope)}  # GET #{scope.path}/confirmation/new: the instructions again.
+    def new
+      #{devise_render("confirmations/new", paths)}
+    end
+
+    # POST #{scope.path}/confirmation
+    def create
+  #{devise_limit(scope, "/confirmation")}    found = #{scope.model}.find_for_authentication(params.require(:#{s})[:#{scope.key}])!
+      if found && !found.confirmed?
+        token = found.confirmation_token
+        found.save!
+        #{scope.mailer}.confirmation_instructions(found, token).deliver_now!
+      end
+      redirect_to scope_path + "/sign_in", notice: "If your email address exists in our database, you will receive an email with instructions for how to confirm your email address in a few minutes."
+    end
+
+    # GET #{scope.path}/confirmation?confirmation_token=...
+    def show
+      if #{scope.model}.confirm_by_token(params[:confirmation_token])!
+        redirect_to scope_path + "/sign_in", notice: "Your email address has been successfully confirmed."
+      else
+        flash("alert", "Confirmation token is invalid or has expired.")
+        #{devise_render("confirmations/new", paths, 422)}
+      end
+    end
+  end
+
+  IYI
+end
+
+def devise_unlocks_controller(scope : DeviseScope, paths : Hash(String, String)?) : String
+  s = scope.singular
+  <<-IYI
+  # Unlocking an account locked after too many wrong passwords, as Devise's
+  # UnlocksController. A lock also ends by itself after an hour.
+  class #{scope.controller("unlocks")} < ApplicationController
+    skip_before_action :authenticate_#{s}!
+
+  #{devise_common(scope)}  # GET #{scope.path}/unlock/new: the instructions again.
+    def new
+      #{devise_render("unlocks/new", paths)}
+    end
+
+    # POST #{scope.path}/unlock
+    def create
+  #{devise_limit(scope, "/unlock")}    found = #{scope.model}.find_for_authentication(params.require(:#{s})[:#{scope.key}])!
+      if found && found.access_locked?
+        #{scope.mailer}.unlock_instructions(found, found.unlock_token).deliver_now!
+      end
+      redirect_to scope_path + "/sign_in", notice: "If your account exists, you will receive an email with instructions for how to unlock it in a few minutes."
+    end
+
+    # GET #{scope.path}/unlock?unlock_token=...
+    def show
+      if #{scope.model}.unlock_by_token(params[:unlock_token])!
+        redirect_to scope_path + "/sign_in", notice: "Your account has been unlocked successfully. Please sign in to continue."
+      else
+        flash("alert", "Unlock token is invalid or has expired.")
+        #{devise_render("unlocks/new", paths, 422)}
+      end
+    end
+  end
+
+  IYI
+end
+
+# ---------------------------------------------------------------------------
+# The mailer
+# ---------------------------------------------------------------------------
+
+# The mails the scope sends. *views* maps "mailer/reset_password_instructions"
+# and the rest to where their views are, and "layout" to the mail layout,
+# when the build writes it; a copy in app/mailers reads app/views/devise/mailer.
+pub def devise_mailer(scope : DeviseScope, parent : String, views : Hash(String, String)? = nil) : String
+  methods = [] of Tuple(String, String, String)
+  methods << {"confirmation_instructions", "Confirmation instructions", "confirmable"}
+  methods << {"reset_password_instructions", "Reset password instructions", "recoverable"}
+  methods << {"unlock_instructions", "Unlock instructions", "lockable"}
+  html = "# The mails of the " + scope.plural + " scope, as Devise's Mailer: each one's text and HTML are\n# app/views/devise/mailer/<mail>.text.eiy and .html.eiy (`kurt generate devise:views`).\n"
+  html += "class " + scope.mailer + " < " + parent + "\n  @resource : " + scope.model + " = " + scope.model + ".new\n  @token : String = \"\"\n\n"
+  html += "  # The scope's pages, for the links: " + scope.path + "/password/edit...\n  def scope_path : String\n    \"" + scope.path + "\"\n  end\n"
+  methods.each do |m|
+    next unless scope.has?(m[2])
+    where = if found = views
+              ", views: \"" + found["mailer/" + m[0]] + "\"" + (found["layout"].empty? ? "" : ", layout_path: \"" + found["layout"] + "\"")
+            else
+              ", views: \"../views/devise/mailer/" + m[0] + "\""
+            end
+    html += "\n  def " + m[0] + "(record : " + scope.model + ", token : String)\n    @resource = record\n    @token = token\n"
+    html += "    mail to: record." + scope.key + ", subject: \"" + m[1] + "\"" + where + "\n  end\n"
+  end
+  html + "end\n"
+end
+
+# ---------------------------------------------------------------------------
+# Views: shared by every scope (`resource`, `resource_name`, `scope_path`)
+# ---------------------------------------------------------------------------
+
+# Every view Kurt ships, by its path under app/views/devise.
+pub def devise_view_names : Array(String)
+  ["sessions/new", "registrations/new", "registrations/edit", "passwords/new", "passwords/edit",
+   "confirmations/new", "unlocks/new", "shared/_links", "shared/_error_messages"]
+end
+
+pub def devise_mail_names : Array(String)
+  ["confirmation_instructions", "reset_password_instructions", "unlock_instructions"]
+end
+
+def dv_page(title : String, body : String, daisy : Bool) : String
+  head = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
+  if daisy
+    head + "<div class=\"mx-auto max-w-sm\">\n  <h1 class=\"text-3xl font-bold mb-6\">" + title + "</h1>\n" + body + "  <%= render \"../shared/_links.eiy\" %>\n</div>\n"
+  else
+    head + "<h1>" + title + "</h1>\n" + body + "<%= render \"../shared/_links.eiy\" %>\n"
+  end
+end
+
+def dv_form(url : String, extra : String, inner : String, daisy : Bool) : String
+  if daisy
+    "  <%= render \"../shared/_error_messages.eiy\" %>\n  <% form_with model: resource, url: " + url + ", scope: resource_name" + extra + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n  <div class=\"card-body\">\n" + inner + "  </div>\n  <% end %>\n"
+  else
+    "<%= render \"../shared/_error_messages.eiy\" %>\n<% form_with model: resource, url: " + url + ", scope: resource_name" + extra + ", class: \"form\" do |f| %>\n" + inner + "<% end %>\n"
+  end
+end
+
+def dv_field(label : String, input : String, daisy : Bool, hint : String = "") : String
+  if daisy
+    "    <fieldset class=\"fieldset\">\n      " + label + "\n      " + input + "\n" + (hint.empty? ? "" : "      <p class=\"label\">" + hint + "</p>\n") + "    </fieldset>\n"
+  else
+    "  <div class=\"field\">\n    " + label + "\n    " + input + "\n" + (hint.empty? ? "" : "    <small>" + hint + "</small>\n") + "  </div>\n"
+  end
+end
+
+def dv_check(input : String, text : String, daisy : Bool) : String
+  daisy ? "    <fieldset class=\"fieldset\">\n      <label class=\"label\">" + input + " " + text + "</label>\n    </fieldset>\n" : "  <div class=\"field\">\n    <label class=\"check\">" + input + " " + text + "</label>\n  </div>\n"
+end
+
+def dv_submit(text : String, daisy : Bool) : String
+  daisy ? "    <%= f.submit \"" + text + "\", class: \"btn btn-primary mt-4\" %>\n" : "  <div class=\"actions\"><%= f.submit \"" + text + "\", class: \"button\" %></div>\n"
+end
+
+def dv_key(key : String, daisy : Bool, autofocus : Bool = true) : String
+  dv_field("<%= f.label :" + key + " %>", "<%= f." + (key.includes?("email") ? "email" : "text") + "_field :" + key + ", required: true" + (autofocus ? ", autofocus: true" : "") + ", autocomplete: \"email\" %>", daisy)
+end
+
+def dv_extra_fields(daisy : Bool) : String
+  "<% sign_up_fields.each do |field| %>\n" + dv_field("<%= f.label field %>", "<%= f.text_field field %>", daisy) + "<% end %>\n"
+end
+
+# A view Kurt ships, for an application with daisyUI or without.
+pub def devise_view(name : String, key : String, daisy : Bool) : String
+  case name
+  when "sessions/new"
+    inner = dv_key(key, daisy) +
+            dv_field("<%= f.label :password %>", "<%= f.password_field :password, required: true, autocomplete: \"current-password\" %>", daisy) +
+            "<% if devise_module?(\"rememberable\") %>\n" + dv_check("<%= f.check_box :remember_me %>", "Remember me", daisy) + "<% end %>\n" +
+            dv_submit("Sign in", daisy)
+    dv_page("Sign in", dv_form("scope_path + \"/sign_in\"", ", method: :post", inner, daisy), daisy)
+  when "registrations/new"
+    inner = dv_key(key, daisy) + dv_extra_fields(daisy) +
+            dv_field("<%= f.label :password %>", "<%= f.password_field :password, required: true, minlength: 8, maxlength: 72, autocomplete: \"new-password\" %>", daisy, "8 characters or more") +
+            dv_field("<%= f.label :password_confirmation %>", "<%= f.password_field :password_confirmation, required: true, autocomplete: \"new-password\" %>", daisy) +
+            dv_submit("Sign up", daisy)
+    dv_page("Sign up", dv_form("scope_path", ", method: :post", inner, daisy), daisy)
+  when "registrations/edit"
+    inner = dv_key(key, daisy, false) + dv_extra_fields(daisy) +
+            dv_field("<%= f.label :password %>", "<%= f.password_field :password, maxlength: 72, autocomplete: \"new-password\" %>", daisy, "Leave it blank to keep the current one") +
+            dv_field("<%= f.label :password_confirmation %>", "<%= f.password_field :password_confirmation, autocomplete: \"new-password\" %>", daisy) +
+            dv_field("<%= f.label :current_password %>", "<%= f.password_field :current_password, required: true, autocomplete: \"current-password\" %>", daisy, "Needed to confirm the changes") +
+            dv_submit("Update", daisy)
+    cancel = daisy ? "  <div class=\"mt-6\">\n    <%= button_to \"Cancel my account\", scope_path, method: :delete, class: \"btn btn-ghost text-error\", confirm: \"Are you sure?\" %>\n  </div>\n" : "<p><%= button_to \"Cancel my account\", scope_path, method: :delete, class: \"link danger\", confirm: \"Are you sure?\" %></p>\n"
+    head = "<% content_for \"title\" do %>Account<% end -%>\n"
+    if daisy
+      head + "<div class=\"mx-auto max-w-sm\">\n  <h1 class=\"text-3xl font-bold mb-6\">Account</h1>\n" + dv_form("scope_path", ", method: :patch", inner, daisy) + cancel + "</div>\n"
+    else
+      head + "<h1>Account</h1>\n" + dv_form("scope_path", ", method: :patch", inner, daisy) + cancel
+    end
+  when "passwords/new"
+    inner = dv_key(key, daisy) + dv_submit("Send me password reset instructions", daisy)
+    dv_page("Forgot your password?", dv_form("scope_path + \"/password\"", ", method: :post", inner, daisy), daisy)
+  when "passwords/edit"
+    inner = "    <%= f.hidden_field :reset_password_token, value: @reset_password_token %>\n" +
+            dv_field("<%= f.label :password, \"New password\" %>", "<%= f.password_field :password, required: true, autofocus: true, minlength: 8, maxlength: 72, autocomplete: \"new-password\" %>", daisy) +
+            dv_field("<%= f.label :password_confirmation, \"Confirm new password\" %>", "<%= f.password_field :password_confirmation, required: true, autocomplete: \"new-password\" %>", daisy) +
+            dv_submit("Change my password", daisy)
+    dv_page("Change your password", dv_form("scope_path + \"/password\"", ", method: :patch", inner, daisy), daisy)
+  when "confirmations/new"
+    inner = dv_key(key, daisy) + dv_submit("Resend confirmation instructions", daisy)
+    dv_page("Resend confirmation instructions", dv_form("scope_path + \"/confirmation\"", ", method: :post", inner, daisy), daisy)
+  when "unlocks/new"
+    inner = dv_key(key, daisy) + dv_submit("Resend unlock instructions", daisy)
+    dv_page("Resend unlock instructions", dv_form("scope_path + \"/unlock\"", ", method: :post", inner, daisy), daisy)
+  when "shared/_links"
+    open, close, link = daisy ? {"<div class=\"mt-4 flex flex-col gap-1 text-sm\">\n", "</div>\n", ", class: \"link link-primary\""} : {"<p class=\"links\">\n", "</p>\n", ""}
+    open +
+      "<% unless current_page?(scope_path + \"/sign_in\") %><%= link_to \"Sign in\", scope_path + \"/sign_in\"" + link + " %><% end %>\n" +
+      "<% if devise_module?(\"registerable\") && !current_page?(scope_path + \"/sign_up\") %><%= link_to \"Sign up\", scope_path + \"/sign_up\"" + link + " %><% end %>\n" +
+      "<% if devise_module?(\"recoverable\") && !current_page?(scope_path + \"/password/new\") %><%= link_to \"Forgot your password?\", scope_path + \"/password/new\"" + link + " %><% end %>\n" +
+      "<% if devise_module?(\"confirmable\") && !current_page?(scope_path + \"/confirmation/new\") %><%= link_to \"Didn't receive confirmation instructions?\", scope_path + \"/confirmation/new\"" + link + " %><% end %>\n" +
+      "<% if devise_module?(\"lockable\") && !current_page?(scope_path + \"/unlock/new\") %><%= link_to \"Didn't receive unlock instructions?\", scope_path + \"/unlock/new\"" + link + " %><% end %>\n" +
+      close
+  else # shared/_error_messages
+    if daisy
+      "<% if resource.errors.any? %>\n<div role=\"alert\" class=\"alert alert-error mb-6\">\n  <div>\n    <p class=\"font-semibold\"><%= pluralize(resource.errors.size, \"error\") %> prohibited this <%= resource_name %> from being saved:</p>\n    <ul class=\"list-disc ml-5\">\n    <% resource.errors.full_messages.each do |message| %><li><%= message %></li><% end %>\n    </ul>\n  </div>\n</div>\n<% end %>\n"
+    else
+      "<% if resource.errors.any? %>\n<div class=\"errors\" role=\"alert\">\n  <p><%= pluralize(resource.errors.size, \"error\") %> prohibited this <%= resource_name %> from being saved:</p>\n  <ul>\n  <% resource.errors.full_messages.each do |message| %><li><%= message %></li><% end %>\n  </ul>\n</div>\n<% end %>\n"
+    end
+  end
+end
+
+# The text (*html* false) or HTML part of a mail Kurt ships.
+pub def devise_mail_view(name : String, key : String, html : Bool) : String
+  link, intro, button, outro = case name
+                               when "confirmation_instructions"
+                                 {"/confirmation?confirmation_token=", "You can confirm your account email through the link below:", "Confirm my account", ""}
+                               when "reset_password_instructions"
+                                 {"/password/edit?reset_password_token=", "Someone has requested a link to change your password. You can do this through the link below.", "Change my password",
+                                  "If you didn't request this, please ignore this email. Your password won't change until you access the link above and create a new one."}
+                               else
+                                 {"/unlock?unlock_token=", "Your account has been locked due to an excessive number of unsuccessful sign in attempts. Click the link below to unlock your account:", "Unlock my account", ""}
+                               end
+  url = "<%= app_url %><%= scope_path %>" + link + "<%= @token %>"
+  if html
+    "<p>Hello <%= @resource." + key + " %>!</p>\n\n<p>" + intro + "</p>\n\n<p><a href=\"" + url + "\">" + button + "</a></p>\n" + (outro.empty? ? "" : "\n<p>" + outro + "</p>\n")
+  else
+    "Hello <%= @resource." + key + " %>!\n\n" + intro + "\n\n" + url + "\n" + (outro.empty? ? "" : "\n" + outro + "\n")
+  end
+end
+
+# ---------------------------------------------------------------------------
+# The test `kurt generate authentication` writes
+# ---------------------------------------------------------------------------
+
+pub DEVISE_TEST_PASSWORD = "password123"
+
+pub def devise_test(scope : DeviseScope) : String
+  s = scope.singular
+  k = scope.key
+  extra = scope.fields.map { |f| "&" + s + "%5B" + f + "%5D=New" }.join
+  confirm = if scope.has?("confirmable")
+              <<-IYI
+              # confirmable: not signed in until the link in the mail is followed
+              assert dispatch(app, with_cookie(http_request("GET", "#{scope.path}/edit"), cookie_of(res))).response.status_code == 302
+              mail = deliveries.last
+              assert mail.subject == "Confirmation instructions"
+              token = mail.body.split("confirmation_token=")[1].split("\\n")[0].strip
+              res = dispatch(app, http_request("GET", "#{scope.path}/confirmation", query: "confirmation_token=" + token)).response
+              assert res.status_code == 303
+              assert res.headers["Location"]? == "#{scope.path}/sign_in"
+
+              IYI
+            else
+              "assert dispatch(app, with_cookie(http_request(\"GET\", \"#{scope.path}/edit\"), cookie_of(res))).response.status_code == 200   # signed in at once\n"
+            end
+  <<-IYI
+  # Signing up, in and out, and resetting a password, through the session
+  # cookie as a browser does. `kurt test` runs this against a freshly
+  # migrated test database; mail goes into `deliveries`.
+  app = chain([SessionHandler.new("kurt test session secret, at least 32 bytes"), RouteHandler.new(routes)])
+  clear_deliveries
+
+  # the cookie a response set, to send with the next request
+  def cookie_of(res) : String
+    found = ""
+    res.headers.each do |name, value|
+      found = value.split(";")[0] if name.downcase == "set-cookie" && value.starts_with?("iyi_web.session=")
+    end
+    found
+  end
+
+  def with_cookie(request, cookie : String)
+    request.headers["Cookie"] = cookie
+    request
+  end
+
+  assert dispatch(app, "GET", "#{scope.path}/sign_in").response.status_code == 200
+  assert dispatch(app, "GET", "#{scope.path}/sign_up").response.status_code == 200
+
+  # signing up; the address is kept lowercase
+  #{scope.model}.#{k}("new-user@example.com").delete_all.as(Int64)
+  res = dispatch(app, form_request("POST", "#{scope.path}", "#{s}%5B#{k}%5D=New-User%40example.com&#{s}%5Bpassword%5D=#{DEVISE_TEST_PASSWORD}&#{s}%5Bpassword_confirmation%5D=#{DEVISE_TEST_PASSWORD}#{extra}")).response
+  assert res.status_code == 303
+  assert #{scope.model}.#{k}("new-user@example.com").count.as(Int64) == 1
+  #{confirm}
+  # a password too short is refused, and the form comes back
+  res = dispatch(app, form_request("POST", "#{scope.path}", "#{s}%5B#{k}%5D=short%40example.com&#{s}%5Bpassword%5D=short&#{s}%5Bpassword_confirmation%5D=short")).response
+  assert res.status_code == 422
+
+  # a wrong password, then the right one
+  res = dispatch(app, form_request("POST", "#{scope.path}/sign_in", "#{s}%5B#{k}%5D=new-user%40example.com&#{s}%5Bpassword%5D=wrong-password")).response
+  assert res.status_code == 422
+  res = dispatch(app, form_request("POST", "#{scope.path}/sign_in", "#{s}%5B#{k}%5D=new-user%40example.com&#{s}%5Bpassword%5D=#{DEVISE_TEST_PASSWORD}")).response
+  assert res.status_code == 303
+  cookie = cookie_of(res)
+  assert !cookie.empty?
+  assert dispatch(app, with_cookie(http_request("GET", "#{scope.path}/edit"), cookie)).response.status_code == 200
+
+  # signing out; the account page then sends to sign-in
+  res = dispatch(app, with_cookie(http_request("DELETE", "#{scope.path}/sign_out"), cookie)).response
+  assert res.status_code == 303
+  assert dispatch(app, "GET", "#{scope.path}/edit").response.status_code == 302
+
+  # a forgotten password: a mail with a link, then a new password
+  res = dispatch(app, form_request("POST", "#{scope.path}/password", "#{s}%5B#{k}%5D=new-user%40example.com")).response
+  assert res.status_code == 303
+  mail = deliveries.last
+  assert mail.subject == "Reset password instructions"
+  token = mail.body.split("reset_password_token=")[1].split("\\n")[0].strip
+  res = dispatch(app, form_request("PATCH", "#{scope.path}/password", "#{s}%5Breset_password_token%5D=" + token + "&#{s}%5Bpassword%5D=another-password&#{s}%5Bpassword_confirmation%5D=another-password")).response
+  assert res.status_code == 303
+  res = dispatch(app, form_request("POST", "#{scope.path}/sign_in", "#{s}%5B#{k}%5D=new-user%40example.com&#{s}%5Bpassword%5D=another-password")).response
+  assert res.status_code == 303
+
+  IYI
+end

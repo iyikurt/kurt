@@ -156,7 +156,6 @@ assert plain_index.includes?("<%= button_to \"Delete\", path_to(post), method: :
 assert plain_index.includes?("<%= link_to \"New post\", \"/posts/new\", class: \"button\" %>")
 assert !plain_index.includes?("_method")
 assert show_view(post, user_ref, labels).includes?("<%= button_to \"Delete this post\"")
-assert auth_nav(true).includes?("<%= button_to \"Sign out\", \"/logout\", method: :delete %>")
 assert gitignore(true).includes?("/public/assets/app.css")
 assert !gitignore.includes?("app.css")
 assert !form_view(post, user_ref, labels).includes?("btn")          # --css none: plain classes

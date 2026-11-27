@@ -135,6 +135,13 @@ impl Error for DeliveryError
   end
 end
 
+# Where the application is, for the links a mail carries: APP_URL, or
+# http://localhost:3000.
+pub def app_url : String
+  url = Program.env("APP_URL") || ""
+  url.empty? ? "http://localhost:3000" : url.rstrip("/")
+end
+
 # "Ada <ada@example.com>" or "ada@example.com".
 pub def address(text : String) : Mail::Address
   stripped = text.strip
@@ -397,14 +404,16 @@ pub class Mailer
   # `template:` names another view of the same mailer; `layout: false`
   # renders without `layouts/mailer.*`. To, cc and bcc take one address or
   # an array.
-  macro mail(to, subject, from = nil, cc = nil, bcc = nil, reply_to = nil, template = nil, layout = "mailer")
+  # `views:` is the view's path without `.text.eiy` / `.html.eiy`, and
+  # `layout_path:` the layout's, for a mailer whose views are elsewhere.
+  macro mail(to, subject, from = nil, cc = nil, bcc = nil, reply_to = nil, template = nil, layout = "mailer", views = nil, layout_path = nil)
     {% caller = @caller.first.filename || "" %}
     {% folder = @type.name.split("::").last.underscore %}
-    {% view = template ? template.id.stringify : @def.name.stringify %}
-    {% frame = layout == false ? "" : layout.id.stringify %}
+    {% view = views ? views : "../views/" + folder + "/" + (template ? template.id.stringify : @def.name.stringify) %}
+    {% frame = layout == false ? "" : (layout_path ? layout_path : "../views/layouts/" + layout.id.stringify) %}
     ::Kurt::Mailers::Message.new(::Kurt::Mailers.list({{ to }}), ({{ from }} || default_from), {{ subject }},
-      ({{ run("./mail_views", caller, "text", folder, view, frame) }}),
-      ({{ run("./mail_views", caller, "html", folder, view, frame) }}),
+      ({{ run("./mail_views", caller, "text", view, frame) }}),
+      ({{ run("./mail_views", caller, "html", view, frame) }}),
       ::Kurt::Mailers.list({{ cc }}), ::Kurt::Mailers.list({{ bcc }}), {{ reply_to }}, [] of ::Kurt::Mailers::Attachment,
       {{ @type.name.split("::").last + "#" + @def.name.stringify }})
   end

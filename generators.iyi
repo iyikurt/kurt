@@ -636,174 +636,15 @@ def daisy_layout_view(app : String) : String
 end
 
 # ---------------------------------------------------------------------------
-# Authentication: `kurt generate authentication`, after Rails 8's generator.
-# Users with an email address and a bcrypt password, sign-in and sign-out
-# through the cookie session, sign-up, and sign-in required everywhere
-# unless a controller says `allow_unauthenticated_access`.
+# Authentication: what is left of the generator Kurt had before the
+# Devise-shaped one (devise_generators.iyi): the password fields a users
+# scaffold gets, and the sign-in line of tests in applications made with it.
 # ---------------------------------------------------------------------------
 
 pub AUTH_PASSWORD = "password123"
 
 pub def auth_label(column : String) : String
   humanize(column)
-end
-
-# A new User: the address it signs in with, its password's digest.
-pub def auth_user_model(login : String) : String
-  <<-IYI
-  class User < ApplicationRecord
-  #{auth_user_lines(login)}end
-
-  IYI
-end
-
-# What a User gets for signing in; also put into a User that exists.
-pub def auth_user_lines(login : String) : String
-  <<-IYI
-    has_secure_password
-
-    validates :#{login}, presence: true, format: /\\A[^@\\s]+@[^@\\s]+\\z/, uniqueness: true
-    validates :password, length: {minimum: 8}
-
-    before_validation :normalize_#{login}
-
-    # Addresses are kept trimmed and lowercase, so "Ada@Example.com " signs in.
-    def normalize_#{login}
-      @#{login} = #{login}.strip.downcase
-    end
-
-  IYI
-end
-
-pub def auth_users_migration(login : String, postgres : Bool) : String
-  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
-  time = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
-  <<-SQL
-  -- up
-  CREATE TABLE users (
-    id #{id},
-    #{login} TEXT NOT NULL DEFAULT '',
-    password_digest TEXT NOT NULL DEFAULT '',
-    created_at #{time},
-    updated_at #{time}
-  );
-  CREATE UNIQUE INDEX users_#{login} ON users (#{login});
-
-  -- down
-  DROP TABLE users;
-
-  SQL
-end
-
-# For a users table that exists: the digest, and the address when it has none.
-pub def auth_columns_migration(login : String, add_login : Bool) : String
-  up = [] of String
-  down = [] of String
-  if add_login
-    up << "ALTER TABLE users ADD COLUMN " + login + " TEXT NOT NULL DEFAULT '';"
-    down << "ALTER TABLE users DROP COLUMN " + login + ";"
-  end
-  up << "ALTER TABLE users ADD COLUMN password_digest TEXT NOT NULL DEFAULT '';"
-  up << "CREATE UNIQUE INDEX users_" + login + " ON users (" + login + ");"
-  down.unshift("DROP INDEX users_" + login + ";")
-  down << "ALTER TABLE users DROP COLUMN password_digest;"
-  "-- up\n" + up.join("\n") + "\n\n-- down\n" + down.join("\n") + "\n"
-end
-
-# Put into ApplicationController: the rule, and who is signed in.
-pub def auth_application_lines : String
-  <<-IYI
-    before_action :require_authentication
-
-    @current_user : User? = nil
-    @current_user_loaded : Bool = false
-
-    # The signed-in user, or nil; views ask it too:
-    # `<% if user = current_user? %>`.
-    def current_user? : User?
-      unless @current_user_loaded
-        @current_user_loaded = true
-        if id = session_user_id
-          found = User.find?(id)
-          @current_user = found.is_a?(User) ? found : nil
-        end
-      end
-      @current_user
-    end
-
-    # Every action needs a signed-in user unless its controller says
-    # `allow_unauthenticated_access`. A page sends the visitor to /login,
-    # and back to it after signing in.
-    def require_authentication
-      return nil if current_user?
-      if (store = session?) && env.request.method == "GET"
-        store["return_to"] = env.request.path
-      end
-      Unauthorized.new
-    end
-
-  IYI
-end
-
-pub def sessions_controller(login : String) : String
-  <<-IYI
-  class SessionsController < ApplicationController
-    allow_unauthenticated_access only: [:new, :create]
-
-    # GET /login
-    def new
-      render "sessions/new"
-    end
-
-    # POST /login
-    def create
-      if user = User.authenticate_by("#{login}", params[:#{login}].strip.downcase, params[:password])!
-        back = session["return_to"]? || "/"
-        start_session_for(user)
-        redirect_to back, notice: "Signed in."
-      else
-        redirect_to "/login", alert: "Try another email address or password."
-      end
-    end
-
-    # DELETE /logout
-    def destroy
-      terminate_session
-      redirect_to "/login", notice: "Signed out."
-    end
-  end
-
-  IYI
-end
-
-pub def registrations_controller(fields : Array(String)) : String
-  permitted = (fields + ["password", "password_confirmation"]).map { |f| ":" + f }.join(", ")
-  <<-IYI
-  class RegistrationsController < ApplicationController
-    allow_unauthenticated_access
-
-    # GET /signup
-    def new
-      render "registrations/new"
-    end
-
-    # POST /signup
-    def create
-      @user = User.new(registration_params)
-      if @user.save!
-        start_session_for(@user)
-        redirect_to "/", notice: "Welcome!"
-      else
-        render "registrations/new", status: 422
-      end
-    end
-
-    private def registration_params : Hash(String, String)
-      params.require(:user).permit(#{permitted})
-    end
-  end
-
-  IYI
 end
 
 # One labelled field of a sign-in or sign-up form, through the form
@@ -815,61 +656,6 @@ pub def auth_input(field : String, label : String, kind : String, extra : String
   else
     "  <div class=\"field\">\n    <%= f.label :" + field + ", \"" + label + "\" %>\n    " + call + "\n  </div>\n"
   end
-end
-
-# *form*: what goes in `form_with`, its model and path (`url: "/login"`).
-def auth_form(title : String, form : String, inputs : String, button : String, after : String, errors : String, daisy : Bool) : String
-  head = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
-  if daisy
-    head + "<div class=\"mx-auto max-w-sm\">\n  <h1 class=\"text-3xl font-bold mb-6\">" + title + "</h1>\n" + errors +
-      "  <% form_with " + form + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n  <div class=\"card-body\">\n" + inputs +
-      "    <%= f.submit \"" + button + "\", class: \"btn btn-primary mt-4\" %>\n  </div>\n  <% end %>\n  <p class=\"mt-4 text-sm\">" + after + "</p>\n</div>\n"
-  else
-    head + "<h1>" + title + "</h1>\n" + errors + "<% form_with " + form + ", class: \"form\" do |f| %>\n" + inputs +
-      "  <div class=\"actions\"><%= f.submit \"" + button + "\", class: \"button\" %></div>\n<% end %>\n<p>" + after + "</p>\n"
-  end
-end
-
-pub def sessions_view(login : String, daisy : Bool) : String
-  link = daisy ? "class=\"link link-primary\" " : ""
-  inputs = auth_input(login, auth_label(login), "email", "required: true, autofocus: true, autocomplete: \"username\"", daisy) +
-           auth_input("password", "Password", "password", "required: true, maxlength: 72, autocomplete: \"current-password\"", daisy)
-  auth_form("Sign in", "url: \"/login\"", inputs, "Sign in", "No account yet? <a " + link + "href=\"/signup\">Sign up</a>", "", daisy)
-end
-
-pub def registrations_view(login : String, fields : Array(String), daisy : Bool) : String
-  link = daisy ? "class=\"link link-primary\" " : ""
-  inputs = ""
-  fields.each do |field|
-    if field == login
-      inputs += auth_input(field, auth_label(field), "email", "required: true, autocomplete: \"username\"", daisy)
-    else
-      inputs += auth_input(field, auth_label(field), "text", "", daisy)
-    end
-  end
-  inputs += auth_input("password", "Password", "password", "required: true, minlength: 8, maxlength: 72, autocomplete: \"new-password\"", daisy)
-  inputs += auth_input("password_confirmation", "Password confirmation", "password", "required: true, autocomplete: \"new-password\"", daisy)
-  box = daisy ? "  <div role=\"alert\" class=\"alert alert-error mb-6\">\n    <ul class=\"list-disc ml-5\">\n" : "<div class=\"errors\" role=\"alert\">\n  <ul>\n"
-  close = daisy ? "    </ul>\n  </div>\n" : "  </ul>\n</div>\n"
-  errors = "<% if @user.errors.any? %>\n" + box + "    <% @user.errors.full_messages.each do |message| %><li><%= message %></li><% end %>\n" + close + "<% end %>\n"
-  auth_form("Sign up", "model: @user, url: \"/signup\"", inputs, "Create account", "Already have one? <a " + link + "href=\"/login\">Sign in</a>", errors, daisy)
-end
-
-# The layout's links: who is signed in and a sign-out button, or the way in.
-pub def auth_nav(daisy : Bool) : String
-  if daisy
-    "<% if current_user? %><li><%= button_to \"Sign out\", \"/logout\", method: :delete %></li><% else %><li><a href=\"/login\">Sign in</a></li><li><a href=\"/signup\">Sign up</a></li><% end %>"
-  else
-    "<% if current_user? %><%= button_to \"Sign out\", \"/logout\", method: :delete, class: \"link\" %><% else %><a href=\"/login\">Sign in</a><a href=\"/signup\">Sign up</a><% end %>"
-  end
-end
-
-pub def auth_routes : Array(String)
-  ["get \"/login\", SessionsController, :new",
-   "post \"/login\", SessionsController, :create",
-   "delete \"/logout\", SessionsController, :destroy",
-   "get \"/signup\", RegistrationsController, :new",
-   "post \"/signup\", RegistrationsController, :create"]
 end
 
 # A user for a test to be signed in as: every text column filled in, the
@@ -888,64 +674,6 @@ end
 # The line a test gets to be signed in for its requests.
 pub def auth_sign_in_line(login : String, fields : Array(String), tag : String) : String
   "sign_in_as(" + auth_tester(login, fields, tag) + ")\n"
-end
-
-pub def sessions_test(login : String, fields : Array(String)) : String
-  email = "signin@example.com"
-  form = login + "=signin%40example.com"
-  <<-IYI
-  # Signing up, in and out through the session cookie, as a browser does.
-  # `kurt test` runs this against a freshly migrated test database.
-  app = chain([SessionHandler.new("kurt test session secret, at least 32 bytes"), RouteHandler.new(routes)])
-  #{auth_tester(login, fields, "signin").sub("tester-signin@example.com", email)}
-
-  # the cookie a response set, to send with the next request
-  def cookie_of(res) : String
-    found = ""
-    res.headers.each do |name, value|
-      found = value.split(";")[0] if name.downcase == "set-cookie"
-    end
-    found
-  end
-
-  def with_cookie(request, cookie : String)
-    request.headers["Cookie"] = cookie
-    request
-  end
-
-  assert dispatch(app, "GET", "/login").response.status_code == 200
-  assert dispatch(app, "GET", "/signup").response.status_code == 200
-
-  # a wrong password goes back to the form
-  res = dispatch(app, form_request("POST", "/login", "#{form}&password=wrong-password")).response
-  assert res.status_code == 303
-  assert res.headers["Location"]? == "/login"
-
-  # the right one signs in and leaves a session cookie
-  res = dispatch(app, form_request("POST", "/login", "#{form}&password=#{AUTH_PASSWORD}")).response
-  assert res.status_code == 303
-  assert res.headers["Location"]? == "/"
-  cookie = cookie_of(res)
-  assert !cookie.empty?
-
-  # signing out needs the cookie; without it, the way is to /login
-  assert dispatch(app, "DELETE", "/logout").response.status_code == 302
-  res = dispatch(app, with_cookie(http_request("DELETE", "/logout"), cookie)).response
-  assert res.status_code == 303
-  assert res.headers["Location"]? == "/login"
-
-  # signing up makes a user and signs them in
-  User.#{login}("new-user@example.com").delete_all.as(Int64)
-  res = dispatch(app, form_request("POST", "/signup", "user%5B#{login}%5D=New-User%40example.com&user%5Bpassword%5D=#{AUTH_PASSWORD}&user%5Bpassword_confirmation%5D=#{AUTH_PASSWORD}#{fields.reject { |f| f == login }.map { |f| "&user%5B" + f + "%5D=New" }.join}")).response
-  assert res.status_code == 303
-  assert !cookie_of(res).empty?
-  assert User.#{login}("new-user@example.com").count.as(Int64) == 1   # kept lowercase
-
-  # a password too short is refused, and the form comes back
-  res = dispatch(app, form_request("POST", "/signup", "user%5B#{login}%5D=short%40example.com&user%5Bpassword%5D=short&user%5Bpassword_confirmation%5D=short")).response
-  assert res.status_code == 422
-
-  IYI
 end
 
 # ---------------------------------------------------------------------------
@@ -1317,7 +1045,7 @@ pub def agents_md(app : String) : String
   - `kurt test`: migrate a fresh test database and run every test/*_test.iyi. Each test file
     starts with test/fixtures/<table>.yml loaded (`ada:` then `column: value` lines; `user: ada`
     sets user_id, `password:` sets password_digest) and reads a row as `users(:ada)`.
-    `sign_in_as(users(:ada))` signs the next requests in. `!` does not work at a test's top
+    `sign_in(users(:ada))` signs the next requests in. `!` does not work at a test's top
     level: use `.as(User)`.
   - `kurt build`: a release binary in bin/#{app}, migrations inside. On the server:
     `KURT_ENV=production DATABASE_URL=... SESSION_SECRET=... ./bin/#{app} db:migrate`, then
@@ -1383,6 +1111,19 @@ pub def agents_md(app : String) : String
     neither is ever nil. Any other instance variable is declared with its type:
     `@featured : Array(Post) = [] of Post`. Views read them as they are.
   - Views see the action's locals and the controller's methods.
+
+  ## Authentication (after `kurt generate authentication`)
+
+  - Devise's shape: `devise :database_authenticatable, :registerable, :recoverable, :rememberable,
+    :validatable` in app/models/user.iyi (also :confirmable, :lockable, :trackable, :timeoutable;
+    their columns are in the users table), `devise_for "users"` in config/routes.iyi,
+    `devise_helpers User` in ApplicationController.
+  - `before_action :authenticate_user!` on a controller whose pages need a signed-in user;
+    `current_user` (User?), `user_signed_in?`, `sign_in(user)`, `sign_out(user)` in controllers and views.
+  - Pages: /users/sign_in, /users/sign_up, /users/edit, /users/password/new (`kurt routes` lists them).
+    Kurt ships their controllers and views; `kurt generate devise:views` / `devise:controllers` copy
+    them into app/ to change them.
+  - Tests: `sign_in(users(:ada))`; a fixture's `password:` becomes encrypted_password.
 
   ## Mailers
 

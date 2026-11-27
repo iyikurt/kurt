@@ -66,6 +66,17 @@ pub class Parameters
     Parameters.new(nested)
   end
 
+  # The named keys as a list: `permit(["email", "name"])`.
+  def permit(keys : Array(String)) : Hash(String, String)
+    allowed = {} of String => String
+    keys.each do |name|
+      if value = @values[name]?
+        allowed[name] = value
+      end
+    end
+    allowed
+  end
+
   # Only the named keys, the ones that were sent.
   def permit(*keys : Symbol) : Hash(String, String)
     allowed = {} of String => String

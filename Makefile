@@ -4,7 +4,7 @@
 #   make install    link it into $(PREFIX)/bin (~/.local/bin), next to iyi;
 #                   on Windows, put bin\ on the user's PATH
 #   make test       the tests on SQLite (in memory)
-#   make test-pg    the model and fixture tests on PostgreSQL: PG_URL=postgres://user@host:port/db
+#   make test-pg    the model, fixture and devise tests on PostgreSQL: PG_URL=postgres://user@host:port/db
 IYI ?= iyi
 PG_URL ?= postgres://localhost/kurt_test
 
@@ -41,5 +41,6 @@ test:
 test-pg:
 	DATABASE_URL="$(PG_URL)" $(IYI) run test/model_test.iyi
 	DATABASE_URL="$(PG_URL)" $(IYI) run test/fixtures_test.iyi
+	DATABASE_URL="$(PG_URL)" $(IYI) run test/devise_test.iyi
 
 .PHONY: install test test-pg

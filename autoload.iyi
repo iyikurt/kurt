@@ -46,7 +46,7 @@ pub class Source
 end
 
 pub def models_imports : Array(String)
-  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*"]
+  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*", "import kurt/devise::*"]
 end
 
 pub def mailers_imports : Array(String)
@@ -58,8 +58,8 @@ end
 pub def controllers_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
    "import web/iyi_web/templates::{raw, content_for, yield_content}",
-   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import app/models::*",
-   "import app/mailers::*"]
+   "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import kurt/devise::*",
+   "import app/models::*", "import app/mailers::*"]
 end
 
 pub def routes_imports : Array(String)
@@ -79,7 +79,7 @@ end
 pub def test_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import web/iyi_web/router::{RouteHandler}",
    "import web/iyi_web/harness::*", "import web/iyi_web/handler::{chain}", "import web/iyi_web/session::{SessionHandler}",
-   "import kurt/model::*", "import kurt/controllers::{sign_in_as, sign_out}", "import app/models::*", "import app/routes::*",
+   "import kurt/model::*", "import kurt/controllers::{sign_in_as, sign_in, sign_out}", "import app/models::*", "import app/routes::*",
    "import kurt/mailers::{deliveries, clear_deliveries, Message}", "import app/mailers::*",
    "import app/fixtures::*"]
 end

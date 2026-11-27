@@ -1,0 +1,83 @@
+module test/devise_generators_test
+
+import std/text
+import devise_generators::*
+
+# the scopes of config/routes.iyi, with a path when given
+assert devise_for_scopes("root HomeController, :index\ndevise_for \"users\"\n  devise_for \"admins\", path: \"staff\"\n") == [{"users", nil}, {"admins", "staff"}]
+
+# a model's modules, over more than one line, and its key
+model = "class User < ApplicationRecord\n  devise :database_authenticatable, :registerable,\n         :lockable, authentication_key: :email_address\nend\n"
+assert devise_modules_of(model) == ["database_authenticatable", "registerable", "lockable"]
+assert devise_key_of(model) == "email_address"
+assert devise_key_of("devise :database_authenticatable\n") == "email"
+assert devise_modules_of("class User < ApplicationRecord\nend\n").nil?
+
+scope = DeviseScope.new("users", DEFAULT_MODULES + ["confirmable"], "email", ["name"])
+assert scope.model == "User"
+assert scope.controller("sessions") == "UserSessionsController"
+assert scope.kinds == ["sessions", "registrations", "passwords", "confirmations"]
+assert scope.mails?
+assert scope.path == "/users"
+assert DeviseScope.new("users", ["database_authenticatable"], "email", [] of String, "auth").path == "/auth"
+assert devise_for_line(DeviseScope.new("users", DEFAULT_MODULES, "email", [] of String, "auth")) == "devise_for \"users\", path: \"auth\""
+assert devise_helpers_line(scope) == "  devise_helpers User\n"
+
+# the model and its columns
+assert devise_model(DEFAULT_MODULES).includes?("  devise :database_authenticatable, :registerable, :recoverable, :rememberable, :validatable\n")
+assert devise_model(DEFAULT_MODULES).includes?(":confirmable, :lockable, :trackable, :timeoutable")
+created = devise_users_migration("email", false)
+assert created.includes?("  encrypted_password TEXT NOT NULL DEFAULT ''")
+assert created.includes?("  locked_at DATETIME")
+assert created.includes?("CREATE UNIQUE INDEX users_email ON users (email);")
+assert devise_users_migration("email", true).includes?("  failed_attempts BIGINT NOT NULL DEFAULT 0")
+added = devise_columns_migration("email", ["id", "name", "email", "remember_created_at"], false)
+assert added.includes?("ALTER TABLE users ADD COLUMN encrypted_password TEXT NOT NULL DEFAULT '';")
+assert !added.includes?("ADD COLUMN email ")
+assert !added.includes?("remember_created_at")
+
+# routes: the modules' routes, to the scope's controllers
+routes = devise_routes_source(scope)
+assert routes.includes?("pub def __kurt_devise_routes_users(router : Router) : Nil\n")
+assert routes.includes?("  post \"/users/sign_in\", UserSessionsController, :create\n")
+assert routes.includes?("  patch \"/users/password\", UserPasswordsController, :update\n")
+assert routes.includes?("  get \"/users/confirmation\", UserConfirmationsController, :show\n")
+assert !routes.includes?("unlock")
+
+# controllers: Kurt's render the paths the build chose, a copy renders app/views/devise
+paths = {"layout" => "/app/views/layouts/application.eiy", "sessions/new" => "/kurt/views/sessions/new.eiy"}
+shipped = devise_controller("sessions", scope, paths)
+assert shipped.includes?("class UserSessionsController < ApplicationController\n  skip_before_action :authenticate_user!\n")
+assert shipped.includes?("render_file \"/kurt/views/sessions/new.eiy\", \"/app/views/layouts/application.eiy\", status: 422")
+assert shipped.includes?("case found = User.authenticate(form[:email], form[:password])!")
+assert shipped.includes?("sign_in(found, remember: form[:remember_me] == \"1\")!")
+assert shipped.includes?("rate_limited?(")
+copied = devise_controller("sessions", scope)
+assert copied.includes?("render \"devise/sessions/new\", status: 422")
+assert devise_controller("registrations", scope).includes?("UserDeviseMailer.confirmation_instructions(@user, token).deliver_now!")
+assert devise_controller("registrations", DeviseScope.new("users", DEFAULT_MODULES)).includes?("sign_in(@user)!")
+assert devise_controller("registrations", scope).includes?("[\"name\"] of String")
+assert devise_controller("passwords", scope).includes?("UserDeviseMailer.reset_password_instructions(found, found.reset_password_token).deliver_now!")
+
+# the mailer: only the mails its modules send
+mailer = devise_mailer(scope, "ApplicationMailer")
+assert mailer.includes?("class UserDeviseMailer < ApplicationMailer\n")
+assert mailer.includes?("views: \"../views/devise/mailer/reset_password_instructions\"")
+assert !mailer.includes?("unlock_instructions")
+
+# views, with daisyUI or plain
+assert devise_view("sessions/new", "email", true).includes?("<% form_with model: resource, url: scope_path + \"/sign_in\", scope: resource_name, method: :post, class: \"card bg-base-100 shadow-sm\" do |f| %>")
+assert devise_view("sessions/new", "email", false).includes?("class: \"form\" do |f| %>")
+assert devise_view("registrations/new", "email", true).includes?("<% sign_up_fields.each do |field| %>")
+assert devise_view("passwords/edit", "email", true).includes?("f.hidden_field :reset_password_token, value: @reset_password_token")
+assert devise_view("shared/_links", "email", true).includes?("devise_module?(\"recoverable\")")
+assert devise_mail_view("reset_password_instructions", "email", false).includes?("<%= app_url %><%= scope_path %>/password/edit?reset_password_token=<%= @token %>")
+assert devise_mail_view("confirmation_instructions", "email", true).includes?("<a href=")
+
+# the test: confirmation followed when confirmable
+assert devise_test(scope).includes?("confirmation_token=")
+assert devise_test(scope).includes?("user%5Bname%5D=New")
+assert !devise_test(DeviseScope.new("users", DEFAULT_MODULES)).includes?("confirmation_token=")
+assert with_devise_classes("@source \"../../views/**/*.eiy\";\n").as(String).includes?("max-w-sm")
+
+puts "devise generators: all assertions passed"

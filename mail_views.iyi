@@ -1,9 +1,9 @@
 # The program `mail` (mailers.iyi) runs at compile time:
-# `mail_views CALLER KIND FOLDER VIEW LAYOUT` prints the iyi source that
-# renders a mail's text (KIND "text") or HTML ("html") part from the views
-# beside CALLER, the mailer's file: `../views/FOLDER/VIEW.KIND.eiy`, inside
-# `../views/layouts/LAYOUT.KIND.eiy` when that exists and LAYOUT is not
-# empty. A part with no view is `nil`; a mail with neither view is refused,
+# `mail_views CALLER KIND VIEW LAYOUT` prints the iyi source that renders a
+# mail's text (KIND "text") or HTML ("html") part from `VIEW.KIND.eiy`,
+# inside `LAYOUT.KIND.eiy` when that exists and LAYOUT is not empty. A
+# relative VIEW or LAYOUT is beside CALLER, the mailer's file
+# (`../views/user_mailer/welcome`). A part with no view is `nil`; a mail with neither view is refused,
 # with the paths it looked for.
 #
 # A program and not a macro's own `file_exists?`, which may only look inside
@@ -19,16 +19,21 @@ def quote(text : String) : String
 end
 
 args = Program.args
-raise "usage: mail_views CALLER KIND FOLDER VIEW LAYOUT, not #{args.size} arguments" unless args.size == 5
-caller, kind, folder, view, layout = args[0], args[1], args[2], args[3], args[4]
+raise "usage: mail_views CALLER KIND VIEW LAYOUT, not #{args.size} arguments" unless args.size == 4
+caller, kind, view, layout = args[0], args[1], args[2], args[3]
 dir = File.dirname(caller)
-view_path = "../views/" + folder + "/" + view + "." + kind + ".eiy"
-layout_path = "../views/layouts/" + layout + "." + kind + ".eiy"
-has_view = File.exists?(dir + "/" + view_path)
-has_layout = !layout.empty? && File.exists?(dir + "/" + layout_path)
 
-if kind == "html" && !has_view && !File.exists?(dir + "/../views/" + folder + "/" + view + ".text.eiy")
-  raise "mail: no app/views/" + folder + "/" + view + ".text.eiy or .html.eiy for " + caller
+def located(path : String, dir : String) : String
+  path.starts_with?("/") ? path : dir + "/" + path
+end
+
+view_path = view + "." + kind + ".eiy"
+layout_path = layout + "." + kind + ".eiy"
+has_view = File.exists?(located(view_path, dir))
+has_layout = !layout.empty? && File.exists?(located(layout_path, dir))
+
+if kind == "html" && !has_view && !File.exists?(located(view + ".text.eiy", dir))
+  raise "mail: no " + view + ".text.eiy or .html.eiy for " + caller
 end
 
 if !has_view

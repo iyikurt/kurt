@@ -22,7 +22,8 @@ def run : Nil | DBError
                           Column.new("admin", "", "Bool"), Column.new("password_digest", "", "String"),
                           Column.new("created_at", "", "Time"), Column.new("updated_at", "", "Time")]),
     Table.new("books", [Column.new("id", "", "Int64"), Column.new("title", "", "String"), Column.new("price", "", "Int64"),
-                        Column.new("author_id", "", "Int64"), Column.new("published_at", "", "Time")]),
+                        Column.new("author_id", "", "Int64"), Column.new("published_at", "", "Time?")]),
+    Table.new("members", [Column.new("id", "", "Int64"), Column.new("email", "", "String"), Column.new("encrypted_password", "", "String")]),
   ]
 
   # ids: the same every run, below 2^30, different per label
@@ -43,6 +44,9 @@ def run : Nil | DBError
   assert authors[0].columns.includes?("password_digest")   # password: becomes a digest
   assert !authors[0].columns.includes?("password")
   assert authors[0].columns.includes?("created_at")        # timestamps filled in
+  assert rows[0].values[4].is_a?(Time)                      # a column that allows NULL converts too
+  members = fixture_rows(parse_fixtures("members", "members.yml", "ada:\n  email: a@b.c\n  password: secret123\n").as(FixtureSet), tables).as(Array(FixtureRow))
+  assert members[0].columns == ["id", "email", "encrypted_password"]   # Devise's column
 
   # what is wrong is said, with the file and the label
   bad = parse_fixtures("books", "books.yml", "x:\n  nope: 1\n").as(FixtureSet)
