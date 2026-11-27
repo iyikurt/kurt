@@ -78,8 +78,10 @@ end
 # What follows it on the same line is line *line* of *path*, for errors and
 # for `render`. It is written in front of that line: on a line of its own,
 # iyi counts the newline after it too and every location is one too far.
+# The path is read as a string literal, so a Windows path's backslashes are
+# escaped: unescaped, `\b` in `C:\src\blog` was a backspace.
 pub def pragma(path : String, line : Int32) : String
-  "#<loc:\"" + path + "\"," + line.to_s + ",1>"
+  "#<loc:\"" + path.gsub("\\", "\\\\").gsub("\"", "\\\"") + "\"," + line.to_s + ",1>"
 end
 
 # The file's own `import` lines, and its lines with each of them blanked, so
@@ -431,7 +433,7 @@ pub def fixtures_module(sets : Array(FixtureSet), models : Array(Tuple(String, S
   out += "import kurt/schema::{Table, parse}\nimport kurt/fixtures::{reload_fixtures}\n\n"
   unless sets.empty?
     # Each test file imports this module, so each starts with the fixtures.
-    out += "case failure = reload_fixtures(database, postgres?, parse(File.read(\"" + schema_path + "\")), \"" + dir + "\")\n"
+    out += "case failure = reload_fixtures(database, postgres?, parse(File.read(" + string_literal(schema_path) + ")), " + string_literal(dir) + ")\n"
     out += "in Nil     then nil\nin DBError then raise \"loading test/fixtures: \" + failure.message\n"
     out += "in String  then raise failure\nend\n\n"
   end
@@ -443,7 +445,7 @@ pub def fixtures_module(sets : Array(FixtureSet), models : Array(Tuple(String, S
     out += "pub def " + set.table + "(label : Symbol) : " + name + "\n"
     out += "  id = case label.to_s\n"
     set.labels.each { |label| out += "       when \"" + label + "\" then " + fixture_id(label).to_s + "_i64\n" }
-    out += "       else raise \"no fixture \" + label.inspect + \" in " + set.path + "\"\n"
+    out += "       else raise \"no fixture \" + label.inspect + \" in \" + " + string_literal(set.path) + "\n"
     out += "       end\n"
     out += "  case found = " + name + ".find(id)\n"
     out += "  in " + name + " then found\n"

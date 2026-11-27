@@ -16,6 +16,7 @@ import std/random::{Random}
 import std/process::{Process, ProcessResult, ProcessError, ChildProcess, Redirect}
 import std/file
 import std/signal::{Signal}
+import std/digest::{SHA256}
 import std/regex::{Regex}
 import db
 import sqlite
@@ -33,6 +34,21 @@ import exporter::{get_paths, output_file, local_links}
 import inflector::{pluralize}
 
 VERSION = "0.1.0"
+
+# What iyi writes for `-o NAME`: NAME.exe and NAME.pdb on Windows (given
+# the .exe, which a NAME with a dot in it is not given), NAME and
+# NAME.dwarf elsewhere.
+{% if flag?(:win32) %}
+  EXE = ".exe"
+  DEBUG_INFO = ".pdb"
+{% else %}
+  EXE = ""
+  DEBUG_INFO = ".dwarf"
+{% end %}
+
+def debug_info(executable : String) : String
+  executable[0, executable.size - EXE.size] + DEBUG_INFO
+end
 
 USAGE = <<-TEXT
 kurt #{VERSION}: an MVC web framework for iyi
@@ -147,29 +163,39 @@ end
 
 # Where the Tailwind CLI is kept, once for every application.
 def kurt_cache : String
+  {% if flag?(:win32) %}
+    if local = Program.env("LOCALAPPDATA")
+      return local + "/kurt"
+    end
+  {% end %}
   base = Program.env("XDG_CACHE_HOME") || ((Program.env("HOME") || ".") + "/.cache")
   base + "/kurt"
 end
 
 def tailwind_binary : String
-  kurt_cache + "/tailwindcss-v" + TAILWIND_VERSION
+  kurt_cache + "/tailwindcss-v" + TAILWIND_VERSION + EXE
 end
 
 # The Tailwind release file for this machine: tailwindcss-macos-arm64 and
 # the like.
 def tailwind_asset : String?
-  case result = Process.run("uname", ["-sm"])
-  in ProcessResult
-    parts = result.stdout.strip.split(" ")
-    return nil unless result.success? && parts.size == 2
-    os = parts[0] == "Darwin" ? "macos" : (parts[0] == "Linux" ? "linux" : "")
-    arch = parts[1] == "arm64" || parts[1] == "aarch64" ? "arm64" : (parts[1] == "x86_64" ? "x64" : "")
-    return nil if os.empty? || arch.empty?
-    musl = os == "linux" && File.exists?("/etc/alpine-release") ? "-musl" : ""
-    "tailwindcss-" + os + "-" + arch + musl
-  in ProcessError, Cancelled
-    nil
-  end
+  {% if flag?(:win32) %}
+    # The one Windows build; an arm64 Windows runs it under x64 emulation.
+    "tailwindcss-windows-x64.exe"
+  {% else %}
+    case result = Process.run("uname", ["-sm"])
+    in ProcessResult
+      parts = result.stdout.strip.split(" ")
+      return nil unless result.success? && parts.size == 2
+      os = parts[0] == "Darwin" ? "macos" : (parts[0] == "Linux" ? "linux" : "")
+      arch = parts[1] == "arm64" || parts[1] == "aarch64" ? "arm64" : (parts[1] == "x86_64" ? "x64" : "")
+      return nil if os.empty? || arch.empty?
+      musl = os == "linux" && File.exists?("/etc/alpine-release") ? "-musl" : ""
+      "tailwindcss-" + os + "-" + arch + musl
+    in ProcessError, Cancelled
+      nil
+    end
+  {% end %}
 end
 
 # Downloads *url* to *path* with curl; false, with the reason printed, when
@@ -185,18 +211,6 @@ def fetch(url : String, path : String) : Bool
   in Cancelled
     false
   end
-end
-
-def sha256(path : String) : String?
-  [{"shasum", ["-a", "256", path]}, {"sha256sum", [path]}].each do |tool|
-    case result = Process.run(tool[0], tool[1])
-    in ProcessResult
-      return result.stdout.split(" ")[0] if result.success?
-    in ProcessError, Cancelled
-      nil
-    end
-  end
-  nil
 end
 
 # The Tailwind CLI, downloaded on first use and checked against the
@@ -218,7 +232,7 @@ def ensure_tailwind : String?
   if ok
     line = File.read(sums).lines.find { |l| l.strip.ends_with?(asset) }
     expected = line ? line.split(" ")[0] : ""
-    if expected.empty? || sha256(partial) != expected
+    if expected.empty? || SHA256.hexdigest(File.read(partial)) != expected
       STDERR.puts "kurt: the downloaded Tailwind CLI does not match its checksum; not using it"
       ok = false
     end
@@ -228,7 +242,9 @@ def ensure_tailwind : String?
     File.delete(partial) if File.exists?(partial)
     return nil
   end
-  Process.run("chmod", ["+x", partial])
+  {% unless flag?(:win32) %}
+    Process.run("chmod", ["+x", partial])
+  {% end %}
   File.rename(partial, binary)
   say("create", binary)
   binary
@@ -950,8 +966,8 @@ def cmd_dev(args : Array(String)) : Nil
   if args.includes?("--no-reload")
     exec_iyi(["run", build_app(name), "--"] + args.reject { |a| a == "--no-reload" })
   end
-  binary = ".kurt/bin/" + name
-  fresh = binary + ".next"
+  binary = ".kurt/bin/" + name + EXE
+  fresh = ".kurt/bin/" + name + ".next" + EXE
   seen = snapshot
   build_css
   server = compile(name, binary) ? start_server(binary, args) : nil
@@ -960,7 +976,12 @@ def cmd_dev(args : Array(String)) : Nil
     # However kurt dev is stopped (Ctrl+C, a kill, a closed terminal),
     # the server it started stops with it rather than holding the port.
     g.spawn(unit: :same) do
-      Signal.wait(Signal::INT, Signal::TERM, Signal::HUP)
+      # Windows' console has INT (Ctrl+C) and TERM (closed, log off), no HUP.
+      {% if flag?(:win32) %}
+        Signal.wait(Signal::INT, Signal::TERM)
+      {% else %}
+        Signal.wait(Signal::INT, Signal::TERM, Signal::HUP)
+      {% end %}
       stop_server(server)
       exit 0
     end
@@ -978,7 +999,7 @@ def cmd_dev(args : Array(String)) : Nil
       next unless compile(name, fresh)
       stop_server(server)
       File.rename(fresh, binary)
-      File.rename(fresh + ".dwarf", binary + ".dwarf") if File.exists?(fresh + ".dwarf")
+      File.rename(debug_info(fresh), debug_info(binary)) if File.exists?(debug_info(fresh))
       server = start_server(binary, args)
     end
   end
@@ -1083,7 +1104,7 @@ def cmd_export(args : Array(String)) : Nil
     fail(dir + " is not empty and kurt export did not write it; name another directory")
   end
   fail("the CSS did not build") unless build_css(minify: true)
-  binary = ".kurt/bin/" + name + "-export"
+  binary = ".kurt/bin/" + name + "-export" + EXE
   fail("the application does not build") unless compile(name, binary)
 
   routes = case listed = Process.run(binary, [] of String, env: {"KURT_PRINT_ROUTES" => "1"})
@@ -1149,7 +1170,7 @@ def cmd_export(args : Array(String)) : Nil
   File.delete(part) if File.exists?(part)
   stop_server(server)
   File.delete(binary) if File.exists?(binary)
-  File.delete(binary + ".dwarf") if File.exists?(binary + ".dwarf")
+  File.delete(debug_info(binary)) if File.exists?(debug_info(binary))
   puts "kurt: " + pages.to_s + " pages in " + dir + "/" + (skipped > 0 ? ", " + skipped.to_s + " skipped" : "") +
        (Dir.exists?("public") ? ", with public/" : "")
 end
