@@ -6,7 +6,7 @@
   </p>
   <p align="center">
     <img src="https://img.shields.io/badge/iyi-0.21+-BE0E29?style=for-the-badge" alt="iyi 0.21+">
-    <img src="https://img.shields.io/badge/version-0.2.0-960720?style=for-the-badge" alt="version 0.2.0">
+    <img src="https://img.shields.io/badge/version-0.3.0-960720?style=for-the-badge" alt="version 0.3.0">
     <img src="https://img.shields.io/badge/license-MIT-FDA4AF?style=for-the-badge&labelColor=2A0A12" alt="MIT license">
   </p>
 </p>
@@ -91,13 +91,13 @@ directory (the first entry of `iyi env IYI_LIBRARY_PATH`). Kurt and the
 applications it creates both link against them.
 
 Kurt is an iyi package, `github.com/iyikurt/kurt`, versioned by git tags
-(`v0.2.0`):
+(`v0.3.0`):
 - `kurt new` writes its own version into the application's `iyi.mod`.
 - iyi downloads the package on the first build.
 - The application's files import it as `kurt/...`:
 
 ```
-require github.com/iyikurt/kurt v0.2.0 as kurt
+require github.com/iyikurt/kurt v0.3.0 as kurt
 ```
 
 When working on Kurt itself, `KURT_PATH=~/src/kurt kurt new app` adds a
