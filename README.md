@@ -23,8 +23,8 @@ kurt dev            # http://localhost:3000/posts
 
 Requirements:
 - iyi 0.21.0 or later (tested with 0.22.0).
-- A C compiler (`cc`).
-- SQLite (macOS ships it).
+- A C compiler (`cc`); on Windows, the Visual C++ build tools iyi links with.
+- SQLite (macOS ships it; on Windows `make install` fetches it).
 - PostgreSQL is optional.
 
 ## Install
@@ -36,6 +36,13 @@ make install           # builds bin/kurt and links it to ~/.local/bin/kurt
 export PATH="$HOME/.local/bin:$PATH"
 kurt version
 ```
+
+On Windows, `make install` (GNU make, from PowerShell, cmd or Git Bash) puts
+`bin\` on your user `PATH` instead; open a new terminal for `kurt`. It also
+downloads SQLite's x64 DLL from sqlite.org and makes its import library with
+MSVC's `lib.exe`, and puts `sqlite3.dll` and `sqlite3.lib` in iyi's library
+directory (the first entry of `iyi env IYI_LIBRARY_PATH`). Kurt and the
+applications it creates both link against them.
 
 Kurt is an iyi package, `github.com/iyikurt/kurt`, versioned by git tags
 (`v0.1.0`):
