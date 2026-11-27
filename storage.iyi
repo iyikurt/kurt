@@ -43,7 +43,7 @@ import db/db/value::{DBValue}
 import web/iyi_web/multipart::{FileUpload}
 import web/iyi_web/router::{Router}
 import datasource::{database, placeholders, postgres?}
-import model::{Errors, Transaction}
+import model::{Errors, Transaction, session_for}
 
 pub import web/iyi_web/multipart
 
@@ -131,11 +131,7 @@ def read_attachments(sql : String, args : Array(DBValue), on : Transaction? = ni
     size = rs.read(Int64)
     Attachment.new(id.as(Int64), key.as(String), filename.as(String), type.as(String), size.as(Int64))
   end
-  if tx = on
-    tx.connection.query_all(placeholders(sql), args: args) { |rs| reader.call(rs) }
-  else
-    database.query_all(placeholders(sql), args: args) { |rs| reader.call(rs) }
-  end
+  session_for(on).query_all(placeholders(sql), args: args) { |rs| reader.call(rs) }
 end
 
 COLUMNS = "id, key, filename, content_type, byte_size"
@@ -174,11 +170,7 @@ def insert_attachment(record_type : String, record_id : Int64, name : String, ke
   sql = placeholders("INSERT INTO kurt_attachments (record_type, record_id, name, key, filename, content_type, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")
   args = [record_type.as(DBValue), record_id.as(DBValue), name.as(DBValue), key.as(DBValue), filename.as(DBValue),
           content_type.as(DBValue), size.as(DBValue), Time.utc.to_unix.as(DBValue)]
-  id = if tx = on
-         tx.connection.query_one(sql, args: args, as: Int64)
-       else
-         database.query_one(sql, args: args, as: Int64)
-       end
+  id = session_for(on).query_one(sql, args: args, as: Int64)
   if id.is_a?(DBError)
     File.delete(path_for(key)) if File.exists?(path_for(key))
     return id
@@ -191,11 +183,7 @@ pub def purge(attachments : Array(Attachment), on : Transaction? = nil) : Nil | 
   attachments.each do |attachment|
     sql = placeholders("DELETE FROM kurt_attachments WHERE id = ?")
     args = [attachment.id.as(DBValue)]
-    if tx = on
-      tx.connection.exec(sql, args: args)!
-    else
-      database.exec(sql, args: args)!
-    end
+    session_for(on).exec(sql, args: args)!
     File.delete(attachment.path) if File.exists?(attachment.path)
   end
   nil

@@ -9,4 +9,8 @@ assert session_secret_problem("x" * 32).nil?
 # outside production the development secret stands in
 assert !production?
 assert session_secret("dev-secret") == (Program.env("SESSION_SECRET") || "dev-secret")
+# the pool asks again at once when every connection is busy
+assert pool_url("sqlite3:./db/test.sqlite3") == "sqlite3:./db/test.sqlite3?retry_delay=0"
+assert pool_url("postgres://db/app?max_pool_size=5") == "postgres://db/app?max_pool_size=5&retry_delay=0"
+assert pool_url("postgres://db/app?retry_delay=0.1") == "postgres://db/app?retry_delay=0.1"
 puts "environment: all assertions passed"

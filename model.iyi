@@ -170,6 +170,16 @@ pub class Transaction
   end
 end
 
+# Where a statement runs: the transaction's connection when there is one,
+# the pool when not.
+pub def session_for(on : Transaction?) : ::Db::Core::Connection | ::Db::Core::Database
+  if tx = on
+    tx.connection
+  else
+    database
+  end
+end
+
 # A transaction of its own, or one nested in *on* (a savepoint).
 pub def transaction(on : Transaction? = nil, & : Transaction -> T) : T | Nil | DBError forall T
   if outer = on
@@ -546,11 +556,7 @@ pub class Query(T)
     if failed = failure
       return failed
     end
-    rows = if tx = @on
-             tx.connection.query_all(placeholders(to_sql), args: args, as: T)!
-           else
-             database.query_all(placeholders(to_sql), args: args, as: T)!
-           end
+    rows = session_for(@on).query_all(placeholders(to_sql), args: args, as: T)!
     if names = @includes
       names.each do |name|
         if failure = T.__kurt_preload(rows, name, @on)
@@ -595,11 +601,7 @@ pub class Query(T)
     if failed = failure
       return failed
     end
-    if tx = @on
-      tx.connection.scalar(placeholders(sql), args: args)
-    else
-      database.scalar(placeholders(sql), args: args)
-    end
+    session_for(@on).scalar(placeholders(sql), args: args)
   end
 
   def count : Int64 | DBError
@@ -623,8 +625,24 @@ pub class Query(T)
     end
   end
 
+  # Whether any row matches. EXISTS stops at the first one, where COUNT
+  # would read them all.
   def exists? : Bool | DBError
-    count! > 0
+    if loaded = @preloaded
+      return !loaded.empty?
+    end
+    groups = @groups
+    inner = if (groups && !groups.empty?) || @distinct || @select
+              "SELECT 1 FROM (" + to_sql + ") AS kurt_counted"
+            else
+              "SELECT 1" + from_clause
+            end
+    case value = scalar("SELECT EXISTS (" + inner + ")")!
+    when Bool  then value
+    when Int64 then value != 0
+    when Int32 then value != 0
+    else            false
+    end
   end
 
   # Deletes every row the query matches, without loading them; answers how
@@ -638,11 +656,7 @@ pub class Query(T)
           else
             "DELETE FROM " + T.table_name + where_clause
           end
-    if tx = @on
-      tx.connection.exec(placeholders(sql), args: @args)!.rows_affected
-    else
-      database.exec(placeholders(sql), args: @args)!.rows_affected
-    end
+    session_for(@on).exec(placeholders(sql), args: @args)!.rows_affected
   end
 
   # ---- values instead of models ---------------------------------------
@@ -672,11 +686,7 @@ pub class Query(T)
       rows << row
       nil
     end
-    if tx = @on
-      tx.connection.query_each(placeholders(sql), args: args) { |rs| reader.call(rs) }!
-    else
-      database.query_each(placeholders(sql), args: args) { |rs| reader.call(rs) }!
-    end
+    session_for(@on).query_each(placeholders(sql), args: args) { |rs| reader.call(rs) }!
     if failed = problem
       return failed
     end
@@ -970,11 +980,7 @@ end
 pub def insert_row(table : String, names : Array(String), values : Array(DBValue), on : Transaction? = nil) : Int64 | DBError
   marks = names.map { |_| "?" }
   sql = placeholders("INSERT INTO " + table + " (" + names.join(", ") + ") VALUES (" + marks.join(", ") + ") RETURNING id")
-  if tx = on
-    tx.connection.query_one(sql, args: values, as: Int64)
-  else
-    database.query_one(sql, args: values, as: Int64)
-  end
+  session_for(on).query_one(sql, args: values, as: Int64)
 end
 
 pub def update_row(table : String, names : Array(String), values : Array(DBValue), id : Int64, on : Transaction? = nil) : Int64 | DBError
@@ -1043,11 +1049,7 @@ def bulk_write(table : String, names : Array(String), values : Array(DBValue), c
   marks = "(" + names.map { |_| "?" }.join(", ") + ")"
   count = names.empty? ? 0 : values.size // names.size
   sql = "INSERT INTO " + table + " (" + names.join(", ") + ") VALUES " + (Array.new(count) { marks }).join(", ") + conflict + " RETURNING id"
-  if tx = on
-    tx.connection.query_all(placeholders(sql), args: values, as: Int64)
-  else
-    database.query_all(placeholders(sql), args: values, as: Int64)
-  end
+  session_for(on).query_all(placeholders(sql), args: values, as: Int64)
 end
 
 pub def insert_all(table : String, columns : Array(String), rows : Array(R), skip_duplicates : Bool, on : Transaction?) : Array(Int64) | DBError forall R
@@ -1070,11 +1072,7 @@ end
 
 # An UPDATE or DELETE, in *on* when there is one; how many rows it touched.
 def write_rows(sql : String, args : Array(DBValue), on : Transaction?) : Int64 | DBError
-  if tx = on
-    tx.connection.exec(placeholders(sql), args: args)!.rows_affected
-  else
-    database.exec(placeholders(sql), args: args)!.rows_affected
-  end
+  session_for(on).exec(placeholders(sql), args: args)!.rows_affected
 end
 
 # ---------------------------------------------------------------------------
@@ -1505,12 +1503,11 @@ pub macro model(declaration)
     end
   \{% end %}
 
+  # Worked out once: every statement names it.
+  KURT_TABLE_NAME = \{% if ann = @type.annotation(::Kurt::Model::Table) %}\{{ ann[0] }}\{% else %}::Kurt::Inflector.pluralize(::Kurt::Inflector.underscore({{ declaration[:name] }}))\{% end %}
+
   def self.table_name : String
-    \{% if ann = @type.annotation(::Kurt::Model::Table) %}
-      \{{ ann[0] }}
-    \{% else %}
-      ::Kurt::Inflector.pluralize(::Kurt::Inflector.underscore({{ declaration[:name] }}))
-    \{% end %}
+    KURT_TABLE_NAME
   end
 
   # The class's own name, unqualified: "Post".
@@ -1920,9 +1917,12 @@ pub macro belongs_to(decl, foreign_key = nil)
 
   ::Kurt::Model.__kurt_preload_link({{ decl.var.stringify }}, {{ @type.methods.any? { |m| m.name == "__kurt_preload_into" } }}) do |records, on|
     ids = [] of ::Db::Value::DBValue
+    seen = {} of Int64 => Bool
     records.each do |record|
       id = record.{{ key }}
-      ids << id unless id.nil? || id == 0 || ids.includes?(id)
+      next if id.nil? || id == 0 || seen.has_key?(id.to_i64)
+      seen[id.to_i64] = true
+      ids << id
     end
     found = ids.empty? ? [] of {{ decl.type }} : {{ decl.type }}.query.on(on).where_in("id", ids).all!
     by_id = {} of Int64 => {{ decl.type }}

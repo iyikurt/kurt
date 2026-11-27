@@ -150,6 +150,9 @@ def routes : Router
   resources "articles", PostsController, only: [:index] do
     resources "notes", NotesController
   end
+  resources "people", PostsController, only: [:index] do
+    resources "notes", NotesController, only: [:index]
+  end
   namespace "admin" do
     get "/stats", StatsController, :index
   end
@@ -280,6 +283,12 @@ summaries = routes.route_docs.map { |pair| pair[1].method + " " + pair[0] + " " 
 assert summaries.includes?("GET /articles/:post_id/notes NotesController#index") == false
 assert summaries.includes?("GET /articles/:article_id/notes NotesController#index")
 assert summaries.includes?("GET /admin/stats StatsController#index")
+# the parent's key is singular as the inflector makes it
+assert summaries.includes?("GET /people/:person_id/notes NotesController#index")
+# a path ending in .json gets its error in JSON
+missing = dispatch(app, "GET", "/posts/999999.json").response
+assert missing.status_code == 404
+assert missing.body == %({"error":"not found"})
 table = routes_table(routes)
 assert table.lines.first.strip.starts_with?("Verb")
 assert table.includes?("/articles/:article_id/notes/:id")

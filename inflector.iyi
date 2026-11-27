@@ -55,36 +55,37 @@ end
 
 # `BlogPost` -> `blog_post`.
 pub def underscore(word : String) : String
-  out = ""
-  i = 0
-  while i < word.size
-    c = word[i]
-    if c.ascii_uppercase?
-      out += "_" if i > 0 && (word[i - 1].ascii_lowercase? || word[i - 1].ascii_number?)
-      out += c.downcase.to_s
-    else
-      out += c.to_s
+  String.build(word.bytesize + 4) do |io|
+    previous = ' '
+    first = true
+    word.each_char do |c|
+      if c.ascii_uppercase?
+        io << '_' if !first && (previous.ascii_lowercase? || previous.ascii_number?)
+        io << c.downcase
+      else
+        io << c
+      end
+      previous = c
+      first = false
     end
-    i += 1
   end
-  out
 end
 
 # `blog_post` -> `BlogPost`.
 pub def camelize(word : String) : String
-  out = ""
-  upper = true
-  word.each_char do |c|
-    if c == '_' || c == '-'
-      upper = true
-    elsif upper
-      out += c.upcase.to_s
-      upper = false
-    else
-      out += c.to_s
+  String.build(word.bytesize) do |io|
+    upper = true
+    word.each_char do |c|
+      if c == '_' || c == '-'
+        upper = true
+      elsif upper
+        io << c.upcase
+        upper = false
+      else
+        io << c
+      end
     end
   end
-  out
 end
 
 # `post_id` -> `Post id`, for labels and messages.

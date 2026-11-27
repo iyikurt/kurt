@@ -1,13 +1,16 @@
 # Where the application runs and which database it talks to. Nothing here
-# opens anything: `kurt/connection` holds the pool, and the CLI opens its
+# opens anything: `kurt/datasource` holds the pool, and the CLI opens its
 # own for `db:migrate`.
 module environment
 
 import std/text
 
-# development, test or production; KURT_ENV picks it.
+# development, test or production; KURT_ENV picks it. Read once: a
+# signed-in check asks on every request.
+ENV_NAME = Program.env("KURT_ENV") || "development"
+
 pub def env : String
-  Program.env("KURT_ENV") || "development"
+  ENV_NAME
 end
 
 pub def production? : Bool
@@ -24,6 +27,15 @@ pub def database_url : String
     return url unless url.empty?
   end
   "sqlite3:./db/" + env + ".sqlite3"
+end
+
+# *url* with the pool settings Kurt changes, unless it sets them itself.
+# When every connection is busy, the db package sleeps `retry_delay`
+# (0.2 s) before it asks again, so under load a request waited 200 ms for
+# a connection that came free in microseconds. With 0 it asks at once.
+pub def pool_url(url : String) : String
+  return url if url.includes?("retry_delay=")
+  url + (url.includes?("?") ? "&" : "?") + "retry_delay=0"
 end
 
 pub def postgres_url?(url : String) : Bool

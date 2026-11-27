@@ -37,7 +37,7 @@ import db/db/errors::{DBError}
 import db/db/value::{DBValue}
 import datasource::{database, placeholders, postgres?}
 import environment::{env}
-import model::{NotFound, Transaction}
+import model::{NotFound, Transaction, session_for}
 import json_writer
 
 pub import std/json
@@ -164,11 +164,7 @@ pub def outcome(result : T) : String? forall T
 end
 
 def write(sql : String, args : Array(DBValue), on : Transaction? = nil) : Int64 | DBError
-  if tx = on
-    tx.connection.exec(placeholders(sql), args: args)!.rows_affected
-  else
-    database.exec(placeholders(sql), args: args)!.rows_affected
-  end
+  session_for(on).exec(placeholders(sql), args: args)!.rows_affected
 end
 
 # Puts a job in the queue, to run *wait* seconds from now: its id. In *on*,
@@ -177,11 +173,7 @@ pub def enqueue(job_class : String, arguments : String, queue : String = "defaul
   now = Time.utc.to_unix
   values = [queue.as(DBValue), job_class.as(DBValue), arguments.as(DBValue), (now + wait).as(DBValue), now.as(DBValue)]
   sql = placeholders("INSERT INTO kurt_jobs (queue, job_class, arguments, run_at, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id")
-  if tx = on
-    tx.connection.query_one(sql, args: values, as: Int64)
-  else
-    database.query_one(sql, args: values, as: Int64)
-  end
+  session_for(on).query_one(sql, args: values, as: Int64)
 end
 
 # A job the worker took.

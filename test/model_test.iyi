@@ -238,6 +238,9 @@ def run_queries : Nil | DBError | NotFound | Invalid
   assert Note.joins(:writer).where("writers.name", "Ada").order(:id).all!.map(&.title) == ["One", "Two"]
   assert Note.joins(:remarks).count! == 3
   assert Note.joins(:remarks).distinct.count! == 2
+  assert Note.joins(:remarks).exists?!
+  assert Note.joins(:remarks).distinct.exists?!
+  assert !Note.where(writer_id: 999_999).exists?!
   assert Note.joins(:remarks).distinct.order(:id).all!.map(&.title) == ["One", "Three"]
   assert Note.joins(:tags).where("tags.name", "red").order(:id).pluck(:title, String)! == ["One", "Two"]
   assert Writer.joins(:remarks).distinct.order(:name).pluck(:name, String)! == ["Ada", "Bob"]

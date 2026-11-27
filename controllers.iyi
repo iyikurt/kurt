@@ -180,9 +180,7 @@ pub class Controller
   # The request asked for JSON: an Accept header naming it, a JSON body, or
   # a path ending in `.json`.
   def wants_json? : Bool
-    accept = @env.request.headers["Accept"]? || ""
-    type = @env.request.headers["Content-Type"]? || ""
-    accept.includes?("application/json") || type.includes?("application/json") || @env.request.path.ends_with?(".json")
+    ::Kurt::Controllers.json_request?(@env)
   end
 
   # Writes *data* as JSON: the text `JSON.to_json` writes, built without
@@ -470,14 +468,15 @@ pub macro render(name, layout = "application", status = nil, collection = nil, *
     {% if collection %}
       {% item = name.split("/").last.gsub(/^_/, "").gsub(/\.eiy$/, "") %}
       begin
-        __kurt_parts = [] of String
-        {{ collection }}.each do |{{ item.id }}|
-          {% for key, value in locals %}
-            {{ key.id }} = {{ value }}
-          {% end %}
-          __kurt_parts << ::IyiWeb::Templates.render({{ name }}).to_s
+        __kurt_html = String.build do |__kurt_io|
+          {{ collection }}.each do |{{ item.id }}|
+            {% for key, value in locals %}
+              {{ key.id }} = {{ value }}
+            {% end %}
+            __kurt_io << ::IyiWeb::Templates.render({{ name }}).to_s
+          end
         end
-        ::IyiWeb::Templates::SafeHTML.new(__kurt_parts.join)
+        ::IyiWeb::Templates::SafeHTML.new(__kurt_html)
       end
     {% elsif locals.empty? %}
       ::IyiWeb::Templates.render({{ name }})
@@ -744,10 +743,9 @@ pub macro resources(name, controller, only = nil, except = nil, param = nil, &bl
     ::Kurt::Controllers.action router, :post, {{ base + "/:id/delete" }}, {{ controller }}, :destroy
   {% end %}
   {% if block %}
-    {% plural = name.id.stringify %}
-    {% one = plural.ends_with?("ies") ? plural[0...-3] + "y" : (plural.ends_with?("ses") || plural.ends_with?("xes") || plural.ends_with?("ches") || plural.ends_with?("shes") ? plural[0...-2] : (plural.ends_with?("s") ? plural[0...-1] : plural)) %}
-    {% key = param ? param.id.stringify : one + "_id" %}
-    router.namespace({{ base + "/:" + key }}) do |router|
+    # The parent's id parameter: `post_id` under /posts, `person_id` under
+    # /people, singular as the inflector makes it.
+    router.namespace({% if param %}{{ base + "/:" + param.id.stringify }}{% else %}{{ base + "/:" }} + ::Kurt::Inflector.singularize({{ name.id.stringify }}) + "_id"{% end %}) do |router|
       {{ block.body }}
     end
   {% end %}
@@ -842,13 +840,15 @@ pub def live_reload? : Bool
 end
 
 def escape(text : String) : String
-  text.gsub("&", "&amp;").gsub("<", "&lt;").gsub(">", "&gt;").gsub("\"", "&quot;")
+  HTML.escape(text)
 end
 
-def json_request?(env : Context) : Bool
+# The request asked for JSON: an Accept header naming it, a JSON body, or
+# a path ending in `.json`. The error pages answer such a request in JSON.
+pub def json_request?(env : Context) : Bool
   accept = env.request.headers["Accept"]? || ""
   type = env.request.headers["Content-Type"]? || ""
-  accept.includes?("application/json") || type.includes?("application/json")
+  accept.includes?("application/json") || type.includes?("application/json") || env.request.path.ends_with?(".json")
 end
 
 def page(title : String, body : String) : String
@@ -876,8 +876,7 @@ pub def install_error_pages(router : Router, login_path : String = "/users/sign_
     env.response.status_code = 422
     if json_request?(env)
       env.response.content_type = "application/json"
-      items = err.errors.full_messages.map { |m| "\"" + m.gsub("\\", "\\\\").gsub("\"", "\\\"") + "\"" }
-      %({"errors":[) + items.join(",") + "]}"
+      ::Kurt::JsonWriter.generate({"errors" => err.errors.full_messages})
     else
       list = err.errors.full_messages.map { |m| "<li>" + escape(m) + "</li>" }.join
       page("Invalid", "<h1>" + escape(err.model) + " could not be saved</h1><ul>" + list + "</ul>")

@@ -10,9 +10,9 @@ import db
 import sqlite
 import pg
 import db/db/core::{Database}
-import environment::{database_url, postgres_url?, numbered_placeholders}
+import environment::{database_url, pool_url, postgres_url?, numbered_placeholders}
 
-DATABASE = Db.open(database_url).or_panic
+DATABASE = Db.open(pool_url(database_url)).or_panic
 POSTGRES = postgres_url?(database_url)
 
 pub def database : Database
