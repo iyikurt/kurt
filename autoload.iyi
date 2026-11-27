@@ -15,6 +15,7 @@
 #   app/models.iyi       every model, with `pub`, a `property` per column of
 #                        its table in db/schema.json, and `derive model` added
 #   app/mailers.iyi      every mailer, ApplicationMailer first
+#   app/jobs.iyi         every job, and the worker that runs them
 #   app/controllers.iyi  every controller, ApplicationController first, with
 #                        `@post : Post = Post.new` and `@posts : Array(Post) =
 #                        [] of Post` declared for the model variables it uses
@@ -59,6 +60,12 @@ pub def controllers_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
    "import web/iyi_web/templates::{raw, content_for, yield_content}",
    "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import kurt/devise::*",
+   "import app/models::*", "import app/mailers::*", "import app/jobs::*"]
+end
+
+pub def jobs_imports : Array(String)
+  ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
+   "import kurt/jobs::*", "import kurt/model::*", "import kurt/mailers::{perform_delivery}",
    "import app/models::*", "import app/mailers::*"]
 end
 
@@ -73,6 +80,7 @@ pub def entry_imports : Array(String)
    "import web/iyi_web/security_headers::{SecurityHeadersHandler}", "import web/iyi_web/request_id::{RequestIdHandler}",
    "import web/iyi_web/config::{config}",
    "import kurt/release::{run_database_command}", "import kurt/environment::{session_secret, production?}",
+   "import kurt/jobs::{in_server?, stop_workers}", "import app/jobs::{work_jobs}",
    "import app/routes::*"]
 end
 
@@ -81,6 +89,7 @@ pub def test_imports : Array(String)
    "import web/iyi_web/harness::*", "import web/iyi_web/handler::{chain}", "import web/iyi_web/session::{SessionHandler}",
    "import kurt/model::*", "import kurt/controllers::{sign_in_as, sign_in, sign_out}", "import app/models::*", "import app/routes::*",
    "import kurt/mailers::{deliveries, clear_deliveries, Message}", "import app/mailers::*",
+   "import kurt/jobs::{enqueued_jobs, failed_jobs, clear_jobs, make_jobs_due}", "import app/jobs::*",
    "import app/fixtures::*"]
 end
 
@@ -376,6 +385,73 @@ pub def mailers_module(sources : Array(Source), models : Array(String) = [] of S
   header("app/mailers", mailers_imports, ordered) + pieces(ordered, false, model_names: models)
 end
 
+# The job classes a file declares: `class WelcomeJob < ApplicationJob`,
+# when the file has a `perform`.
+pub def job_classes(text : String) : Array(String)
+  return [] of String unless text.includes?("def perform")
+  found = [] of String
+  text.lines.each do |line|
+    next unless line.starts_with?("class ") && line.includes?("<")
+    name = line[6, line.index("<").as(Int32) - 6].strip
+    found << name unless name == "ApplicationJob"
+  end
+  found
+end
+
+# Every job, ApplicationJob first, and what the worker calls: one job class
+# by its name, each in a task of its own (a panic there is the job's
+# failure), and the loops that take them.
+pub def jobs_module(sources : Array(Source), models : Array(String) = [] of String) : String
+  ordered = sources.select { |s| s.path.ends_with?("/application_job.iyi") }
+  sources.each { |s| ordered << s unless ordered.includes?(s) }
+  names = [] of String
+  ordered.each { |source| job_classes(source.text).each { |name| names << name } }
+  out = header("app/jobs", jobs_imports, ordered) + pieces(ordered, false, model_names: models)
+  out += "# One job, by its class's name: nil when done, else why not.\n"
+  out += "def __kurt_dispatch(name : String, arguments : String) : String?\n  case name\n"
+  names.each { |name| out += "  when " + string_literal(name) + " then " + name + ".__kurt_perform(arguments)\n" }
+  out += "  when \"Kurt::Mail\" then perform_delivery(arguments)\n  else \"no job class \" + name\n  end\nend\n\n"
+  out += "def __kurt_max_attempts(name : String) : Int32\n  case name\n"
+  names.each { |name| out += "  when " + string_literal(name) + " then " + name + ".max_attempts\n" }
+  out += "  else 5\n  end\nend\n\n"
+  out += JOB_RUNNER
+  out
+end
+
+JOB_RUNNER = <<-IYI
+# A job in a task of its own: a panic in it fails the job, not the worker.
+def __kurt_run_job(job : Claimed) : Tuple(String?, Int32)
+  outcome = group do |inner|
+    task = inner.spawn do
+      __kurt_dispatch(job.job_class, job.arguments)
+    end
+    task.value
+  end
+  error = case outcome
+          when Panicked  then "panicked: " + outcome.message
+          when Cancelled then "cancelled"
+          else                outcome
+          end
+  {error, __kurt_max_attempts(job.job_class)}
+end
+
+# The worker: takes jobs until the process stops (`kurt jobs`, and beside
+# the server).
+pub def work_jobs : Int32 | DBError
+  work { |job| __kurt_run_job(job) }
+end
+
+# In a test: runs every job that is due now, and those they enqueue;
+# answers how many ran.
+pub def perform_enqueued_jobs : Int32
+  case ran = work(once: true) { |job| __kurt_run_job(job) }
+  in Int32   then ran
+  in DBError then raise "perform_enqueued_jobs: " + ran.message + " (is there a kurt_jobs table? `kurt generate job` writes its migration)"
+  end
+end
+
+IYI
+
 pub def routes_module(source : Source, generated : String) : String
   _, lines = split_imports(source.text)
   body = header("app/routes", routes_imports, [source])
@@ -425,15 +501,54 @@ pub def database_commands(migrations : Array(Tuple(String, String))) : String
   out + "if (command = Program.args[0]?) && command.starts_with?(\"db:\")\n  exit run_database_command(command, KURT_MIGRATIONS)\nend\n\n"
 end
 
+# `./bin/app jobs` (and `kurt jobs`): the worker alone, before
+# config/application.iyi, as the database commands.
+JOBS_COMMAND = <<-IYI
+if Program.args[0]? == "jobs"
+  STDOUT.puts "[jobs] working; Ctrl+C stops"
+  case failure = work_jobs
+  in Int32 then exit 0
+  in ::Db::Errors::DBError
+    STDERR.puts "kurt jobs: " + failure.message
+    exit 1
+  end
+end
+
+IYI
+
+# The server, with a worker beside it on a thread of its own when the
+# application has a queue (its migrations make kurt_jobs) and
+# KURT_JOBS_IN_SERVER is not 0. When the server stops, so does the worker,
+# after the job it runs.
+SERVE_WITH_JOBS = <<-IYI
+if in_server?
+  group do |g|
+    g.spawn(unit: :new) do
+      work_jobs
+      0
+    end
+    mount routes
+    run
+    stop_workers
+  end
+else
+  mount routes
+  run
+end
+
+IYI
+
 pub def entry_module(app : String, config : Source?, generated : String, migrations : Array(Tuple(String, String)) = [] of Tuple(String, String)) : String
   sources = config ? [config] : [] of Source
+  # A queue exists when a migration makes it.
+  queue = migrations.any? { |pair| pair[1].includes?("CREATE TABLE kurt_jobs") }
   body = header(app, entry_imports, sources)
-  body += pragma(generated, 1) + database_commands(migrations)
+  body += pragma(generated, 1) + database_commands(migrations) + (queue ? JOBS_COMMAND : "")
   body += "config.env = ::Kurt::Environment.env    # \"[production] blog is ready...\"\nconfig.app_name = " + string_literal(app) + "\n\n"
   if source = config
     body += pragma(source.path, 1) + split_imports(source.text)[1].join("\n") + "\n"
   end
-  body + pragma(generated, 1) + PRINT_ROUTES + LIVE_ROUTE + "mount routes\nrun\n"
+  body + pragma(generated, 1) + PRINT_ROUTES + LIVE_ROUTE + (queue ? SERVE_WITH_JOBS : "mount routes\nrun\n")
 end
 
 pub def test_module(name : String, source : Source) : String

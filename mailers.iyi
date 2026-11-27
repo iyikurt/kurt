@@ -41,7 +41,12 @@ import std/mail::{Mail}
 import std/smtp::{SmtpClient, SmtpError, SmtpSecurity}
 import std/eiy::{Eiy}
 import std/uri::{URI}
+import std/base64::{Base64}
+import std/json::{JSON, Any}
 import environment::{env}
+import jobs::{enqueue}
+import json_writer
+import db/db/errors::{DBError}
 
 pub import std/eiy
 pub import web/iyi_web/templates
@@ -94,6 +99,44 @@ pub class Message
     ::Kurt::Mailers.deliver(self)
   end
 
+  # Sends it from a background job (jobs.iyi), *wait* seconds from now:
+  # the job's id. The mail is rendered now and kept in the queue.
+  def deliver_later(wait : Int32 = 0) : Int64 | DBError
+    enqueue("Kurt::Mail", to_json, "mailers", wait)
+  end
+
+  # The mail as the queue keeps it; an attachment's bytes in base64.
+  def to_json : String
+    w = ->(value : String) { ::Kurt::JsonWriter.generate(value) }
+    list = ->(values : Array(String)) { "[" + values.map { |v| ::Kurt::JsonWriter.generate(v) }.join(",") + "]" }
+    maybe = ->(value : String?) { value ? ::Kurt::JsonWriter.generate(value) : "null" }
+    files = @attachments.map do |file|
+      "{\"filename\":" + w.call(file.filename) + ",\"data\":" + w.call(Base64.encode(file.data)) + ",\"content_type\":" + maybe.call(file.content_type) + "}"
+    end
+    "{\"to\":" + list.call(@to) + ",\"cc\":" + list.call(@cc) + ",\"bcc\":" + list.call(@bcc) + ",\"from\":" + w.call(@from) +
+      ",\"reply_to\":" + maybe.call(@reply_to) + ",\"subject\":" + w.call(@subject) + ",\"text\":" + maybe.call(@text) +
+      ",\"html\":" + maybe.call(@html) + ",\"mailer\":" + w.call(@mailer) + ",\"attachments\":[" + files.join(",") + "]}"
+  end
+
+  # A mail `to_json` wrote, or nil when the text is not one.
+  def self.from_json(text : String) : Message?
+    data = JSON.parse?(text)
+    return nil if data.nil?
+    files = [] of Attachment
+    ::Kurt::Mailers.json_list(data, "attachments").each do |file|
+      name = ::Kurt::Mailers.json_text(file, "filename")
+      encoded = ::Kurt::Mailers.json_text(file, "data")
+      next if name.nil? || encoded.nil?
+      decoded = Base64.decode?(encoded)
+      next unless decoded.is_a?(String)
+      files << Attachment.new(name, decoded, ::Kurt::Mailers.json_text(file, "content_type"))
+    end
+    Message.new(::Kurt::Mailers.json_strings(data, "to"), ::Kurt::Mailers.json_text(data, "from") || "", ::Kurt::Mailers.json_text(data, "subject") || "",
+      ::Kurt::Mailers.json_text(data, "text"), ::Kurt::Mailers.json_text(data, "html"),
+      ::Kurt::Mailers.json_strings(data, "cc"), ::Kurt::Mailers.json_strings(data, "bcc"), ::Kurt::Mailers.json_text(data, "reply_to"), files,
+      ::Kurt::Mailers.json_text(data, "mailer") || "")
+  end
+
   # As std/mail writes it: the headers, the text and HTML as
   # multipart/alternative, the attachments.
   def to_mail : Mail::Message
@@ -140,6 +183,40 @@ end
 pub def app_url : String
   url = Program.env("APP_URL") || ""
   url.empty? ? "http://localhost:3000" : url.rstrip("/")
+end
+
+pub def json_list(data : Any, key : String) : Array(Any)
+  if found = data[key]?
+    found.as_a? || [] of Any
+  else
+    [] of Any
+  end
+end
+
+pub def json_text(data : Any, key : String) : String?
+  if found = data[key]?
+    found.as_s?
+  else
+    nil
+  end
+end
+
+pub def json_strings(data : Any, key : String) : Array(String)
+  list = [] of String
+  json_list(data, key).each do |item|
+    if text = item.as_s?
+      list << text
+    end
+  end
+  list
+end
+
+# What the job `deliver_later` enqueued does: the mail sent, or why not.
+pub def perform_delivery(arguments : String) : String?
+  message = Message.from_json(arguments)
+  return "not a mail: " + arguments[0, 80] if message.nil?
+  sent = deliver(message)
+  sent.is_a?(DeliveryError) ? sent.message : nil
 end
 
 # "Ada <ada@example.com>" or "ada@example.com".

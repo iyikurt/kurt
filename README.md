@@ -67,12 +67,14 @@ published version.
 | `kurt generate model NAME FIELD...` | Model and migration |
 | `kurt generate controller NAME ACTION...` | Controller, views and routes |
 | `kurt generate migration NAME` | An empty migration |
+| `kurt generate job NAME` | A background job, its test, and the queue's migration (`kurt_jobs`) when there is none |
 | `kurt generate mailer NAME METHOD...` | A mailer, a text and an HTML view per method, the mail layouts and a test |
 | `kurt generate authentication [MODULE...]` | Devise-like users: sign-in, sign-up, password reset, remember me; `confirmable`, `lockable`, `trackable`, `timeoutable` on request |
 | `kurt generate devise:views` / `devise:controllers` | Copies Kurt's authentication pages, mails and controllers into the application, to change them |
 | `kurt db:migrate` / `db:rollback [N]` / `db:status` / `db:reset` | Manage the schema (`db:reset` also runs the seeds) |
 | `kurt db:seed` | Runs `db/seeds.iyi` |
 | `kurt routes` | Lists every route with its path and `Controller#action` |
+| `kurt jobs` | Runs the background jobs worker on its own |
 | `kurt dev [-p PORT]` | Runs the server; on a change it rebuilds, restarts and reloads the page |
 | `kurt test` | Migrates a fresh test database and runs each `test/*_test.iyi` with fixtures |
 | `kurt build` | A release binary in `bin/NAME`, with minified CSS and the migrations inside |
@@ -100,6 +102,7 @@ app/models/post.iyi        class Post < ApplicationRecord
 app/controllers/posts_controller.iyi
 app/views/posts/index.eiy
 app/mailers/user_mailer.iyi        class UserMailer < ApplicationMailer
+app/jobs/welcome_job.iyi           class WelcomeJob < ApplicationJob
 db/migrations/20261123153000_create_posts.sql
 db/seeds.iyi               the first records of a new database
 test/posts_test.iyi
@@ -704,7 +707,79 @@ assert deliveries.last.subject == "Welcome to the blog"
 assert deliveries.last.body.includes?("Hello")
 ```
 
+`message.deliver_later` sends it from a background job instead (see
+Background jobs): the mail is rendered at once and waits in the queue. It
+answers the job's id, or a `DBError`; `deliver_later(wait: 600)` sends it
+in ten minutes. In a test, `perform_enqueued_jobs` sends what is waiting.
+
 Sending uses iyi's `std/smtp` and `std/mail`.
+
+## Background jobs
+
+```sh
+kurt generate job Notify     # app/jobs/notify_job.iyi, test/notify_job_test.iyi, and the queue's table
+kurt db:migrate
+```
+
+```iyi
+# app/jobs/notify_job.iyi
+class NotifyJob < ApplicationJob
+  queue_as :default
+  retry_attempts 5
+
+  def perform(post : Post, user : User)
+    PostMailer.created(post, user).deliver_now!
+  end
+end
+```
+
+```iyi
+NotifyJob.perform_later(@post, current_user.as(User))!   # the job's id | DBError
+NotifyJob.perform_later(@post, user, wait: 300)!         # in five minutes
+NotifyJob.perform_later(@post, user, on: tx)!            # only if the transaction commits
+NotifyJob.perform_now(@post, user)                       # here, without the queue
+```
+
+- Jobs wait in the `kurt_jobs` table, on SQLite and PostgreSQL alike.
+  `kurt generate job` writes its migration once.
+- `perform`'s arguments are kept as JSON: `String`, `Int32`, `Int64`,
+  `Float64`, `Bool`, `Time`, nil (for a `String?` argument), arrays of
+  these, and models. A model is kept as its id and found again when the
+  job runs, as Rails' GlobalID does. A record deleted in between fails the
+  job.
+- Each public `perform` gets `perform_later` and `perform_now` as class
+  methods.
+
+The worker runs inside the server, on a thread of its own, when the
+application has a queue. `KURT_JOBS_IN_SERVER=0` turns that off; then
+`kurt jobs` (or `./bin/blog jobs` on a server) runs it alone. Any number of
+workers can share the queue: on PostgreSQL a worker takes a job with
+`FOR UPDATE SKIP LOCKED`, and on SQLite the database takes one writer at a
+time.
+
+- A job fails when `perform` answers an error (hand it up with `!`). It
+  runs again after attempts⁴ + 2 seconds (3, 18, 83, 258...), until its
+  attempts are spent (5, or `retry_attempts 3`). Then it stays in the table
+  with `failed_at` and `last_error`.
+- A job that panics (`raise`) is caught in its own task. The panic is its
+  error, and the worker goes on.
+- A job a worker took and never finished (the process was killed) is taken
+  again after 15 minutes.
+- A finished job is deleted.
+- Workers poll the table every second when it is empty.
+
+Tests (`kurt test`) do not run a worker:
+
+```iyi
+clear_jobs.as(Nil)
+res = dispatch(app, form_request("POST", "/posts", "post%5Btitle%5D=Hi")).response
+assert enqueued_jobs.as(Array).size == 1      # the jobs waiting: job_class, arguments, attempts...
+assert perform_enqueued_jobs == 1             # runs the jobs that are due, and those they enqueue
+assert deliveries.last.subject == "Your post is up: Hi"
+```
+
+`failed_jobs` lists the ones whose attempts are spent, and `make_jobs_due`
+makes waiting jobs due now.
 
 ## Authentication
 
@@ -1026,7 +1101,7 @@ make test       # the tests, on SQLite in memory
 make test-pg PG_URL=postgres://user@127.0.0.1:5432/kurt_test
 ```
 
-The model, fixture and devise tests pass on both SQLite and PostgreSQL 16.
+The model, fixture, devise and jobs tests pass on both SQLite and PostgreSQL 16.
 
 | File | |
 |---|---|
@@ -1037,6 +1112,7 @@ The model, fixture and devise tests pass on both SQLite and PostgreSQL 16.
 | `forms.iyi` | `form_with`'s form builder |
 | `devise.iyi` | `devise :...` in a model: passwords, signed tokens, lockable, trackable; the sign-in rate limit |
 | `devise_generators.iyi` | `kurt generate authentication`, and the controllers, views, mails and routes Kurt ships |
+| `jobs.iyi` | `Job`, `perform_later`, the `kurt_jobs` queue, the worker loop |
 | `mailers.iyi`, `mail_views.iyi` | mailers, `deliveries`, SMTP; the program that finds a mail's views at compile time |
 | `json_writer.iyi` | the JSON that `json(data)` writes |
 | `exporter.iyi` | `kurt export`'s routes, output files and links |

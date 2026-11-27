@@ -73,6 +73,18 @@ assert smtp_settings("smtps://mail.example.com").as(SmtpSettings).port == 465
 assert smtp_settings("smtp://localhost:1025?security=none").as(SmtpSettings).security == SmtpSecurity::Cleartext
 assert smtp_settings("http://x").is_a?(DeliveryError)
 
+# deliver_later's form: the mail as JSON, and back
+copy = Message.from_json(message.attach("a.bin", "\u0000\u00ff bytes").to_json).as(Message)
+assert copy.subject == message.subject
+assert copy.text == message.text
+assert copy.html == message.html
+assert copy.from == message.from
+assert copy.attachments[0].data == "\u0000\u00ff bytes"
+assert Message.from_json("nope").nil?
+clear_deliveries
+assert perform_delivery(message.to_json).nil?
+assert deliveries.last.subject == "Welcome, Ada & <Bob>"
+
 clear_deliveries
 assert deliveries.empty?
 puts "mailer: all assertions passed"

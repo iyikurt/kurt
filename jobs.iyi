@@ -1,0 +1,429 @@
+# Background jobs, as Rails' Active Job over a database queue (Solid
+# Queue's idea): a job class with `perform`, enqueued with `perform_later`
+# into the `kurt_jobs` table, and a worker that takes them.
+#
+#   # app/jobs/welcome_job.iyi
+#   class WelcomeJob < ApplicationJob
+#     def perform(user : User, note : String)
+#       UserMailer.welcome(user, note).deliver_now!
+#     end
+#   end
+#
+#   WelcomeJob.perform_later(user, "hello")!          # Int64 (the job's id) | DBError
+#   WelcomeJob.perform_later(user, "hi", wait: 300)!  # in five minutes
+#   WelcomeJob.perform_now(user, "hello")             # here and now
+#
+# Arguments are kept as JSON: String, Int32, Int64, Float64, Bool, Time,
+# nil, arrays of these, and models, which are kept as their id and read
+# again when the job runs (Rails' GlobalID).
+#
+# The worker runs inside the server (unless KURT_JOBS_IN_SERVER=0) or on
+# its own (`kurt jobs`, `./bin/app jobs`). The queue is the `kurt_jobs`
+# table, which `kurt generate job` writes a migration for (generators.iyi). It takes one job at a time from
+# the queue - `FOR UPDATE SKIP LOCKED` on PostgreSQL, so several workers
+# share it - and runs it in a task of its own, so a job that panics is
+# reported and does not take the worker down. A job fails when `perform`
+# answers an error (`!` hands one up); it is tried again later, after
+# 3, 18, 83, 258... seconds (attempts⁴ + 2, Rails' polynomially longer),
+# until its attempts (5 unless `retry_attempts` says) are spent. Then it is
+# kept with `failed_at` and its last error.
+module jobs
+
+import std/text
+import std/time::{Time}
+import std/json::{JSON, Any}
+import std/random::{Random}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue}
+import datasource::{database, placeholders, postgres?}
+import environment::{env}
+import model::{NotFound, Transaction}
+import json_writer
+
+pub import std/json
+
+# An argument that could not be read back: the job fails with it.
+pub class DecodeError
+  getter message : String
+
+  def initialize(@message : String)
+  end
+end
+
+impl Error for DecodeError
+  def message : String
+    @message
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Arguments: to JSON and back
+# ---------------------------------------------------------------------------
+
+pub def encode(value : String) : String
+  ::Kurt::JsonWriter.generate(value)
+end
+
+pub def encode(value : Int32 | Int64 | Float64 | Bool) : String
+  value.to_s
+end
+
+pub def encode(value : Nil) : String
+  "null"
+end
+
+pub def encode(value : Time) : String
+  "{\"_time\":" + value.to_unix_ms.to_s + "}"
+end
+
+pub def encode(value : Array(T)) : String forall T
+  "[" + value.map { |item| encode(item) }.join(",") + "]"
+end
+
+# A model: its class and id, read again when the job runs.
+pub def encode(value : T) : String forall T
+  "{\"_model\":" + ::Kurt::JsonWriter.generate(T.model_name) + ",\"id\":" + value.id.to_s + "}"
+end
+
+pub def decode(value : Any, type : String.class) : String | DecodeError
+  value.as_s? || DecodeError.new("not a String: " + value.to_s)
+end
+
+pub def decode(value : Any, type : Int64.class) : Int64 | DecodeError
+  value.as_i64? || DecodeError.new("not an Int64: " + value.to_s)
+end
+
+pub def decode(value : Any, type : Int32.class) : Int32 | DecodeError
+  value.as_i? || DecodeError.new("not an Int32: " + value.to_s)
+end
+
+pub def decode(value : Any, type : Float64.class) : Float64 | DecodeError
+  if number = value.as_f?
+    return number
+  end
+  if whole = value.as_i64?
+    return whole.to_f
+  end
+  DecodeError.new("not a Float64: " + value.to_s)
+end
+
+pub def decode(value : Any, type : Bool.class) : Bool | DecodeError
+  flag = value.as_bool?
+  flag.nil? ? DecodeError.new("not a Bool: " + value.to_s) : flag
+end
+
+pub def decode(value : Any, type : Time.class) : Time | DecodeError
+  if (inner = value["_time"]?) && (ms = inner.as_i64?)
+    Time.unix_ms(ms)
+  else
+    DecodeError.new("not a Time: " + value.to_s)
+  end
+end
+
+pub def decode(value : Any, type : Array(T).class) : Array(T) | DecodeError forall T
+  items = value.as_a?
+  return DecodeError.new("not an array: " + value.to_s) if items.nil?
+  list = [] of T
+  items.each do |item|
+    one = decode(item, T)
+    return one if one.is_a?(DecodeError)
+    list << one
+  end
+  list
+end
+
+# A model, found again by its id: a record deleted since fails the job.
+pub def decode(value : Any, type : T.class) : T | DecodeError forall T
+  key = value["id"]?
+  id = key ? key.as_i64? : nil
+  return DecodeError.new("not a " + T.model_name + ": " + value.to_s) if id.nil?
+  found = T.find(id)
+  return DecodeError.new(found.message) unless found.is_a?(T)
+  found
+end
+
+# A value that may be nil: nil, or the type.
+pub def decode_nilable(value : Any, type : T.class) : T | Nil | DecodeError forall T
+  value.raw.nil? ? nil : decode(value, T)
+end
+
+pub def parse_arguments(text : String) : Array(Any) | DecodeError
+  parsed = JSON.parse?(text)
+  return DecodeError.new("arguments are not JSON: " + text) if parsed.nil?
+  parsed.as_a? || DecodeError.new("arguments are not a list: " + text)
+end
+
+# What `perform` answered, as the worker sees it: an error's message, or
+# nil for done.
+pub def outcome(result : T) : String? forall T
+  if result.is_a?(Error)
+    result.message
+  else
+    nil
+  end
+end
+
+def write(sql : String, args : Array(DBValue), on : Transaction? = nil) : Int64 | DBError
+  if tx = on
+    tx.connection.exec(placeholders(sql), args: args)!.rows_affected
+  else
+    database.exec(placeholders(sql), args: args)!.rows_affected
+  end
+end
+
+# Puts a job in the queue, to run *wait* seconds from now: its id. In *on*,
+# it is enqueued only if that transaction commits.
+pub def enqueue(job_class : String, arguments : String, queue : String = "default", wait : Int32 = 0, on : Transaction? = nil) : Int64 | DBError
+  now = Time.utc.to_unix
+  values = [queue.as(DBValue), job_class.as(DBValue), arguments.as(DBValue), (now + wait).as(DBValue), now.as(DBValue)]
+  sql = placeholders("INSERT INTO kurt_jobs (queue, job_class, arguments, run_at, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id")
+  if tx = on
+    tx.connection.query_one(sql, args: values, as: Int64)
+  else
+    database.query_one(sql, args: values, as: Int64)
+  end
+end
+
+# A job the worker took.
+pub class Claimed
+  getter id : Int64
+  getter job_class : String
+  getter arguments : String
+  getter attempts : Int64
+
+  def initialize(@id : Int64, @job_class : String, @arguments : String, @attempts : Int64)
+  end
+end
+
+# A job left locked this long was taken by a worker that stopped: it is
+# taken again.
+STALE_AFTER = 900
+
+# Takes the next job due, if any, marking it as *worker*'s.
+pub def claim(worker : String) : Claimed | Nil | DBError
+  now = Time.utc.to_unix
+  pick = "SELECT id FROM kurt_jobs WHERE failed_at IS NULL AND run_at <= ? AND (locked_at IS NULL OR locked_at < ?) ORDER BY run_at, id LIMIT 1"
+  pick += " FOR UPDATE SKIP LOCKED" if postgres?
+  sql = placeholders("UPDATE kurt_jobs SET locked_at = ?, locked_by = ? WHERE id = (" + pick + ") RETURNING id, job_class, arguments, attempts")
+  args = [now.as(DBValue), worker.as(DBValue), now.as(DBValue), (now - STALE_AFTER).as(DBValue)]
+  rows = database.query_all(sql, args: args) do |rs|
+    id = rs.read(Int64)
+    name = rs.read(String)
+    arguments = rs.read(String)
+    attempts = rs.read(Int64)
+    if id.is_a?(Int64) && name.is_a?(String) && arguments.is_a?(String) && attempts.is_a?(Int64)
+      Claimed.new(id, name, arguments, attempts)
+    else
+      nil
+    end
+  end!
+  rows.empty? ? nil : rows[0]
+end
+
+# A job that ran: gone from the queue.
+pub def complete(job : Claimed) : Nil | DBError
+  write("DELETE FROM kurt_jobs WHERE id = ?", [job.id.as(DBValue)])!
+  nil
+end
+
+# How long before attempt *attempts* + 1: attempts⁴ + 2 seconds.
+pub def backoff(attempts : Int64) : Int64
+  attempts * attempts * attempts * attempts + 2
+end
+
+# A job that failed: tried again after a while, or, once its attempts are
+# spent, kept as failed with its error.
+pub def failed(job : Claimed, error : String, max_attempts : Int32) : Nil | DBError
+  attempts = job.attempts + 1
+  now = Time.utc.to_unix
+  if attempts >= max_attempts
+    write("UPDATE kurt_jobs SET attempts = ?, failed_at = ?, last_error = ?, locked_at = NULL, locked_by = NULL WHERE id = ?",
+      [attempts.as(DBValue), now.as(DBValue), error.as(DBValue), job.id.as(DBValue)])!
+  else
+    write("UPDATE kurt_jobs SET attempts = ?, run_at = ?, last_error = ?, locked_at = NULL, locked_by = NULL WHERE id = ?",
+      [attempts.as(DBValue), (now + backoff(attempts)).as(DBValue), error.as(DBValue), job.id.as(DBValue)])!
+  end
+  nil
+end
+
+# Jobs waiting (not failed): what a test checks after an action enqueues.
+pub class Enqueued
+  getter id : Int64
+  getter job_class : String
+  getter arguments : String
+  getter attempts : Int64
+  getter run_at : Int64
+  getter last_error : String?
+  getter failed : Bool
+
+  def initialize(@id : Int64, @job_class : String, @arguments : String, @attempts : Int64, @run_at : Int64, @last_error : String?, @failed : Bool)
+  end
+end
+
+def listed(where : String) : Array(Enqueued) | DBError
+  database.query_all("SELECT id, job_class, arguments, attempts, run_at, last_error, failed_at FROM kurt_jobs WHERE " + where + " ORDER BY id") do |rs|
+    id = rs.read(Int64)
+    name = rs.read(String)
+    arguments = rs.read(String)
+    attempts = rs.read(Int64)
+    run_at = rs.read(Int64)
+    error = rs.read(String?)
+    failed_at = rs.read(Int64?)
+    Enqueued.new(id.as(Int64), name.as(String), arguments.as(String), attempts.as(Int64), run_at.as(Int64),
+      error.is_a?(String) ? error : nil, failed_at.is_a?(Int64))
+  end
+end
+
+# Every job in the queue that has not failed, oldest first.
+pub def enqueued_jobs : Array(Enqueued) | DBError
+  listed("failed_at IS NULL")
+end
+
+# The jobs whose attempts are spent.
+pub def failed_jobs : Array(Enqueued) | DBError
+  listed("failed_at IS NOT NULL")
+end
+
+# Empties the queue: a test starts from none.
+pub def clear_jobs : Nil | DBError
+  write("DELETE FROM kurt_jobs", [] of DBValue)!
+  nil
+end
+
+# Makes every waiting job due now: a test runs one enqueued with `wait:`
+# or one waiting to be tried again.
+pub def make_jobs_due : Nil | DBError
+  write("UPDATE kurt_jobs SET run_at = ? WHERE failed_at IS NULL", [Time.utc.to_unix.as(DBValue)])!
+  nil
+end
+
+# ---------------------------------------------------------------------------
+# The worker
+# ---------------------------------------------------------------------------
+
+STOPPING = Atomic(Int32).new(0)
+
+# Asks every worker loop of this process to stop after the job it runs.
+pub def stop_workers : Nil
+  STOPPING.set(1)
+  nil
+end
+
+pub def stopping? : Bool
+  STOPPING.get == 1
+end
+
+# This process's name in `locked_by`.
+WORKER_NAME = "worker-" + Random::Secure.hex(4)
+
+pub def worker_name : String
+  WORKER_NAME
+end
+
+# Whether the server runs a worker of its own: unless KURT_JOBS_IN_SERVER=0,
+# and not in test.
+pub def in_server? : Bool
+  (Program.env("KURT_JOBS_IN_SERVER") || "1") != "0" && env != "test"
+end
+
+pub def log(line : String) : Nil
+  STDOUT.puts "[jobs] " + line unless env == "test"
+  nil
+end
+
+# Takes jobs and runs them until `stop_workers`, polling the queue every
+# *poll* milliseconds while it is empty; with *once*, until no job is due,
+# answering how many ran. The block runs one job (the application's
+# dispatcher, in a task of its own) and answers why it failed, or nil, and
+# how many attempts its class allows.
+pub def work(once : Bool = false, poll : Int32 = 1000, & : Claimed -> Tuple(String?, Int32)) : Int32 | DBError
+  ran = 0
+  until stopping?
+    job = claim(worker_name)!
+    if job.nil?
+      break if once
+      sleep(poll)
+      next
+    end
+    started = Time.utc.to_unix_ms
+    error, attempts = yield job
+    took = (Time.utc.to_unix_ms - started).to_s + "ms"
+    if message = error
+      failed(job, message, attempts)!
+      log(job.job_class + " #" + job.id.to_s + " failed (attempt " + (job.attempts + 1).to_s + " of " + attempts.to_s + "): " + message)
+    else
+      complete(job)!
+      log(job.job_class + " #" + job.id.to_s + " done in " + took)
+    end
+    ran += 1
+  end
+  ran
+end
+
+# ---------------------------------------------------------------------------
+# The parent of every job
+# ---------------------------------------------------------------------------
+
+pub class Job
+  # The queue a job goes into: `queue_as :mailers`.
+  def self.queue_name : String
+    "default"
+  end
+
+  macro queue_as(name)
+    def self.queue_name : String
+      {{ name.id.stringify }}
+    end
+  end
+
+  # How many times a job is tried before it is kept as failed: 5, or
+  # `retry_attempts 3`.
+  def self.max_attempts : Int32
+    5
+  end
+
+  macro retry_attempts(count)
+    def self.max_attempts : Int32
+      {{ count }}
+    end
+  end
+
+  # From `perform`, each job class gets `perform_later`, `perform_now`
+  # and what the worker calls.
+  macro inherited
+    macro finished
+      \{% perform = @type.methods.find { |m| m.name == "perform" } %}
+      \{% if perform %}
+        # Enqueues the job; its id. `wait:` delays it by seconds, `queue:`
+        # names another queue, `on:` enqueues in a transaction.
+        def self.perform_later(\{% for a in perform.args %}\{{ a }}, \{% end %}*, wait : Int32 = 0, queue : String? = nil, on : ::Kurt::Model::Transaction? = nil) : Int64 | ::Db::Errors::DBError
+          arguments = "[" + ([\{% for a in perform.args %}::Kurt::Jobs.encode(\{{ a.name }}), \{% end %}] of String).join(",") + "]"
+          ::Kurt::Jobs.enqueue(\{{ @type.name.split("::").last }}, arguments, queue || queue_name, wait, on)
+        end
+
+        def self.perform_now(\{% for a in perform.args %}\{{ a }}, \{% end %})
+          new.perform(\{% for a in perform.args %}\{{ a.name }}, \{% end %})
+        end
+
+        # What the worker calls: the arguments read back, then `perform`;
+        # nil when it is done, else why it failed.
+        def self.__kurt_perform(arguments : String) : String?
+          list = ::Kurt::Jobs.parse_arguments(arguments)
+          return list.message if list.is_a?(::Kurt::Jobs::DecodeError)
+          return "expected \{{ perform.args.size }} arguments, got " + list.size.to_s if list.size != \{{ perform.args.size }}
+          \{% for a, i in perform.args %}
+            \{% type = a.restriction.resolve %}
+            \{% if type.nilable? %}
+              \{% inner = type.union_types.reject { |t| t == Nil }.first %}
+              arg\{{ i }} = ::Kurt::Jobs.decode_nilable(list[\{{ i }}], \{{ inner }})
+            \{% else %}
+              arg\{{ i }} = ::Kurt::Jobs.decode(list[\{{ i }}], \{{ type }})
+            \{% end %}
+            return arg\{{ i }}.message if arg\{{ i }}.is_a?(::Kurt::Jobs::DecodeError)
+          \{% end %}
+          ::Kurt::Jobs.outcome(new.perform(\{% for a, i in perform.args %}arg\{{ i }}, \{% end %}))
+        end
+      \{% end %}
+    end
+  end
+end

@@ -1,0 +1,160 @@
+module test/app/jobs/jobs_test
+
+import std/text
+import std/time::{Time}
+import db/db/errors::{DBError}
+import datasource::{database, postgres?}
+import model::*
+import jobs::*
+import generators::{jobs_table_sql}
+
+pub class Person
+  property name : String
+
+  derive model
+end
+
+RAN = [] of String
+
+pub class ApplicationJob < Job
+end
+
+pub class GreetJob < ApplicationJob
+  queue_as :mail
+
+  def perform(person : Person, greeting : String, times : Int64, tags : Array(String), note : String?, at : Time)
+    RAN << greeting + " " + person.name + " x" + times.to_s + " " + tags.join("+") + " " + (note || "-") + " " + at.to_unix.to_s
+    nil
+  end
+end
+
+pub class FlakyJob < ApplicationJob
+  retry_attempts 2
+
+  def perform(fail : Bool) : Nil | NotFound
+    return NotFound.new("Thing") if fail
+    RAN << "flaky ok"
+    nil
+  end
+end
+
+pub class CrashJob < ApplicationJob
+  def perform(code : Int32)
+    raise "crash " + code.to_s
+  end
+end
+
+# What the build writes for an application: one class name to one job.
+def dispatch_job(job : Claimed) : Tuple(String?, Int32)
+  outcome = group do |inner|
+    task = inner.spawn do
+      case job.job_class
+      when "GreetJob" then GreetJob.__kurt_perform(job.arguments)
+      when "FlakyJob" then FlakyJob.__kurt_perform(job.arguments)
+      when "CrashJob" then CrashJob.__kurt_perform(job.arguments)
+      else                 "no job " + job.job_class
+      end
+    end
+    task.value
+  end
+  error = case outcome
+          when Panicked  then "panicked: " + outcome.message
+          when Cancelled then "cancelled"
+          else                outcome
+          end
+  attempts = case job.job_class
+             when "FlakyJob" then FlakyJob.max_attempts
+             else                 GreetJob.max_attempts
+             end
+  {error, attempts}
+end
+
+def setup : Nil | DBError
+  id = postgres? ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  ["kurt_jobs", "people"].each { |t| database.exec("DROP TABLE IF EXISTS " + t)! }
+  database.exec("CREATE TABLE people (id " + id + ", name TEXT NOT NULL)")!
+  jobs_table_sql(postgres?).split(";").each do |statement|
+    database.exec(statement)! unless statement.strip.empty?
+  end
+  nil
+end
+
+def run_all : Nil | DBError | NotFound | Invalid
+  setup!
+  ada = Person.create(name: "Ada")!
+  at = Time.unix(1800000000)
+
+  # enqueued: arguments as JSON, a model as its id
+  id = GreetJob.perform_later(ada, "hello", 3_i64, ["a", "b"], nil, at)!
+  queued = enqueued_jobs!
+  assert queued.size == 1
+  assert queued[0].id == id
+  assert queued[0].job_class == "GreetJob"
+  assert queued[0].arguments == %([{"_model":"Person","id":) + ada.id.to_s + %(},"hello",3,["a","b"],null,{"_time":1800000000000}])
+  assert GreetJob.queue_name == "mail"
+
+  # a job for later is not due yet
+  GreetJob.perform_later(ada, "later", 1_i64, [] of String, "n", at, wait: 3600)!
+  assert work(once: true) { |job| dispatch_job(job) }! == 1
+  assert RAN == ["hello Ada x3 a+b - 1800000000"]
+  assert enqueued_jobs!.size == 1
+  make_jobs_due!
+  assert work(once: true) { |job| dispatch_job(job) }! == 1
+  assert RAN.last == "later Ada x1  n 1800000000"
+  assert enqueued_jobs!.empty?
+
+  # perform_now: here, no queue
+  GreetJob.perform_now(ada, "now", 1_i64, ["x"], nil, at)
+  assert RAN.last == "now Ada x1 x - 1800000000"
+
+  # a failure is tried again after a while, then kept as failed
+  FlakyJob.perform_later(true)!
+  work(once: true) { |job| dispatch_job(job) }!
+  retry = enqueued_jobs!
+  assert retry.size == 1
+  assert retry[0].attempts == 1
+  assert retry[0].last_error == "Thing not found"
+  assert retry[0].run_at >= Time.utc.to_unix + 2
+  assert work(once: true) { |job| dispatch_job(job) }! == 0     # not due yet
+  make_jobs_due!
+  work(once: true) { |job| dispatch_job(job) }!
+  assert enqueued_jobs!.empty?
+  failed = failed_jobs!
+  assert failed.size == 1
+  assert failed[0].attempts == 2
+  assert backoff(1_i64) == 3
+  assert backoff(3_i64) == 83
+
+  # a panic is caught: the worker goes on
+  CrashJob.perform_later(7)!
+  FlakyJob.perform_later(false)!
+  assert work(once: true) { |job| dispatch_job(job) }! == 2
+  assert RAN.last == "flaky ok"
+  crashed = enqueued_jobs!
+  assert crashed.size == 1
+  assert crashed[0].last_error.as(String).includes?("crash 7")
+
+  # a record deleted before its job ran fails the job
+  clear_jobs!
+  gone = Person.create(name: "Gone")!
+  GreetJob.perform_later(gone, "bye", 1_i64, [] of String, nil, at)!
+  gone.destroy!
+  work(once: true) { |job| dispatch_job(job) }!
+  assert enqueued_jobs![0].last_error == "Person not found"
+
+  # enqueued in a transaction that rolls back: not enqueued
+  clear_jobs!
+  Person.transaction do |tx|
+    FlakyJob.perform_later(false, on: tx)!
+    NotFound.new("rollback")
+  end
+  assert enqueued_jobs!.empty?
+  nil
+end
+
+case failure = run_all
+in Nil then puts "jobs: all assertions passed" + (postgres? ? " (postgres)" : "")
+in DBError, NotFound, Invalid
+  STDERR.puts failure.message
+  exit 1
+end

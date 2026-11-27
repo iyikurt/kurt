@@ -755,6 +755,69 @@ pub def mailer_test(name : String, methods : Array(String)) : String
 end
 
 # ---------------------------------------------------------------------------
+# Jobs: `kurt generate job Welcome`
+# ---------------------------------------------------------------------------
+
+# `welcome` or `WelcomeJob` -> "welcome_job".
+pub def job_file_name(name : String) : String
+  base = underscore(name)
+  base.ends_with?("_job") ? base : base + "_job"
+end
+
+pub def application_job : String
+  <<-IYI
+  # The parent of every job. `queue_as :default` and `retry_attempts 5` here
+  # apply to all of them; a job may say otherwise.
+  class ApplicationJob < Job
+  end
+
+  IYI
+end
+
+pub def job_class(name : String) : String
+  klass = camelize(job_file_name(name))
+  <<-IYI
+  class #{klass} < ApplicationJob
+    queue_as :default
+
+    # #{klass}.perform_later(...)! enqueues it; the worker runs this. Answer an
+    # error (hand it up with `!`) and the job is tried again later.
+    def perform(note : String)
+      nil
+    end
+  end
+
+  IYI
+end
+
+pub def job_test(name : String) : String
+  klass = camelize(job_file_name(name))
+  <<-IYI
+  # Jobs wait in the kurt_jobs table; `perform_enqueued_jobs` runs them here.
+  clear_jobs.as(Nil)
+  #{klass}.perform_later("hello").as(Int64)
+  assert enqueued_jobs.as(Array).size == 1
+  assert perform_enqueued_jobs == 1
+  assert enqueued_jobs.as(Array).empty?
+
+  IYI
+end
+
+# The queue's table: times are Unix seconds, which compare the same on
+# both databases.
+pub def jobs_table_sql(postgres : Bool) : String
+  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres ? "BIGINT" : "INTEGER"
+  "CREATE TABLE kurt_jobs (\n  id " + id + ",\n  queue TEXT NOT NULL DEFAULT 'default',\n  job_class TEXT NOT NULL,\n  arguments TEXT NOT NULL DEFAULT '[]',\n" +
+    "  attempts " + int + " NOT NULL DEFAULT 0,\n  run_at " + int + " NOT NULL,\n  locked_at " + int + ",\n  locked_by TEXT,\n  failed_at " + int + ",\n" +
+    "  last_error TEXT,\n  created_at " + int + " NOT NULL\n);\nCREATE INDEX kurt_jobs_due ON kurt_jobs (run_at);\n"
+end
+
+pub def jobs_migration(postgres : Bool) : String
+  "-- up\n" + jobs_table_sql(postgres) + "\n-- down\nDROP TABLE kurt_jobs;\n"
+end
+
+# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
@@ -1040,6 +1103,7 @@ pub def agents_md(app : String) : String
   - `kurt generate controller Pages about contact`
   - `kurt generate migration add_slug_to_posts`
   - `kurt generate mailer User welcome`: app/mailers/user_mailer.iyi, its .text.eiy and .html.eiy views
+  - `kurt generate job Notify`: a background job; `kurt jobs` runs the worker alone
   - `kurt db:migrate`, `kurt db:rollback [STEPS]`, `kurt db:status`, `kurt db:reset` (then seeds)
   - `kurt db:seed`: run db/seeds.iyi (models, `find_or_create_by`, `!` works there).
   - `kurt test`: migrate a fresh test database and run every test/*_test.iyi. Each test file
@@ -1138,9 +1202,21 @@ pub def agents_md(app : String) : String
 
   - Views: app/views/user_mailer/welcome.text.eiy and/or welcome.html.eiy, inside
     layouts/mailer.text.eiy and layouts/mailer.html.eiy (`<%= content %>`). The text is not escaped.
-  - Send: `UserMailer.welcome(user).deliver_now!`. SMTP_URL (`smtp://user:pass@host:587`) sends for
+  - Send: `UserMailer.welcome(user).deliver_now!`, or `deliver_later!` through a background job. SMTP_URL (`smtp://user:pass@host:587`) sends for
     real; without it, test keeps mail in `deliveries` (`deliveries.last.subject`, `clear_deliveries`),
     development prints it to the log, and production answers a DeliveryError (503).
+
+  ## Background jobs
+
+  - `kurt generate job Notify`: app/jobs/notify_job.iyi (`class NotifyJob < ApplicationJob` with
+    `def perform(post : Post, user : User)`), its test, and the kurt_jobs migration.
+  - `NotifyJob.perform_later(post, user)!` enqueues (`wait: 300`, `on: tx`); `perform_now` runs it here.
+    Arguments: String, Int32, Int64, Float64, Bool, Time, nil, arrays, models (kept by id).
+  - The worker runs inside the server (KURT_JOBS_IN_SERVER=0 turns it off) or alone: `kurt jobs`.
+    A job fails by answering an error (`!`); it is retried after attempts⁴ + 2 seconds, 5 times
+    (`retry_attempts 3`). A panic fails the job, not the worker.
+  - Mail: `UserMailer.welcome(user).deliver_later!`.
+  - Tests: `enqueued_jobs`, `perform_enqueued_jobs`, `failed_jobs`, `clear_jobs`.
 
   ## Forms
 

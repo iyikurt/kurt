@@ -175,6 +175,16 @@ assert mailer_text_view("user", "welcome").includes?("<%= @greeting %>")
 assert mailer_layout_html.includes?("<%= content %>")
 assert mailer_test("user", ["welcome"]).includes?("mail = UserMailer.welcome\n")
 
+# kurt generate job
+assert job_file_name("Welcome") == "welcome_job"
+assert job_file_name("WelcomeJob") == "welcome_job"
+assert job_class("welcome").includes?("class WelcomeJob < ApplicationJob\n  queue_as :default\n")
+assert application_job.includes?("class ApplicationJob < Job\n")
+assert job_test("welcome").includes?("WelcomeJob.perform_later(\"hello\")")
+assert jobs_migration(false).includes?("CREATE TABLE kurt_jobs (\n  id INTEGER PRIMARY KEY,")
+assert jobs_migration(true).includes?("  run_at BIGINT NOT NULL,")
+assert jobs_migration(true).includes?("-- down\nDROP TABLE kurt_jobs;")
+
 puts "generators: all assertions passed"
 
 # db/seeds.iyi for a new application

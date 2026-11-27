@@ -62,6 +62,7 @@ Usage:
   kurt generate controller NAME ACTION...
   kurt generate migration NAME
   kurt generate mailer NAME METHOD...    a mailer, its text and HTML views, a test
+  kurt generate job NAME                 a background job, a test, the queue's table
   kurt generate authentication [MODULE...]
                                          Devise-like users: sign-in, sign-up, password
                                          reset, remember me; MODULE adds confirmable,
@@ -75,6 +76,7 @@ Usage:
   kurt db:seed                           run db/seeds.iyi
   kurt dev [-p PORT] [--no-reload]       run the application; rebuild and reload on change
   kurt routes                            every route: verb, path, controller#action
+  kurt jobs                              run the background jobs worker on its own
   kurt test                              run every test/*_test.iyi on a fresh test database,
                                          with test/fixtures/*.yml loaded
   kurt build                             a release binary in bin/NAME
@@ -528,6 +530,25 @@ def gen_mailer(name : String, methods : Array(String)) : Nil
   write("test/" + file + "_test.iyi", mailer_test(name, methods))
 end
 
+# A job, ApplicationJob, a test, and the queue's migration when no
+# migration makes it yet.
+def gen_job(name : String) : Nil
+  write("app/jobs/application_job.iyi", application_job) unless File.exists?("app/jobs/application_job.iyi")
+  path = "app/jobs/" + job_file_name(name) + ".iyi"
+  fail(camelize(job_file_name(name)) + " exists already: " + path) if File.exists?(path)
+  write(path, job_class(name))
+  write("test/" + job_file_name(name) + "_test.iyi", job_test(name))
+  ensure_jobs_table
+end
+
+# The kurt_jobs migration, unless one is there.
+def ensure_jobs_table : Nil
+  if Dir.exists?("db/migrations")
+    return if Dir.entries("db/migrations").any? { |f| f.ends_with?(".sql") && File.read("db/migrations/" + f).includes?("CREATE TABLE kurt_jobs") }
+  end
+  write(migration_path("create_kurt_jobs"), jobs_migration(postgres_url?(database_url)))
+end
+
 # ---------------------------------------------------------------------------
 # generate authentication
 # ---------------------------------------------------------------------------
@@ -725,7 +746,7 @@ def users_test_takes_passwords : Nil
 end
 
 def cmd_generate(args : Array(String)) : Nil
-  fail("usage: kurt generate (scaffold|model|controller|migration|mailer) NAME ..., or kurt generate authentication") if args.empty?
+  fail("usage: kurt generate (scaffold|model|controller|migration|mailer|job) NAME ..., or kurt generate authentication") if args.empty?
   kind = args[0]
   app = require_app
   case kind
@@ -757,6 +778,8 @@ def cmd_generate(args : Array(String)) : Nil
     write(migration_path(underscore(name)), empty_migration)
   when "mailer"
     gen_mailer(name, rest)
+  when "job"
+    gen_job(name)
   else
     fail("unknown generator `" + kind + "`: scaffold, model, controller, migration or mailer")
   end
@@ -932,6 +955,7 @@ def build_app(name : String, tests : Bool = false) : String
   models.each { |source| model_tables(source.text).each { |pair| model_names << pair[0] } }
   devise_controllers, devise_mailers = devise_sources(tables)
   emit(BUILD + "/app/mailers.iyi", mailers_module(sources("app/mailers") + devise_mailers, model_names))
+  emit(BUILD + "/app/jobs.iyi", jobs_module(sources("app/jobs"), model_names))
   emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers") + devise_controllers, model_names))
   routes = source?("config/routes.iyi") || fail("no config/routes.iyi")
   emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi"))
@@ -1205,6 +1229,15 @@ def cmd_routes : Nil
   exec_iyi(["run", build_app(name)], {"KURT_PRINT_ROUTES" => "1"})
 end
 
+# The worker alone, from the application's own binary: `kurt jobs` here,
+# `./bin/app jobs` on a server.
+def cmd_jobs : Nil
+  name = require_app
+  entry = build_app(name)
+  fail("no kurt_jobs table among the migrations: `kurt generate job NAME` writes its migration") unless File.read(entry).includes?("Program.args[0]? == \"jobs\"")
+  exec_iyi(["run", entry, "--", "jobs"])
+end
+
 def cmd_test(args : Array(String)) : Nil
   name = require_app
   build_app(name, tests: true)
@@ -1379,6 +1412,7 @@ when "build"                     then cmd_build(rest)
 when "export"                    then cmd_export(rest)
 when "css:install", "css:build"  then cmd_css(command, rest)
 when "routes"                    then cmd_routes
+when "jobs"                      then cmd_jobs
 when "version", "--version", "-v" then puts "kurt " + VERSION
 when "help", "--help", "-h"      then puts USAGE
 else
