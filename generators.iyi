@@ -40,6 +40,11 @@ pub class Field
     @kind == "references"
   end
 
+  # `avatar:attachment`: no column, a `has_one_attached`.
+  def attachment? : Bool
+    @kind == "attachment"
+  end
+
   def iyi_type : String
     case @kind
     when "string", "text"     then "String"
@@ -78,6 +83,7 @@ pub def normalize_kind(kind : String) : String?
   when "bool", "boolean"                                then "bool"
   when "time", "datetime", "timestamp"                  then "time"
   when "references", "reference", "belongs_to", "ref"   then "references"
+  when "attachment", "file", "image"                    then "attachment"
   else                                                       nil
   end
 end
@@ -93,7 +99,7 @@ pub def parse_fields(args : Array(String)) : Array(Field) | String
     return "`" + name + "` is a column Kurt writes itself" if ["id", "created_at", "updated_at"].includes?(name)
     raw = parts.size > 1 ? parts[1] : "string"
     kind = normalize_kind(raw)
-    return "unknown type `" + raw + "` in " + arg + ": use string, text, int, float, bool, time or references" if kind.nil?
+    return "unknown type `" + raw + "` in " + arg + ": use string, text, int, float, bool, time, references or attachment" if kind.nil?
     fields << Field.new(name, kind)
   end
   fields
@@ -153,6 +159,8 @@ pub def model_file(names : Names, fields : Array(Field), known : Array(String)) 
     end
   end
   parts << relations unless relations.empty?
+  attached = fields.select(&.attachment?).map { |f| "  has_one_attached :" + f.name + "\n" }.join
+  parts << attached unless attached.empty?
   # Text fields and links must be filled in; the rest is up to you.
   required = fields.select { |f| f.kind == "string" || (f.reference? && known.includes?(camelize(f.name))) }
   unless required.empty?
@@ -197,7 +205,7 @@ pub def create_table_migration(names : Names, fields : Array(Field), postgres : 
   id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
   stamp = postgres ? "TIMESTAMPTZ NOT NULL DEFAULT now()" : "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
   columns = ["  id " + id]
-  fields.each { |field| columns << "  " + field.column + " " + field.sql_type(postgres) }
+  fields.each { |field| columns << "  " + field.column + " " + field.sql_type(postgres) unless field.attachment? }
   columns << "  created_at " + stamp
   columns << "  updated_at " + stamp
   out = "-- up\nCREATE TABLE " + names.plural + " (\n" + columns.join(",\n") + "\n);\n"
@@ -234,7 +242,9 @@ end
 
 pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String) : String
   view = names.plural + "/"
-  permitted = fields.map { |field| ":" + field.column }.join(", ")
+  permitted = fields.reject(&.attachment?).map { |field| ":" + field.column }.join(", ")
+  # A file chosen in the form, attached when the record saves.
+  uploads = fields.select(&.attachment?).map { |f| "    @" + names.singular + "." + f.name + " = uploaded_file(:" + names.singular + ", :" + f.name + ")\n" }.join
   # The records a form's selects offer, loaded for the actions that show it.
   list_filters = ""
   list_methods = ""
@@ -274,7 +284,7 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
     # POST /#{names.plural}
     def create
       @#{names.singular} = #{names.model}.new(#{names.singular}_params)
-      if @#{names.singular}.save!
+  #{uploads}    if @#{names.singular}.save!
         redirect_to path_to(@#{names.singular}), notice: "#{names.human} was created."
       else
         render "#{view}new", status: 422
@@ -288,7 +298,7 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
 
     # PATCH /#{names.plural}/:id
     def update
-      if @#{names.singular}.update(#{names.singular}_params)!
+  #{uploads}    if @#{names.singular}.update(#{names.singular}_params)!
         redirect_to path_to(@#{names.singular}), notice: "#{names.human} was updated."
       else
         render "#{view}edit", status: 422
@@ -313,6 +323,15 @@ pub def scaffold_controller(names : Names, fields : Array(Field), labels : Hash(
     end
   end
   IYI
+end
+
+# An attachment on the show page: the image, or a link to the file; nothing
+# when none is attached. `url?` and not `!`: a template has no `!`.
+def attachment_cell(record : String, field : Field, daisy : Bool) : String?
+  return nil unless field.attachment?
+  look = daisy ? " class=\"max-h-64 rounded-box\"" : " style=\"max-width: 16rem\""
+  link = daisy ? " class=\"link\"" : ""
+  "<% if (file = " + record + "." + field.name + ".attachment).is_a?(Attachment) %><% if file.image? %><img src=\"<%= file.url %>\" alt=\"<%= file.filename %>\"" + look + "><% else %><a" + link + " href=\"<%= file.url %>\"><%= file.filename %></a><% end %><% end %>"
 end
 
 # What a reference shows its record by: *labels* maps a model to its first
@@ -340,6 +359,7 @@ def field_input(names : Names, field : Field, labels : Hash(String, String)) : S
     return "<%= f.select :" + field.column + ", @" + pluralize(underscore(target)) + ".map { |option| {option." + shown_by + ", option.id} }, prompt: \"Select a " + humanize(field.name).downcase + "\" %>"
   end
   case field.kind
+  when "attachment"        then "<%= f.file_field :" + field.name + " %>"
   when "text"              then "<%= f.text_area :" + field.column + ", rows: 8 %>"
   when "int", "references" then "<%= f.number_field :" + field.column + " %>"
   when "float"             then "<%= f.number_field :" + field.column + ", step: \"any\" %>"
@@ -367,7 +387,8 @@ end
 pub def form_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
   return daisy_form_view(names, fields, labels) if daisy
   html = error_summary(names, false)
-  html += "<% form_with model: @" + names.singular + ", class: \"form\" do |f| %>\n"
+  multipart = fields.any?(&.attachment?) ? ", multipart: true" : ""
+  html += "<% form_with model: @" + names.singular + multipart + ", class: \"form\" do |f| %>\n"
   fields.each do |field|
     if field.kind == "bool" && reference_label(field, labels).nil?
       html += "  <div class=\"field\">\n    <label class=\"check\">" + field_input(names, field, labels) + " " + field.label + "</label>\n  </div>\n"
@@ -381,8 +402,8 @@ end
 
 pub def index_view(names : Names, fields : Array(Field), labels : Hash(String, String) = {} of String => String, daisy : Bool = false) : String
   return daisy_index_view(names, fields, labels) if daisy
-  shown = fields.reject { |f| f.kind == "text" }
-  shown = fields if shown.empty?
+  shown = fields.reject { |f| f.kind == "text" || f.attachment? }
+  shown = fields.reject(&.attachment?) if shown.empty?
   out = "<% content_for \"title\" do %>" + humanize(names.plural) + "<% end -%>\n"
   out += "<div class=\"page-header\">\n  <h1>" + humanize(names.plural) + "</h1>\n  <%= link_to \"New " + names.human.downcase + "\", \"/" + names.plural + "/new\", class: \"button\" %>\n</div>\n\n"
   out += "<% if @" + names.plural + ".empty? %>\n<p class=\"empty\">No " + humanize(names.plural).downcase + " yet.</p>\n<% else %>\n"
@@ -407,7 +428,7 @@ pub def show_view(names : Names, fields : Array(Field), labels : Hash(String, St
   out = "<% content_for \"title\" do %>" + names.human + " <%= @" + names.singular + ".id %><% end -%>\n"
   out += "<div class=\"page-header\">\n  <h1>" + names.human + " <%= @" + names.singular + ".id %></h1>\n</div>\n\n<dl class=\"details\">\n"
   fields.each do |f|
-    shown = reference_cell("@" + names.singular, f, labels)
+    shown = reference_cell("@" + names.singular, f, labels) || attachment_cell("@" + names.singular, f, false)
     shown ||= f.kind == "text" ? "<div class=\"prose\"><%= @" + names.singular + "." + f.column + " %></div>" : "<%= @" + names.singular + "." + f.column + " %>"
     out += "  <dt>" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</dt>\n  <dd>" + shown + "</dd>\n"
   end
@@ -493,7 +514,8 @@ end
 
 def daisy_form_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
   html = error_summary(names, true)
-  html += "<% form_with model: @" + names.singular + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n"
+  multipart = fields.any?(&.attachment?) ? ", multipart: true" : ""
+  html += "<% form_with model: @" + names.singular + multipart + ", class: \"card bg-base-100 shadow-sm\" do |f| %>\n"
   html += "  <div class=\"card-body\">\n"
   fields.each do |field|
     if field.kind == "bool" && reference_label(field, labels).nil?
@@ -507,8 +529,8 @@ def daisy_form_view(names : Names, fields : Array(Field), labels : Hash(String, 
 end
 
 def daisy_index_view(names : Names, fields : Array(Field), labels : Hash(String, String)) : String
-  shown = fields.reject { |f| f.kind == "text" }
-  shown = fields if shown.empty?
+  shown = fields.reject { |f| f.kind == "text" || f.attachment? }
+  shown = fields.reject(&.attachment?) if shown.empty?
   title = humanize(names.plural)
   out = "<% content_for \"title\" do %>" + title + "<% end -%>\n"
   out += "<div class=\"flex items-center justify-between gap-4 mb-6\">\n  <h1 class=\"text-3xl font-bold\">" + title + "</h1>\n  <%= link_to \"New " + names.human.downcase + "\", \"/" + names.plural + "/new\", class: \"btn btn-primary\" %>\n</div>\n\n"
@@ -535,7 +557,7 @@ def daisy_show_view(names : Names, fields : Array(Field), labels : Hash(String, 
   out += "<h1 class=\"text-3xl font-bold mb-6\">" + names.human + " <%= " + record + ".id %></h1>\n\n"
   out += "<div class=\"card bg-base-100 shadow-sm\">\n  <div class=\"card-body\">\n    <dl class=\"grid gap-4\">\n"
   fields.each do |f|
-    shown = reference_cell(record, f, labels)
+    shown = reference_cell(record, f, labels) || attachment_cell(record, f, true)
     shown ||= f.kind == "text" ? "<div class=\"whitespace-pre-wrap\"><%= " + record + "." + f.column + " %></div>" : "<%= " + record + "." + f.column + " %>"
     out += "      <div>\n        <dt class=\"text-sm font-semibold text-base-content/60\">" + (reference_label(f, labels) ? humanize(f.name) : f.label) + "</dt>\n        <dd>" + shown + "</dd>\n      </div>\n"
   end
@@ -811,6 +833,16 @@ pub def jobs_table_sql(postgres : Bool) : String
   "CREATE TABLE kurt_jobs (\n  id " + id + ",\n  queue TEXT NOT NULL DEFAULT 'default',\n  job_class TEXT NOT NULL,\n  arguments TEXT NOT NULL DEFAULT '[]',\n" +
     "  attempts " + int + " NOT NULL DEFAULT 0,\n  run_at " + int + " NOT NULL,\n  locked_at " + int + ",\n  locked_by TEXT,\n  failed_at " + int + ",\n" +
     "  last_error TEXT,\n  created_at " + int + " NOT NULL\n);\nCREATE INDEX kurt_jobs_due ON kurt_jobs (run_at);\n"
+end
+
+# The table attachments are kept in (storage.iyi).
+pub def attachments_migration(postgres : Bool) : String
+  id = postgres ? "BIGSERIAL PRIMARY KEY" : "INTEGER PRIMARY KEY"
+  int = postgres ? "BIGINT" : "INTEGER"
+  "-- up\nCREATE TABLE kurt_attachments (\n  id " + id + ",\n  record_type TEXT NOT NULL,\n  record_id " + int + " NOT NULL,\n  name TEXT NOT NULL,\n" +
+    "  key TEXT NOT NULL,\n  filename TEXT NOT NULL,\n  content_type TEXT NOT NULL,\n  byte_size " + int + " NOT NULL,\n  created_at " + int + " NOT NULL\n);\n" +
+    "CREATE UNIQUE INDEX kurt_attachments_key ON kurt_attachments (key);\n" +
+    "CREATE INDEX kurt_attachments_record ON kurt_attachments (record_type, record_id, name);\n\n-- down\nDROP TABLE kurt_attachments;\n"
 end
 
 pub def jobs_migration(postgres : Bool) : String
@@ -1119,7 +1151,7 @@ pub def agents_md(app : String) : String
     GET route without parameters, the local pages they link to, each PATH, and public/. For a
     site with no server: GitHub Pages, Netlify, any web server.
 
-  Field types: string, text, int, float, bool, time, references.
+  Field types: string, text, int, float, bool, time, references, attachment.
 
   ## Models
 
@@ -1224,6 +1256,18 @@ pub def agents_md(app : String) : String
     (`retry_attempts 3`). A panic fails the job, not the worker.
   - Mail: `UserMailer.welcome(user).deliver_later!`.
   - Tests: `enqueued_jobs`, `perform_enqueued_jobs`, `failed_jobs`, `clear_jobs`.
+
+  ## File uploads
+
+  - `has_one_attached :avatar` (`content_types: [...]`, `max_size: bytes`), `has_many_attached :documents`;
+    `kurt generate attachments` writes the kurt_attachments migration (a scaffold field
+    `avatar:attachment` does it too).
+  - Form: `form_with model: @user, multipart: true` and `f.file_field :avatar`
+    (`multiple: true` for many). Controller: `@user.avatar = uploaded_file(:user, :avatar)` before
+    `save`/`update`; attached after the record saves, validated with it.
+  - `user.avatar.attachment` (Attachment?: url, filename, content_type, byte_size, image?),
+    `user.avatar.url?` in views, `attach(upload)`, `purge`. Files under storage/, served at
+    /files/<key>/<filename>.
 
   ## Forms
 

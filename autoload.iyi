@@ -47,7 +47,7 @@ pub class Source
 end
 
 pub def models_imports : Array(String)
-  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*", "import kurt/devise::*"]
+  ["import std/text", "import std/time::{Time}", "import std/regex::{Regex}", "import kurt/model::*", "import kurt/devise::*", "import kurt/storage::*"]
 end
 
 pub def mailers_imports : Array(String)
@@ -60,17 +60,17 @@ pub def controllers_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
    "import web/iyi_web/templates::{raw, content_for, yield_content}",
    "import kurt/controllers::*", "import kurt/helpers::*", "import kurt/model::*", "import kurt/devise::*",
-   "import app/models::*", "import app/mailers::*", "import app/jobs::*"]
+   "import kurt/storage::*", "import app/models::*", "import app/mailers::*", "import app/jobs::*"]
 end
 
 pub def jobs_imports : Array(String)
   ["import std/text", "import std/time::{Time}", "import db/db/errors::{DBError}",
-   "import kurt/jobs::*", "import kurt/model::*", "import kurt/mailers::{perform_delivery}",
+   "import kurt/jobs::*", "import kurt/model::*", "import kurt/storage::*", "import kurt/mailers::{perform_delivery}",
    "import app/models::*", "import app/mailers::*"]
 end
 
 pub def routes_imports : Array(String)
-  ["import web/iyi_web/router::{Router}", "import kurt/controllers::*", "import app/controllers::*"]
+  ["import web/iyi_web/router::{Router}", "import kurt/controllers::*", "import kurt/storage::{install_file_routes}", "import app/controllers::*"]
 end
 
 pub def entry_imports : Array(String)
@@ -452,12 +452,14 @@ end
 
 IYI
 
-pub def routes_module(source : Source, generated : String) : String
+# *files*: the application keeps attachments (a migration makes
+# kurt_attachments), so /files/:key/:filename serves them.
+pub def routes_module(source : Source, generated : String, files : Bool = false) : String
   _, lines = split_imports(source.text)
   body = header("app/routes", routes_imports, [source])
   body += "pub def routes : Router\n  router = Router.new\n"
   body += pragma(source.path, 1) + lines.join("\n") + "\n"
-  body += pragma(generated, 1) + "  install_error_pages router\n  router\nend\n"
+  body += pragma(generated, 1) + (files ? "  install_file_routes router\n" : "") + "  install_error_pages router\n  router\nend\n"
   body
 end
 

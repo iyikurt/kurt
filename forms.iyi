@@ -255,9 +255,12 @@ pub class FormBuilder
     SafeHTML.new(html + "</select>")
   end
 
-  # A file input; the form needs `multipart: true` (form_with sets it).
-  def file_field(field : Symbol | String, class klass : String? = nil, **attrs) : SafeHTML
-    SafeHTML.new("<input type=\"file\" name=\"" + HTML.escape(field_name(field)) + "\" id=\"" + HTML.escape(field_id(field)) + "\"" +
+  # A file input, for `has_one_attached`; the form needs `multipart: true`
+  # (`form_with model: @user, multipart: true`). `multiple: true` sends
+  # several (`user[documents][]`), for `has_many_attached`.
+  def file_field(field : Symbol | String, multiple : Bool = false, class klass : String? = nil, **attrs) : SafeHTML
+    name = field_name(field) + (multiple ? "[]" : "")
+    SafeHTML.new("<input type=\"file\" name=\"" + HTML.escape(name) + "\" id=\"" + HTML.escape(field_id(field)) + "\"" + (multiple ? " multiple" : "") +
                  attributes_html(class: classes(field, "file", klass)) + invalid(field) + attributes_html(**attrs) + ">")
   end
 

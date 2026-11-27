@@ -52,7 +52,7 @@ pub import std/eiy
 pub import web/iyi_web/templates
 
 # A file sent with a mail.
-pub class Attachment
+pub class MailAttachment
   getter filename : String
   getter data : String
   getter content_type : String?
@@ -72,19 +72,19 @@ pub class Message
   getter subject : String
   getter text : String?
   getter html : String?
-  getter attachments : Array(Attachment)
+  getter attachments : Array(MailAttachment)
   # Which mailer and method made it: "UserMailer#welcome".
   getter mailer : String
 
   def initialize(@to : Array(String), @from : String, @subject : String, @text : String?, @html : String?,
                  @cc : Array(String) = [] of String, @bcc : Array(String) = [] of String, @reply_to : String? = nil,
-                 @attachments : Array(Attachment) = [] of Attachment, @mailer : String = "")
+                 @attachments : Array(MailAttachment) = [] of MailAttachment, @mailer : String = "")
   end
 
   # The same mail with a file attached.
   def attach(filename : String, data : String, content_type : String? = nil) : Message
     files = @attachments.dup
-    files << Attachment.new(filename, data, content_type)
+    files << MailAttachment.new(filename, data, content_type)
     Message.new(@to, @from, @subject, @text, @html, @cc, @bcc, @reply_to, files, @mailer)
   end
 
@@ -122,14 +122,14 @@ pub class Message
   def self.from_json(text : String) : Message?
     data = JSON.parse?(text)
     return nil if data.nil?
-    files = [] of Attachment
+    files = [] of MailAttachment
     ::Kurt::Mailers.json_list(data, "attachments").each do |file|
       name = ::Kurt::Mailers.json_text(file, "filename")
       encoded = ::Kurt::Mailers.json_text(file, "data")
       next if name.nil? || encoded.nil?
       decoded = Base64.decode?(encoded)
       next unless decoded.is_a?(String)
-      files << Attachment.new(name, decoded, ::Kurt::Mailers.json_text(file, "content_type"))
+      files << MailAttachment.new(name, decoded, ::Kurt::Mailers.json_text(file, "content_type"))
     end
     Message.new(::Kurt::Mailers.json_strings(data, "to"), ::Kurt::Mailers.json_text(data, "from") || "", ::Kurt::Mailers.json_text(data, "subject") || "",
       ::Kurt::Mailers.json_text(data, "text"), ::Kurt::Mailers.json_text(data, "html"),
@@ -263,10 +263,10 @@ pub class Sent
   end
 
   def to_message : Message
-    attachments = [] of Attachment
+    attachments = [] of MailAttachment
     file = @files
     while current = file
-      attachments << Attachment.new(current.filename, current.data, current.content_type)
+      attachments << MailAttachment.new(current.filename, current.data, current.content_type)
       file = current.next_file
     end
     Message.new(split(@to), @from, @subject, @text, @html, split(@cc), split(@bcc), @reply_to, attachments, @mailer)
@@ -491,7 +491,7 @@ pub class Mailer
     ::Kurt::Mailers::Message.new(::Kurt::Mailers.list({{ to }}), ({{ from }} || default_from), {{ subject }},
       ({{ run("./mail_views", caller, "text", view, frame) }}),
       ({{ run("./mail_views", caller, "html", view, frame) }}),
-      ::Kurt::Mailers.list({{ cc }}), ::Kurt::Mailers.list({{ bcc }}), {{ reply_to }}, [] of ::Kurt::Mailers::Attachment,
+      ::Kurt::Mailers.list({{ cc }}), ::Kurt::Mailers.list({{ bcc }}), {{ reply_to }}, [] of ::Kurt::Mailers::MailAttachment,
       {{ @type.name.split("::").last + "#" + @def.name.stringify }})
   end
 end

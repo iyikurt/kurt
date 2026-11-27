@@ -54,6 +54,7 @@ pub import model
 pub import strong_parameters
 pub import helpers
 pub import forms
+pub import storage
 
 # The visitor must sign in first. A page sends them to the sign-in page
 # (*location*, or the one `install_error_pages` names); a JSON request gets
@@ -323,6 +324,22 @@ pub class Controller
     verb = method ? method.to_s : "post"
     name = scope ? scope.to_s : nil
     FormBuilder.new(name, url || env.request.path, verb, form_style, {} of String => ::Db::Value::DBValue, nil, false, "", csrf_field, html_class, multipart, attrs)
+  end
+
+  # The file a form sent as `user[avatar]` (`f.file_field :avatar` in
+  # `form_with model: @user`): `uploaded_file(:user, :avatar)`; nil when
+  # none was chosen. Without *name*, the field is *scope* alone.
+  def uploaded_file(scope : Symbol | String, name : Symbol | String | Nil = nil) : ::IyiWeb::Multipart::FileUpload?
+    field = name ? scope.to_s + "[" + name.to_s + "]" : scope.to_s
+    found = @env.params.files[field]?
+    return nil if found.nil? || (found.filename.empty? && found.size == 0)
+    found
+  end
+
+  # The files of a `multiple: true` field (`user[documents][]`).
+  def uploaded_files(scope : Symbol | String, name : Symbol | String) : Array(::IyiWeb::Multipart::FileUpload)
+    list = @env.params.all_files[scope.to_s + "[" + name.to_s + "][]"]? || [] of ::IyiWeb::Multipart::FileUpload
+    list.reject { |upload| upload.filename.empty? && upload.size == 0 }
   end
 
   # Whether the request is for *path*: a navbar marks its page with it.

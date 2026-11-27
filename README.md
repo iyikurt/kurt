@@ -67,6 +67,7 @@ published version.
 | `kurt generate model NAME FIELD...` | Model and migration |
 | `kurt generate controller NAME ACTION...` | Controller, views and routes |
 | `kurt generate migration NAME` | An empty migration |
+| `kurt generate attachments` | The migration of `kurt_attachments`, the table `has_one_attached` keeps files in |
 | `kurt generate job NAME` | A background job, its test, and the queue's migration (`kurt_jobs`) when there is none |
 | `kurt generate mailer NAME METHOD...` | A mailer, a text and an HTML view per method, the mail layouts and a test |
 | `kurt generate authentication [MODULE...]` | Devise-like users: sign-in, sign-up, password reset, remember me; `confirmable`, `lockable`, `trackable`, `timeoutable` on request |
@@ -84,7 +85,9 @@ published version.
 
 Field types:
 - `string`, `text`, `int`, `float`, `bool`, `time`;
-- `references`: `user:references` gives a `user_id` column and `belongs_to user`.
+- `references`: `user:references` gives a `user_id` column and `belongs_to user`;
+- `attachment`: `avatar:attachment` gives no column but `has_one_attached :avatar`
+  and a file field (see File uploads).
 
 The database is `DATABASE_URL`, or `sqlite3:./db/<env>.sqlite3` when that
 is not set. The environment is `KURT_ENV` (default `development`). The same
@@ -737,6 +740,73 @@ The show and index pages print the name instead of the number. A form
 submitted without a choice comes back with 422 and
 `user_id can't be blank`.
 
+## File uploads
+
+```iyi
+class User < ApplicationRecord
+  has_one_attached :avatar, content_types: ["image/png", "image/jpeg"], max_size: 5_000_000
+  has_many_attached :documents
+end
+```
+
+```erb
+<% form_with model: @user, multipart: true do |f| %>
+  <%= f.file_field :avatar %>
+  <%= f.file_field :documents, multiple: true %>
+  <%= f.submit %>
+<% end %>
+
+<% if (file = @user.avatar.attachment).is_a?(Attachment) %>
+  <img src="<%= file.url %>" alt="<%= file.filename %>">
+<% end %>
+<% @user.documents.all?.each do |doc| %><a href="<%= doc.url %>"><%= doc.filename %></a><% end %>
+```
+
+```iyi
+def update
+  @user.avatar = uploaded_file(:user, :avatar)          # nil when no file was chosen: the old one stays
+  @user.documents = uploaded_files(:user, :documents)   # added to the ones there
+  if @user.update(user_params)!
+    ...
+```
+
+- iyi-web reads `multipart/form-data` bodies. It streams each file to a
+  temporary file, which it deletes once the response is written.
+  `uploaded_file(:user, :avatar)` is the `user[avatar]` field's file.
+- `user.avatar = upload` keeps the file until the record saves. It is
+  checked with the record's validations (`content_types:`, `max_size:` in
+  bytes), and attached once the record has saved. A record that does not
+  validate keeps nothing.
+- `user.avatar` answers what is attached: `attachment` (an `Attachment` or
+  nil), `attached?`, `url?` (for a view), `attach(upload)` or
+  `attach(data, "name.pdf")` at once, and `purge`. A new one replaces the
+  old one, and its file is deleted. `user.documents` has `all`, `all?`,
+  `count`, `attach` and `purge`.
+- An `Attachment` has `url`, `filename`, `content_type`, `byte_size`,
+  `image?`, `path` (on disk) and `read`.
+- Destroying the record deletes its attachments and their files.
+
+Storage:
+- Each attachment is a row of `kurt_attachments` and a file under
+  `storage/` (or `KURT_STORAGE`), named by a random key: 24 bytes in hex.
+  `kurt generate attachments` writes the table's migration and keeps
+  `storage/` out of git; a scaffold with an `attachment` field does it on
+  its own.
+- The browser's file name is kept without its path or control
+  characters. The type is the browser's, or the extension's when it sent
+  none.
+- `GET /files/<key>/<filename>` serves the files once a migration makes
+  the table.
+  - Images, PDF, audio, video and plain text are shown in the browser.
+  - Anything else, HTML and SVG included, is sent as a download, so an
+    upload cannot run script on the application's origin.
+  - The key cannot be guessed, but anyone with the URL can fetch the file.
+    Serve a private file from an action of your own (`env.send_file(attachment.path)`).
+- On a server, keep `storage/` on a disk that outlives deploys.
+
+Not yet: storage in S3 or another service, image variants (thumbnails),
+direct uploads from the browser, and signed or expiring URLs.
+
 ## Mailers
 
 ```sh
@@ -1197,7 +1267,7 @@ make test       # the tests, on SQLite in memory
 make test-pg PG_URL=postgres://user@127.0.0.1:5432/kurt_test
 ```
 
-The model, fixture, devise and jobs tests pass on both SQLite and PostgreSQL 16.
+The model, fixture, devise, jobs and storage tests pass on both SQLite and PostgreSQL 16.
 
 | File | |
 |---|---|
@@ -1208,6 +1278,7 @@ The model, fixture, devise and jobs tests pass on both SQLite and PostgreSQL 16.
 | `forms.iyi` | `form_with`'s form builder |
 | `devise.iyi` | `devise :...` in a model: passwords, signed tokens, lockable, trackable; the sign-in rate limit |
 | `devise_generators.iyi` | `kurt generate authentication`, and the controllers, views, mails and routes Kurt ships |
+| `storage.iyi` | `has_one_attached`, `has_many_attached`, disk storage, `/files/...` |
 | `jobs.iyi` | `Job`, `perform_later`, the `kurt_jobs` queue, the worker loop |
 | `mailers.iyi`, `mail_views.iyi` | mailers, `deliveries`, SMTP; the program that finds a mail's views at compile time |
 | `json_writer.iyi` | the JSON that `json(data)` writes |

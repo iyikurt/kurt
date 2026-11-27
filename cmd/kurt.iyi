@@ -63,6 +63,7 @@ Usage:
   kurt generate migration NAME
   kurt generate mailer NAME METHOD...    a mailer, its text and HTML views, a test
   kurt generate job NAME                 a background job, a test, the queue's table
+  kurt generate attachments              the table has_one_attached keeps files in
   kurt generate authentication [MODULE...]
                                          Devise-like users: sign-in, sign-up, password
                                          reset, remember me; MODULE adds confirmable,
@@ -88,7 +89,7 @@ Usage:
   kurt version
 
 FIELD is name:type, with type one of string, text, int, float, bool, time,
-references. `g` is short for generate.
+references, attachment. `g` is short for generate.
 
 The database is DATABASE_URL, or sqlite3:./db/<env>.sqlite3 with env from
 KURT_ENV (development by default).
@@ -494,7 +495,8 @@ def gen_scaffold(app : String, names : Names, fields : Array(Field)) : Nil
   end
   add_route("resources \"" + names.plural + "\", " + names.controller)
   add_nav(names)
-  test = scaffold_test(app, names, fields, auth_sign_in(names.plural))
+  ensure_attachments_table if fields.any?(&.attachment?)
+  test = scaffold_test(app, names, fields.reject(&.attachment?), auth_sign_in(names.plural))
   # With authentication, the signed-in tester is one of the users.
   test = test.gsub("User.count.as(Int64) == 0", "User.count.as(Int64) == 1") if names.model == "User" && auth_app?
   write("test/" + names.plural + "_test.iyi", test)
@@ -541,12 +543,26 @@ def gen_job(name : String) : Nil
   ensure_jobs_table
 end
 
+# Whether a migration creates *table*.
+def migration_makes?(table : String) : Bool
+  return false unless Dir.exists?("db/migrations")
+  Dir.entries("db/migrations").any? { |f| f.ends_with?(".sql") && File.read("db/migrations/" + f).includes?("CREATE TABLE " + table + " ") }
+end
+
 # The kurt_jobs migration, unless one is there.
 def ensure_jobs_table : Nil
-  if Dir.exists?("db/migrations")
-    return if Dir.entries("db/migrations").any? { |f| f.ends_with?(".sql") && File.read("db/migrations/" + f).includes?("CREATE TABLE kurt_jobs") }
-  end
+  return if migration_makes?("kurt_jobs")
   write(migration_path("create_kurt_jobs"), jobs_migration(postgres_url?(database_url)))
+end
+
+# The kurt_attachments migration, unless one is there; storage/ out of git.
+def ensure_attachments_table : Nil
+  unless migration_makes?("kurt_attachments")
+    write(migration_path("create_kurt_attachments"), attachments_migration(postgres_url?(database_url)))
+  end
+  if File.exists?(".gitignore") && !File.read(".gitignore").includes?("/storage/")
+    update(".gitignore", File.read(".gitignore").rstrip + "\n/storage/\n")
+  end
 end
 
 # ---------------------------------------------------------------------------
@@ -750,6 +766,9 @@ def cmd_generate(args : Array(String)) : Nil
   kind = args[0]
   app = require_app
   case kind
+  when "attachments"
+    ensure_attachments_table
+    return
   when "authentication"
     gen_authentication(app, args[1, args.size - 1])
     return
@@ -958,7 +977,7 @@ def build_app(name : String, tests : Bool = false) : String
   emit(BUILD + "/app/jobs.iyi", jobs_module(sources("app/jobs"), model_names))
   emit(BUILD + "/app/controllers.iyi", controllers_module(sources("app/controllers") + devise_controllers, model_names))
   routes = source?("config/routes.iyi") || fail("no config/routes.iyi")
-  emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi"))
+  emit(BUILD + "/app/routes.iyi", routes_module(routes, generated + "/app/routes.iyi", migration_makes?("kurt_attachments")))
   entry = BUILD + "/" + name + ".iyi"
   migrations = [] of Tuple(String, String)
   if Dir.exists?("db/migrations")

@@ -175,6 +175,23 @@ assert mailer_text_view("user", "welcome").includes?("<%= @greeting %>")
 assert mailer_layout_html.includes?("<%= content %>")
 assert mailer_test("user", ["welcome"]).includes?("mail = UserMailer.welcome\n")
 
+# an attachment field: no column, a has_one_attached, a file field
+photo = Names.new("Photo")
+photo_fields = parse_fields(["title:string", "image:attachment"]).as(Array(Field))
+assert photo_fields[1].attachment?
+assert normalize_kind("file") == "attachment"
+assert model_file(photo, photo_fields, [] of String).includes?("  has_one_attached :image\n")
+assert !create_table_migration(photo, photo_fields, false).includes?("image")
+photo_controller = scaffold_controller(photo, photo_fields)
+assert photo_controller.includes?("    @photo.image = uploaded_file(:photo, :image)\n")
+assert photo_controller.includes?("permit(:title)")
+assert form_view(photo, photo_fields).includes?("<% form_with model: @photo, multipart: true, class: \"form\" do |f| %>")
+assert form_view(photo, photo_fields, daisy: true).includes?("<%= f.file_field :image %>")
+assert show_view(photo, photo_fields).includes?("<% if (file = @photo.image.attachment).is_a?(Attachment) %>")
+assert !index_view(photo, photo_fields).includes?("image")
+assert attachments_migration(false).includes?("CREATE UNIQUE INDEX kurt_attachments_key ON kurt_attachments (key);")
+assert attachments_migration(true).includes?("  record_id BIGINT NOT NULL,")
+
 # kurt generate job
 assert job_file_name("Welcome") == "welcome_job"
 assert job_file_name("WelcomeJob") == "welcome_job"

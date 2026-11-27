@@ -1,0 +1,402 @@
+# File uploads, as Rails' Active Storage, kept on disk: a model declares
+# its attachments, a form sends the files, and the application serves them.
+#
+#   class User < ApplicationRecord
+#     has_one_attached :avatar, content_types: ["image/png", "image/jpeg"], max_size: 5_000_000
+#     has_many_attached :documents
+#   end
+#
+#   # a controller, from a form with `f.file_field :avatar` (form_with sets multipart)
+#   @user.avatar = uploaded_file(:user, :avatar)      # nil when none was chosen: the old one stays
+#   if @user.update(user_params)! ...                 # validated with the record, attached after it saves
+#
+#   user.avatar.attached?!                            # Bool | DBError
+#   user.avatar.url?                                  # "/files/<key>/me.png", or nil; for views
+#   user.avatar.attach(upload)!                       # at once: an iyi-web FileUpload, or data
+#   user.avatar.purge!
+#   user.documents.all!                               # Array(Attachment)
+#
+# Every attachment is a row of `kurt_attachments` (which model, which
+# record, which name; the file's key, name, type and size) and a file under
+# `storage/` (KURT_STORAGE). `kurt generate attachments` writes the table's
+# migration; a scaffold field `avatar:attachment` does too.
+#
+# Files are served at `/files/<key>/<filename>` (`install_file_routes`,
+# which every application's routes get). The key is 24 random bytes in
+# hex, so a URL cannot be guessed, but anyone who has it can fetch the
+# file: put files that need a signed-in user behind an action of your own
+# (`send_file attachment.path`). Images, PDFs, audio, video and plain text
+# are shown in the browser; anything else, HTML and SVG included, is sent
+# as a download, so an upload cannot run script on the application's
+# origin.
+module storage
+
+import std/text
+import std/time::{Time}
+import std/file::{File}
+import std/dir::{Dir}
+import std/file_utils::{FileUtils}
+import std/random::{Random}
+import std/uri::{URI}
+import db/db/errors::{DBError}
+import db/db/value::{DBValue}
+import web/iyi_web/multipart::{FileUpload}
+import web/iyi_web/router::{Router}
+import datasource::{database, placeholders, postgres?}
+import model::{Errors, Transaction}
+
+pub import web/iyi_web/multipart
+
+# Where files are kept: KURT_STORAGE, or `storage` beside the application.
+pub def storage_root : String
+  root = Program.env("KURT_STORAGE") || ""
+  root.empty? ? "storage" : root.rstrip("/")
+end
+
+# A file attached to a record.
+pub class Attachment
+  getter id : Int64
+  getter key : String
+  getter filename : String
+  getter content_type : String
+  getter byte_size : Int64
+
+  def initialize(@id : Int64, @key : String, @filename : String, @content_type : String, @byte_size : Int64)
+  end
+
+  # Where the application serves it.
+  def url : String
+    "/files/" + @key + "/" + URI.encode_path_segment(@filename.empty? ? "file" : @filename)
+  end
+
+  # The file on disk.
+  def path : String
+    ::Kurt::Storage.path_for(@key)
+  end
+
+  def read : String
+    File.read(path)
+  end
+
+  def image? : Bool
+    @content_type.starts_with?("image/")
+  end
+end
+
+# `storage/ab/cd/abcd...`: two levels, so no directory holds them all.
+pub def path_for(key : String) : String
+  storage_root + "/" + key[0, 2] + "/" + key[2, 2] + "/" + key
+end
+
+# What a file's name says its type is, when the browser sent none.
+pub def type_of(filename : String, given : String) : String
+  return given unless given.empty? || given == "application/octet-stream"
+  lower = filename.downcase
+  {".png" => "image/png", ".jpg" => "image/jpeg", ".jpeg" => "image/jpeg", ".gif" => "image/gif", ".webp" => "image/webp",
+   ".svg" => "image/svg+xml", ".pdf" => "application/pdf", ".txt" => "text/plain", ".csv" => "text/csv",
+   ".mp4" => "video/mp4", ".mp3" => "audio/mpeg", ".zip" => "application/zip"}.each do |ext, type|
+    return type if lower.ends_with?(ext)
+  end
+  given.empty? ? "application/octet-stream" : given
+end
+
+# A file name without a path, control characters or quotes: what the
+# browser sent can be `../../etc/passwd`.
+pub def clean_filename(name : String) : String
+  base = name.split("/").last.split("\\").last
+  cleaned = String.build do |io|
+    base.each_char { |c| io << c unless c.ord < 32 || c == '"' || c == '\'' }
+  end
+  cleaned = cleaned.strip
+  cleaned.empty? || cleaned == "." || cleaned == ".." ? "file" : cleaned
+end
+
+# Types a browser may show in the page; any other is sent as a download.
+pub def inline?(content_type : String) : Bool
+  return false if content_type.includes?("svg") || content_type.includes?("html") || content_type.includes?("xml")
+  content_type.starts_with?("image/") || content_type.starts_with?("video/") || content_type.starts_with?("audio/") ||
+    content_type == "application/pdf" || content_type == "text/plain"
+end
+
+# ---------------------------------------------------------------------------
+# The table
+# ---------------------------------------------------------------------------
+
+def read_attachments(sql : String, args : Array(DBValue), on : Transaction? = nil) : Array(Attachment) | DBError
+  reader = ->(rs : ::Db::Core::ResultSet) do
+    id = rs.read(Int64)
+    key = rs.read(String)
+    filename = rs.read(String)
+    type = rs.read(String)
+    size = rs.read(Int64)
+    Attachment.new(id.as(Int64), key.as(String), filename.as(String), type.as(String), size.as(Int64))
+  end
+  if tx = on
+    tx.connection.query_all(placeholders(sql), args: args) { |rs| reader.call(rs) }
+  else
+    database.query_all(placeholders(sql), args: args) { |rs| reader.call(rs) }
+  end
+end
+
+COLUMNS = "id, key, filename, content_type, byte_size"
+
+pub def attachments_of(record_type : String, record_id : Int64, name : String) : Array(Attachment) | DBError
+  read_attachments("SELECT " + COLUMNS + " FROM kurt_attachments WHERE record_type = ? AND record_id = ? AND name = ? ORDER BY id",
+    [record_type.as(DBValue), record_id.as(DBValue), name.as(DBValue)])
+end
+
+pub def find_by_key(key : String) : Attachment | Nil | DBError
+  found = read_attachments("SELECT " + COLUMNS + " FROM kurt_attachments WHERE key = ?", [key.as(DBValue)])!
+  found.empty? ? nil : found[0]
+end
+
+# Keeps *data* as a new attachment of the record: the file first, then its
+# row.
+pub def store(record_type : String, record_id : Int64, name : String, data : String, filename : String, content_type : String, on : Transaction? = nil) : Attachment | DBError
+  key = Random::Secure.hex(24)
+  path = path_for(key)
+  Dir.mkdir_p(File.dirname(path))
+  File.write(path, data)
+  insert_attachment(record_type, record_id, name, key, filename, content_type, data.bytesize.to_i64, on)
+end
+
+# An upload as it came: its temporary file copied into storage.
+pub def store(record_type : String, record_id : Int64, name : String, upload : FileUpload, on : Transaction? = nil) : Attachment | DBError
+  key = Random::Secure.hex(24)
+  path = path_for(key)
+  Dir.mkdir_p(File.dirname(path))
+  FileUtils.cp(upload.path, path)
+  filename = clean_filename(upload.filename)
+  insert_attachment(record_type, record_id, name, key, filename, type_of(filename, upload.content_type), upload.size.to_i64, on)
+end
+
+def insert_attachment(record_type : String, record_id : Int64, name : String, key : String, filename : String, content_type : String, size : Int64, on : Transaction?) : Attachment | DBError
+  sql = placeholders("INSERT INTO kurt_attachments (record_type, record_id, name, key, filename, content_type, byte_size, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id")
+  args = [record_type.as(DBValue), record_id.as(DBValue), name.as(DBValue), key.as(DBValue), filename.as(DBValue),
+          content_type.as(DBValue), size.as(DBValue), Time.utc.to_unix.as(DBValue)]
+  id = if tx = on
+         tx.connection.query_one(sql, args: args, as: Int64)
+       else
+         database.query_one(sql, args: args, as: Int64)
+       end
+  if id.is_a?(DBError)
+    File.delete(path_for(key)) if File.exists?(path_for(key))
+    return id
+  end
+  Attachment.new(id, key, filename, content_type, size)
+end
+
+# Deletes attachments: their rows, then their files.
+pub def purge(attachments : Array(Attachment), on : Transaction? = nil) : Nil | DBError
+  attachments.each do |attachment|
+    sql = placeholders("DELETE FROM kurt_attachments WHERE id = ?")
+    args = [attachment.id.as(DBValue)]
+    if tx = on
+      tx.connection.exec(sql, args: args)!
+    else
+      database.exec(sql, args: args)!
+    end
+    File.delete(attachment.path) if File.exists?(attachment.path)
+  end
+  nil
+end
+
+# What a pending upload breaks: a type not allowed, a file too large.
+pub def check_upload(errors : Errors, name : String, upload : FileUpload?, types : Array(String)?, max_size : Int64?) : Nil
+  return if upload.nil?
+  type = type_of(clean_filename(upload.filename), upload.content_type)
+  if allowed = types
+    errors.add(name, "is not a file of an allowed type (" + allowed.join(", ") + ")") unless allowed.includes?(type)
+  end
+  if limit = max_size
+    errors.add(name, "is too large (maximum is " + limit.to_s + " bytes)") if upload.size.to_i64 > limit
+  end
+end
+
+# ---------------------------------------------------------------------------
+# What `user.avatar` and `user.documents` answer
+# ---------------------------------------------------------------------------
+
+pub class AttachedOne
+  getter record_type : String
+  getter record_id : Int64
+  getter name : String
+
+  def initialize(@record_type : String, @record_id : Int64, @name : String)
+  end
+
+  # The attachment, or nil.
+  def attachment : Attachment | Nil | DBError
+    found = ::Kurt::Storage.attachments_of(@record_type, @record_id, @name)!
+    found.empty? ? nil : found.last
+  end
+
+  def attached? : Bool | DBError
+    !attachment!.nil?
+  end
+
+  # Its URL, or nil when there is none (or it could not be read): for a
+  # view, which has no `!`.
+  def url? : String?
+    found = attachment
+    found.is_a?(Attachment) ? found.url : nil
+  end
+
+  # Attaches *upload*, replacing what was attached.
+  def attach(upload : FileUpload, on : Transaction? = nil) : Attachment | DBError
+    old = ::Kurt::Storage.attachments_of(@record_type, @record_id, @name)!
+    stored = ::Kurt::Storage.store(@record_type, @record_id, @name, upload, on)!
+    ::Kurt::Storage.purge(old, on)!
+    stored
+  end
+
+  # Attaches *data* as a file named *filename*.
+  def attach(data : String, filename : String, content_type : String = "", on : Transaction? = nil) : Attachment | DBError
+    old = ::Kurt::Storage.attachments_of(@record_type, @record_id, @name)!
+    clean = ::Kurt::Storage.clean_filename(filename)
+    stored = ::Kurt::Storage.store(@record_type, @record_id, @name, data, clean, ::Kurt::Storage.type_of(clean, content_type), on)!
+    ::Kurt::Storage.purge(old, on)!
+    stored
+  end
+
+  def purge(on : Transaction? = nil) : Nil | DBError
+    ::Kurt::Storage.purge(::Kurt::Storage.attachments_of(@record_type, @record_id, @name)!, on)
+  end
+end
+
+pub class AttachedMany
+  getter record_type : String
+  getter record_id : Int64
+  getter name : String
+
+  def initialize(@record_type : String, @record_id : Int64, @name : String)
+  end
+
+  def all : Array(Attachment) | DBError
+    ::Kurt::Storage.attachments_of(@record_type, @record_id, @name)
+  end
+
+  # The attachments, or none when they could not be read: for a view.
+  def all? : Array(Attachment)
+    found = all
+    found.is_a?(Array(Attachment)) ? found : [] of Attachment
+  end
+
+  def attached? : Bool | DBError
+    !all!.empty?
+  end
+
+  def count : Int32 | DBError
+    all!.size
+  end
+
+  # Adds *upload* to the others.
+  def attach(upload : FileUpload, on : Transaction? = nil) : Attachment | DBError
+    ::Kurt::Storage.store(@record_type, @record_id, @name, upload, on)
+  end
+
+  def attach(data : String, filename : String, content_type : String = "", on : Transaction? = nil) : Attachment | DBError
+    clean = ::Kurt::Storage.clean_filename(filename)
+    ::Kurt::Storage.store(@record_type, @record_id, @name, data, clean, ::Kurt::Storage.type_of(clean, content_type), on)
+  end
+
+  def purge(on : Transaction? = nil) : Nil | DBError
+    ::Kurt::Storage.purge(all!, on)
+  end
+end
+
+# ---------------------------------------------------------------------------
+# The model macros
+# ---------------------------------------------------------------------------
+
+# `has_one_attached :avatar`: `user.avatar` (an AttachedOne), and
+# `user.avatar = upload`, kept until the record saves and attached then.
+# `content_types:` and `max_size:` (bytes) are checked with the record's
+# validations. The attachment goes when the record is destroyed.
+pub macro has_one_attached(name, content_types = nil, max_size = nil)
+  ::Kurt::Storage.__kurt_attached({{ name }}, ::Kurt::Storage::AttachedOne, {{ content_types }}, {{ max_size }})
+end
+
+# `has_many_attached :documents`: `user.documents` (an AttachedMany), and
+# `user.documents = [uploads]`, added when the record saves.
+pub macro has_many_attached(name, content_types = nil, max_size = nil)
+  ::Kurt::Storage.__kurt_attached({{ name }}, ::Kurt::Storage::AttachedMany, {{ content_types }}, {{ max_size }})
+end
+
+pub macro __kurt_attached(name, proxy, content_types, max_size)
+  {% field = name.id %}
+  @[::Db::Serializable::DBField(ignore: true)]
+  @__kurt_pending_{{ field }} : Array(::IyiWeb::Multipart::FileUpload)? = nil
+
+  def {{ field }} : {{ proxy }}
+    {{ proxy }}.new(self.class.model_name, @id, {{ field.stringify }})
+  end
+
+  # The upload the next save attaches; nil leaves what is there.
+  def {{ field }}=(upload : ::IyiWeb::Multipart::FileUpload?) : Nil
+    @__kurt_pending_{{ field }} = upload ? [upload] : nil
+    nil
+  end
+
+  def {{ field }}=(uploads : Array(::IyiWeb::Multipart::FileUpload)) : Nil
+    @__kurt_pending_{{ field }} = uploads.empty? ? nil : uploads
+    nil
+  end
+
+  def __kurt_check_{{ field }}(errors : ::Kurt::Model::Errors) : Nil
+    if pending = @__kurt_pending_{{ field }}
+      pending.each do |upload|
+        ::Kurt::Storage.check_upload(errors, {{ field.stringify }}, upload, {{ content_types }}{% if content_types %} of String{% end %}, {{ max_size ? (max_size.stringify + "_i64").id : nil }})
+      end
+    end
+  end
+
+  def __kurt_attach_{{ field }} : Nil | ::Db::Errors::DBError
+    if pending = @__kurt_pending_{{ field }}
+      @__kurt_pending_{{ field }} = nil
+      pending.each { |upload| {{ field }}.attach(upload, current_transaction)! }
+    end
+    nil
+  end
+
+  def __kurt_purge_{{ field }} : Nil | ::Db::Errors::DBError
+    {{ field }}.purge(current_transaction)
+  end
+
+  # `derive model` calls every `__kurt_check_*`, `__kurt_attach_*` and
+  # `__kurt_purge_*` a model has: when it validates, after it saves (before
+  # after_save), after it is destroyed.
+end
+
+# ---------------------------------------------------------------------------
+# Serving
+# ---------------------------------------------------------------------------
+
+# 48 hex digits, as `store` makes them.
+pub def key?(key : String) : Bool
+  return false unless key.size == 48
+  key.each_char { |c| return false unless (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') }
+  true
+end
+
+# GET /files/:key/:filename: the file, shown in the browser when its type
+# is one a page may show, else sent as a download.
+pub def install_file_routes(router : Router) : Nil
+  router.get "/files/:key/:filename", summary: "attached files" do |env|
+    key = env.params.url["key"]
+    found = ::Kurt::Storage.key?(key) ? find_by_key(key) : nil
+    case found
+    in Attachment
+      env.response.headers["Cache-Control"] = "private, max-age=3600"
+      env.send_file(found.path, found.content_type, found.filename, inline?(found.content_type) ? "inline" : "attachment")
+      ""
+    in Nil
+      env.response.status_code = 404
+      "not found"
+    in DBError
+      env.response.status_code = 503
+      "unavailable"
+    end
+  end
+  nil
+end
