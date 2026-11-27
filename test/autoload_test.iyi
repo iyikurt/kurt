@@ -16,6 +16,9 @@ assert lines == ["", "class A", "end"]
 model = Source.new("/app/models/post.iyi", "class Post < ApplicationRecord\n  property title : String\nend\n")
 assert model_lines(model) == ["pub class Post", "  property title : String", "  derive model", %(#<loc:"/app/models/post.iyi",3,1>end)]
 
+# a Windows path is escaped: the pragma's path is a string literal
+assert pragma("C:\\src\\blog/app/x.iyi", 2) == "#<loc:\"C:\\\\src\\\\blog/app/x.iyi\",2,1>"
+
 # a model that derives on its own keeps its derive and gets no second one
 own = Source.new("/m.iyi", "class Tag < ApplicationRecord\n  property name : String\n  derive model\nend\n")
 assert model_lines(own).count { |l| l.includes?("derive model") } == 1
@@ -97,6 +100,9 @@ assert fx.includes?("module app/fixtures\n")
 assert fx.includes?("pub def users(label : Symbol) : User\n")
 assert fx.includes?("when \"ada\" then " + fixture_id("ada").to_s + "_i64\n")
 assert fx.includes?("reload_fixtures(database, postgres?, parse(File.read(\"/app/db/schema.json\")), \"/app/test/fixtures\")")
+win = fixtures_module([users_set], [{"User", "users"}], "C:\\src\\blog/test/fixtures", "C:\\src\\blog/db/schema.json")
+assert win.includes?("File.read(\"C:\\\\src\\\\blog/db/schema.json\")), \"C:\\\\src\\\\blog/test/fixtures\")")
+assert win.includes?("\" in \" + \"test/fixtures/users.yml\"\n")
 assert !fx.includes?("def tags(")                        # no Tag model
 assert !fixtures_module([] of FixtureSet, [{"User", "users"}]).includes?("reload_fixtures(database")   # nothing to load
 assert test_imports.includes?("import app/fixtures::*")
